@@ -37,6 +37,13 @@ header {
 }
 
 .logo { font-weight: 700; letter-spacing: .3px; }
+.logo-tokens {
+  margin-left: 6px;
+  font-weight: 400;
+  font-size: 11px;
+  color: var(--muted);
+  cursor: default;
+}
 
 .ghost {
   background: transparent;
@@ -85,6 +92,68 @@ input:focus { outline: none; border-color: var(--accent); }
   background: var(--bg-2);
   flex-shrink: 0;
 }
+/* ---------------- 顶部会话栏 ---------------- */
+#sessionBar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  padding: 8px 14px;
+  border-bottom: 1px solid var(--border);
+  background: var(--bg-2);
+  flex-shrink: 0;
+}
+.chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 8px 3px 10px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--bg-3);
+  color: var(--muted);
+  cursor: pointer;
+  font-size: 12px;
+  user-select: none;
+}
+.chip:hover { color: var(--text); border-color: var(--muted); }
+.chip.active { border-color: var(--accent); color: var(--text); background: rgba(79, 140, 255, .12); }
+
+/* 状态点：纯颜色表达，不用 emoji */
+.chip .dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+.dot.idle { background: #555b66; }
+.dot.working { background: var(--accent); }
+.dot.warn { background: #ffb454; }
+.dot.ok { background: var(--ok); }
+.dot.teach { background: #ffb454; }
+
+.chip-del {
+  background: transparent;
+  border: none;
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1;
+  padding: 0 2px;
+  cursor: pointer;
+  border-radius: 4px;
+}
+.chip-del:hover { color: var(--danger); background: rgba(255, 107, 107, .12); }
+.chip-add {
+  background: transparent;
+  border: 1px dashed var(--border);
+  color: var(--muted);
+  border-radius: 999px;
+  padding: 3px 10px;
+  font-size: 12px;
+  cursor: pointer;
+}
+.chip-add:hover:not(:disabled) { color: var(--accent); border-color: var(--accent); }
+.chip-add:disabled { opacity: .4; cursor: default; }
 /* ---------------- 网站操作技巧面板 ---------------- */
 #tipsPanel {
   border-bottom: 1px solid var(--border);
@@ -225,9 +294,13 @@ input:focus { outline: none; border-color: var(--accent); }
   border-color: var(--ok);
   background: rgba(76, 212, 124, .08);
 }
-.msg.agent.ask .resume {
-  display: block;
+.ask-actions {
+  display: flex;
+  gap: 8px;
   margin-top: 8px;
+}
+.msg.agent.ask .resume {
+  flex: 1;
   background: var(--ok);
   border-color: var(--ok);
   color: #06250f;
@@ -236,6 +309,11 @@ input:focus { outline: none; border-color: var(--accent); }
 .msg.agent.ask .resume:disabled {
   opacity: .7;
   cursor: default;
+}
+.msg.agent.ask .view {
+  background: transparent;
+  border: 1px solid var(--accent);
+  color: var(--accent);
 }
 
 /* 对话回复模式：蓝色描边，无"继续"按钮，只提示直接在输入框回复 */
@@ -277,6 +355,57 @@ input:focus { outline: none; border-color: var(--accent); }
   padding: 1px 2px;
   word-break: break-all;
 }
+
+/* ---------------- 消息内 Markdown（紧凑排版） ---------------- */
+/* Agent 回复按 Markdown 渲染后气泡带 .md：关掉 pre-wrap（HTML 已无裸换行，避免块间多余空行）；
+   块间距压到 0.35em、标题不大幅放大，行距紧凑不浪费阅读空间 */
+.msg.agent.md { white-space: normal; }
+.msg.agent.md p,
+.msg.agent.md ul,
+.msg.agent.md ol,
+.msg.agent.md pre,
+.msg.agent.md blockquote { margin: .35em 0; }
+.msg.agent.md > :first-child { margin-top: 0; }
+.msg.agent.md > :last-child { margin-bottom: 0; }
+.msg.agent.md h1,
+.msg.agent.md h2,
+.msg.agent.md h3,
+.msg.agent.md h4,
+.msg.agent.md h5,
+.msg.agent.md h6 {
+  margin: .5em 0 .25em;
+  font-size: 1.05em;
+  line-height: 1.35;
+}
+.msg.agent.md h1,
+.msg.agent.md h2 { font-size: 1.12em; }
+.msg.agent.md ul,
+.msg.agent.md ol { padding-left: 1.3em; }
+.msg.agent.md li { margin: .15em 0; }
+.msg.agent.md code {
+  background: rgba(127, 127, 127, .18);
+  border-radius: 4px;
+  padding: 1px 4px;
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  font-size: .92em;
+}
+.msg.agent.md pre {
+  background: #14161b;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 8px 10px;
+  overflow-x: auto;
+  white-space: pre;
+  font-size: 12px;
+}
+.msg.agent.md pre code { background: none; padding: 0; font-size: inherit; }
+.msg.agent.md a { color: var(--accent); text-decoration: underline; }
+.msg.agent.md blockquote {
+  border-left: 3px solid var(--muted);
+  padding-left: 10px;
+  color: var(--muted);
+}
+.msg.agent.md hr { border: none; border-top: 1px solid var(--border); margin: .5em 0; }
 
 /* ---------------- 底部输入 ---------------- */
 #inputBar {

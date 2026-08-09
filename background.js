@@ -24,7 +24,7 @@ const NAV_TIMEOUT_MS = 120000;   // 页面加载/跳转等待上限
 const MAX_AGENT_TABS = 8;        // Agent 自开标签上限，防止失控
 const HEARTBEAT_ALARM = 'pageagent-heartbeat';
 const MAX_STEP_LLM_RETRY = 4;    // 单步 LLM 输出解析失败的最大重试次数
-const GROUP_TITLE = 'PageAgent'; // Agent 自开标签的分组标题
+const MAX_SESSIONS = 5;          // 最多并发会话数（顶部会话栏可新建/切换）
 const MAX_CONVERSATION = 80;     // 对话记录最多保留条数
 const MAX_HISTORY = 400;         // LLM 消息历史上限（超出后裁剪保留尾部）
 const DEFAULT_CONTEXT_WINDOW = 1000000; // DeepSeek V4 上下文窗口（token），设置里可调
@@ -34,26 +34,150 @@ const TAIL_KEEP_STEPS = 2;            // 压缩时保留最近几步原文（快
 const SUMMARY_CHUNK_TOKENS = 150000;  // 摘要单次输入的 token 上限（超出分块链式合并）
 const SUMMARY_MAX_CHARS = 1500;       // 压缩摘要长度上限（字符）
 
-let task = null; // 内存态；与 storage.session 同步
+// ---------------- 会话状态模型（多会话并发） ----------------
+// 会话对象 = 一个独立对话的全部状态（标签/分组/历史/回合）。tasks[sid] 为字典，
+// 各会话的执行链互不干扰（并发安全的关键：执行链全程用参数传入的会话对象，不读全局）。
+// activeId 是面板当前查看的会话；后台各会话可同时运行。
+let tasks = {};      // sid -> 会话对象
+let activeId = null; // 面板当前查看的会话 sid
+let seq = 0;         // sid 生成用序号
 
-// ---------------- 任务持久化 ----------------
-async function loadTask() {
-  if (task) return task;
-  const { task: t } = await chrome.storage.session.get('task');
-  task = t || null;
-  updateBadge();
-  return task;
-}
-async function saveTask() {
-  if (task) {
-    // 长对话防膨胀：保留 system + 最近 350 条
-    if (task.history && task.history.length > MAX_HISTORY) {
-      task.history = [task.history[0]].concat(task.history.slice(-(MAX_HISTORY - 50)));
-      if (task.ctxBoundary != null) task.ctxBoundary = Math.min(task.ctxBoundary, task.history.length);
-    }
-    await chrome.storage.session.set({ task });
+function newSid() { return 's' + Date.now().toString(36) + (seq++); }
+function getTask(sid) { return (sid != null && tasks[sid]) ? tasks[sid] : null; }
+function activeTask() { return getTask(activeId); }
+function setActive(sid) { activeId = (sid != null && tasks[sid]) ? sid : null; }
+
+// 找出包含某 tabId 的会话（标签事件/教学事件按 tab 路由到所属会话）；找不到返回 null
+function sessionOfTab(tabId) {
+  for (const sid of Object.keys(tasks)) {
+    if ((tasks[sid].tabs || []).some((e) => e.tabId === tabId)) return sid;
   }
-  updateBadge(); // 所有状态变更都经 saveTask，角标随之刷新
+  return null;
+}
+
+// 当前处于"教我演示"等待态的会话（演示是使用者独占行为，多个会话不会同时等教）
+function findTeachSid() {
+  let found = null;
+  for (const sid of Object.keys(tasks)) {
+    const s = tasks[sid];
+    if (s && s.state === 'waiting_user' && s.askMode === 'teach') {
+      if (sid === activeId) return sid;
+      if (!found) found = sid;
+    }
+  }
+  return found;
+}
+
+// 分配 1..MAX_SESSIONS 里最小空闲编号（删除会话后编号释放、可复用）
+function nextNumber() {
+  const used = new Set();
+  for (const sid of Object.keys(tasks)) {
+    const n = tasks[sid].n;
+    if (n != null) used.add(n);
+  }
+  for (let n = 1; n <= MAX_SESSIONS; n++) if (!used.has(n)) return n;
+  return null;
+}
+
+// ---------------- 会话持久化（storage key 'tasks'，兼容旧 'task' 单会话数据） ----------------
+async function loadTasks() {
+  if (Object.keys(tasks).length) return tasks;
+  const { tasks: dict, task: old } = await chrome.storage.session.get(['tasks', 'task']);
+  if (dict && Object.keys(dict).length) {
+    tasks = dict;
+  } else if (old) {
+    const sid = newSid();
+    old.sid = sid;
+    old.n = 1;
+    old.groupTitle = 'PageAgent 1';
+    tasks = { [sid]: old };
+    await chrome.storage.session.remove('task');
+  }
+  // 兜底：至少保留一个空会话（面板可直接发指令）
+  if (!Object.keys(tasks).length) await createSession();
+  if (!activeId || !tasks[activeId]) activeId = Object.keys(tasks)[0] || null;
+  updateBadge();
+  return tasks;
+}
+
+async function saveTasks() {
+  // 长对话防膨胀：每会话保留 system + 最近 350 条
+  for (const sid of Object.keys(tasks)) {
+    const t = tasks[sid];
+    if (t.history && t.history.length > MAX_HISTORY) {
+      t.history = [t.history[0]].concat(t.history.slice(-(MAX_HISTORY - 50)));
+      if (t.ctxBoundary != null) t.ctxBoundary = Math.min(t.ctxBoundary, t.history.length);
+    }
+  }
+  await chrome.storage.session.set({ tasks });
+  updateBadge(); // 所有状态变更都经 saveTasks，角标随之刷新
+}
+
+// 新建一个空会话（idle）。tabId 可选：给定时直接把 @MAIN 钉到该标签。返回会话对象；满 5 个返回 null
+async function createSession(tabId) {
+  const n = nextNumber();
+  if (n == null) return null;
+  const sid = newSid();
+  const t = {
+    id: 't' + Date.now().toString(36) + seq,
+    sid,
+    n,
+    groupTitle: 'PageAgent ' + n,
+    mainTabId: tabId != null ? tabId : null,
+    tabSeq: 0,
+    userTabSeq: 0,
+    tabs: tabId != null ? [{ ref: 'MAIN', tabId, role: 'main', title: '', url: '' }] : [],
+    currentRef: 'MAIN',
+    groupId: null,
+    waitTabId: null,
+    goal: '',
+    state: 'idle', // idle = 等待使用者第一条指令
+    turnId: 0,     // 回合号，用于打断旧回合
+    turnHistoryStart: 0, // 本回合在 history 里的起点（复盘时切出本轮访问过的站点）
+    steps: 0,
+    turnSteps: 0,  // 本轮步数（每轮重置，maxSteps 按轮生效）
+    failStreak: 0, // 本轮连续失败次数（>=3 转人工）
+    askText: null, // 等待使用者时的提示文案
+    askMode: 'page', // page=需在页面上操作；reply=需在对话中回复；teach=教我模式（演示学习）
+    waitingReply: false, // 是否正等待使用者在对话中回复
+    teachTabId: null,    // 教我模式主教学标签（进入时当前操作标签）
+    teachTabIds: [],     // 教我模式监听【任务下所有 tab】的录制挂载清单
+    teachEvents: [],     // 教我模式录制缓冲（content 批量上报 TEACH_EVENT 累积）
+    history: [{ role: 'system', content: systemPrompt() }],
+    ctxSummary: null,   // 历史压缩摘要（已完成进展 / 踩过的坑 / 用户注意点）
+    ctxBoundary: 0,     // 历史下标：该下标之前的消息已并入 ctxSummary，之后逐条发送
+    conversation: [],
+    result: null,
+    error: null,
+    startedAt: Date.now(),
+    awaitingNavAt: 0,
+    navWaitIdx: null, // "正在打开页面，等待就绪…"在 logs 里的索引，就绪后合并成一行
+    lastActiveAt: Date.now(),
+    consecWaits: 0,   // 连续 wait 次数（无真实动作插入时累计，防"假装人类"空转）
+    lastActSig: '',   // 最近一次执行（成功或失败）的页面动作签名，识别"反复执行同一个动作"的无进展循环
+    stuck: 0,         // 无进展计数：连续失败/重复同一动作/空等累计，换新动作清零，>=STUCK_TEACH_LIMIT 转教我
+    lastTipsHost: ''  // 本会话已显示"加载 x 个相关技巧"的站点（同一站点只提示一次，避免刷屏）
+  };
+  tasks[sid] = t;
+  await saveTasks();
+  return t;
+}
+
+// 确保会话存在并把 @MAIN 钉到 tabId（首次发送/指令时）
+async function ensureSession(sid, tabId) {
+  await loadTasks();
+  let t = getTask(sid) || (await createSession(tabId));
+  if (t.mainTabId == null && tabId != null) {
+    t.mainTabId = tabId;
+    t.tabs.push({ ref: 'MAIN', tabId, role: 'main', title: '', url: '' });
+    const mainTab = await getTab(tabId);
+    if (mainTab) {
+      t.tabs[0].title = mainTab.title || '';
+      t.tabs[0].url = mainTab.url || '';
+    }
+    await saveTasks();
+  }
+  return t;
 }
 
 // ---------------- 配置 ----------------
@@ -94,31 +218,33 @@ function isRestrictedUrl(url) {
   return /^(chrome|chrome-extension|chrome-search|edge|about|devtools|view-source|file):/i.test(String(url || ''));
 }
 
-function broadcast(msg) {
+function broadcast(msg, sid) {
+  if (sid != null) msg.sid = sid;
   chrome.runtime.sendMessage(msg).catch(() => {});
 }
 
-// addLog(m, quiet)：向面板广播"友好动作轨迹"。quiet=true 时只进 SW console，不推送到面板
+// addLog(sid, m, quiet)：向面板广播"友好动作轨迹"。quiet=true 时只进 SW console，不推送到面板
 // （面板只显示给使用者看的动作痕迹，技术细节留在 Service Worker 控制台排查，不再持久化诊断日志）。
-function addLog(m, quiet) {
+function addLog(sid, m, quiet) {
   console.log('[PageAgent]', m); // 始终进 SW console（chrome://extensions → Service Worker → DevTools Console）
-  if (!quiet) broadcast({ type: 'AGENT_ACTIVITY', text: String(m) });
+  if (!quiet) broadcast({ type: 'AGENT_ACTIVITY', text: String(m) }, sid);
 }
 
 // 改写面板最后一行动作行（如把"正在打开页面，等待就绪…"补上就绪时间）
-function updateLog(idx, m) {
-  broadcast({ type: 'AGENT_ACTIVITY_UPDATE', text: String(m) });
+function updateLog(sid, idx, m) {
+  broadcast({ type: 'AGENT_ACTIVITY_UPDATE', text: String(m) }, sid);
 }
 
 // 防"页面动作触发的 window.open 抢前台焦点"（target=_blank 链接已在 content.js 截获，这里是 JS 新开的兜底）：
 // 页面动作执行窗口内新开的标签若抢到前台，立即把焦点还给动作前使用者的前台标签，
 // 并把该新标签纳入 Agent 自开 @T（页面动作触发的，算 Agent 开的，不算使用者的）。
-const focusGuard = { armed: false, until: 0, anchorTabId: null, created: new Set() };
+const focusGuard = { armed: false, until: 0, anchorTabId: null, created: new Set(), sid: null };
 
-function armFocusGuard() {
+function armFocusGuard(t) {
   focusGuard.armed = true;
   focusGuard.until = Date.now() + 2500; // 覆盖动作执行 + 异步 window.open 的余量
   focusGuard.created.clear();
+  focusGuard.sid = t ? t.sid : null;
   chrome.tabs.query({ active: true, lastFocusedWindow: true })
     .then((tabs) => { focusGuard.anchorTabId = (tabs && tabs[0]) ? tabs[0].id : null; })
     .catch(() => {});
@@ -129,10 +255,11 @@ chrome.tabs.onCreated.addListener((tab) => {
 });
 
 chrome.tabs.onActivated.addListener(async (info) => {
-  // 教我模式：使用者在演示中切到/新开另一个标签继续操作，也纳入任务并挂上录制（学习者只演示不指挥，切到哪个就学哪个）
-  if (task && task.state === 'waiting_user' && task.askMode === 'teach') {
+  // 教我模式：使用者在演示中切到/新开另一个标签继续操作，也纳入该会话并挂上录制（学习者只演示不指挥，切到哪个就学哪个）
+  const teachSid = findTeachSid();
+  if (teachSid) {
     try {
-      await adoptTeachTab(info.tabId);
+      await adoptTeachTab(info.tabId, getTask(teachSid));
     } catch (e) {}
     return;
   }
@@ -144,28 +271,28 @@ chrome.tabs.onActivated.addListener(async (info) => {
     chrome.tabs.update(anchor, { active: true }).catch(() => {}); // 焦点还给使用者之前的标签
   }
   try {
-    await adoptOpenedTab(info.tabId);
+    await adoptOpenedTab(info.tabId, getTask(focusGuard.sid) || activeTask());
   } catch (e) {}
 });
 
 // SW 全局异常兜底：任何未捕获的错误都会落到这里，便于定位"打开页面后就没反应"
 self.addEventListener('error', (e) => {
   console.error('[PageAgent] SW 错误：', e.message, e.filename + ':' + e.lineno);
-  try { addLog('后台异常：' + e.message + ' @' + (e.filename || '') + ':' + e.lineno); } catch (_) {}
+  try { addLog(null, '后台异常：' + e.message + ' @' + (e.filename || '') + ':' + e.lineno); } catch (_) {}
 });
 self.addEventListener('unhandledrejection', (e) => {
   const r = e.reason;
   const m = (r && r.message) || String(r);
   console.error('[PageAgent] SW 未处理拒绝：', r);
-  try { addLog('后台未处理异常：' + m); } catch (_) {}
+  try { addLog(null, '后台未处理异常：' + m); } catch (_) {}
 });
 
-function broadcastTabs() {
-  broadcast({ type: 'AGENT_TABS', tabs: task ? (task.tabs || []).map((t) => ({ ref: t.ref, role: t.role, title: t.title, url: t.url })) : [] });
+function broadcastTabs(t) {
+  broadcast({ type: 'AGENT_TABS', tabs: t ? (t.tabs || []).map((x) => ({ ref: x.ref, role: x.role, title: x.title, url: x.url })) : [] }, t ? t.sid : null);
 }
 
 // 工具栏图标右下角角标动效（badge 位于图标右下角）：
-//   运行中/加载中 = 步数 + 旋转动画（蓝）
+//   运行中/加载中 = 运行中的会话数 + 旋转动画（蓝）
 //   等待手动操作 = 橙色 "!" 闪烁
 //   空闲 = 清空
 let badgeTimer = null;
@@ -177,7 +304,7 @@ function stopBadgeEffect() {
   }
 }
 
-function startBadgeEffect(kind) {
+function startBadgeEffect(kind, count) {
   stopBadgeEffect();
   if (kind === 'wait') {
     let show = true;
@@ -190,41 +317,44 @@ function startBadgeEffect(kind) {
     }, 600);
     return;
   }
-  // working / awaiting_nav：旋转加载帧 + 步数（如 7- 7\ 7| 7/）
+  // working / awaiting_nav：旋转加载帧 + 运行中的会话数（如 2- 2\ 2| 2/）
   const frames = ['-', '\\', '|', '/'];
   let i = 0;
   badgeTimer = setInterval(() => {
     i = (i + 1) % frames.length;
     try {
-      const t = task;
-      const num = Math.min(t ? (t.steps || 0) : 0, 99);
+      const num = Math.min(count || 0, 99);
       chrome.action.setBadgeText({ text: String(num) + frames[i] });
       chrome.action.setBadgeBackgroundColor({ color: '#4f8cff' });
     } catch (e) {}
   }, 350);
 }
 
-// 统一由 saveTask()/loadTask() 触发：任何状态变更都会重新对齐角标动效
+// 统一由 saveTasks()/loadTasks() 触发：任何状态变更都会重新对齐角标动效。
+// 多会话下聚合：任一等待手动操作 → 橙 !（优先生效，提醒使用者介入）；否则统计运行中的会话数，
+// 蓝 spinner 显示该数量（N- N\ N| N/），不再显示单个会话的步数
 function updateBadge() {
   try {
-    const t = task;
-    if (!t || t.state === 'idle' || t.state === 'done') {
-      stopBadgeEffect();
-      chrome.action.setBadgeText({ text: '' });
-      return;
+    let wait = false;
+    let running = 0;
+    for (const sid of Object.keys(tasks)) {
+      const s = tasks[sid];
+      if (!s) continue;
+      const st = s.state || 'idle';
+      if (st === 'waiting_user') wait = true;
+      else if (st === 'working' || st === 'awaiting_nav') running++;
     }
-    if (t.state === 'waiting_user') {
-      startBadgeEffect('wait');
-      return;
-    }
-    startBadgeEffect('working'); // working / awaiting_nav
+    if (wait) { startBadgeEffect('wait'); return; }
+    if (running > 0) { startBadgeEffect('working', running); return; }
+    stopBadgeEffect();
+    chrome.action.setBadgeText({ text: '' });
   } catch (e) {}
 }
 
 // 判断某个动作回合是否仍是当前回合（用于新指令打断旧回合时安全退出）
-function stillCurrent(myTurn, force) {
+function stillCurrent(t, myTurn, force) {
   // force：复盘类后台任务用（如停止后复盘），只认回合号、不再要求 state===working
-  return !!(task && task.turnId === myTurn && (force || task.state === 'working'));
+  return !!(t && t.turnId === myTurn && (force || t.state === 'working'));
 }
 
 // ---------------- 心跳（防休眠 + 跳转超时 + 停滞自愈） ----------------
@@ -237,27 +367,29 @@ function clearAlarm() {
 
 chrome.alarms.onAlarm.addListener(async (al) => {
   if (al.name !== HEARTBEAT_ALARM) return;
-  await loadTask();
-  const t = task;
-  if (!t || t.state === 'idle' || t.state === 'done' || t.state === 'waiting_user') {
-    clearAlarm();
-    return;
-  }
-  if (t.state === 'awaiting_nav') {
-    const waited = Date.now() - (t.awaitingNavAt || 0);
-    if (waited > NAV_TIMEOUT_MS) {
-      fail('页面加载/跳转超时（' + Math.round(waited / 1000) + 's）');
-    } else {
-      tryResume(t.waitTabId); // 尝试提前恢复，失败会再次进入 awaiting_nav
+  await loadTasks();
+  let anyBusy = false;
+  for (const sid of Object.keys(tasks)) {
+    const t = tasks[sid];
+    if (!t || t.state === 'idle' || t.state === 'done' || t.state === 'waiting_user') continue;
+    anyBusy = true;
+    if (t.state === 'awaiting_nav') {
+      const waited = Date.now() - (t.awaitingNavAt || 0);
+      if (waited > NAV_TIMEOUT_MS) {
+        fail(t, '页面加载/跳转超时（' + Math.round(waited / 1000) + 's）');
+      } else {
+        tryResume(sid, t.waitTabId); // 尝试提前恢复，失败会再次进入 awaiting_nav
+      }
+    } else if (t.state === 'working') {
+      // MV3 worker 可能被回收导致循环中断：检测到长期无进展则从持久化状态恢复
+      const stale = Date.now() - (t.lastActiveAt || 0) > 60000;
+      if (stale) {
+        addLog(sid, '检测到任务停滞，尝试恢复…', true);
+        agentStep(t).catch((e) => fail(t, '运行异常：' + e.message));
+      }
     }
-  } else if (t.state === 'working') {
-    // MV3 worker 可能被回收导致循环中断：检测到长期无进展则从持久化状态恢复
-    const stale = Date.now() - (t.lastActiveAt || 0) > 60000;
-    if (stale) {
-      addLog('检测到任务停滞，尝试恢复…', true);
-      agentStep().catch((e) => fail('运行异常：' + e.message));
-    }
   }
+  if (!anyBusy) clearAlarm();
 });
 
 // ---------------- 系统提示词（持续对话模式） ----------------
@@ -271,7 +403,7 @@ function systemPrompt() {
 
 多轮对话中，请记住并复用此前完成的操作和得出的结论（对话记录跨轮保留）。例如使用者说"把刚才的总结存成文件"，你应能找到之前的总结内容并用 save_file 保存。注意：每轮完成时你自开的标签（@T 系）会被自动关闭，跨轮不再存在；要重新访问某页面时用 open_tab/search 重新打开，或用 use_tab 用使用者已打开的标签。
 
-你拥有"任务标签页"：@MAIN 是使用者交给你的标签页（属于使用者，不要随便关）；@T1/@T2/... 是你自己新开的后台标签（已自动归入 PageAgent 分组，不影响使用者浏览；点击"新开页面"的链接也会自动变成后台 @T 标签，不抢你正在看的焦点）；@U1/@U2/... 是你用 use_tab 纳入任务的使用者已有标签（同样属于使用者，不要随便关）。
+你拥有"任务标签页"：@MAIN 是使用者交给你的标签页（属于使用者，不要随便关）；@T1/@T2/... 是你自己新开的后台标签（已自动归入本会话的 PageAgent N 分组，不影响使用者浏览；点击"新开页面"的链接也会自动变成后台 @T 标签，不抢你正在看的焦点）；@U1/@U2/... 是你用 use_tab 纳入任务的使用者已有标签（同样属于使用者，不要随便关）。
 你通过"页面快照"感知当前操作标签的网页：包括标签页列表、URL、标题、可交互元素列表（[ref] 类型 文本 值 选择器）和正文摘要。页面可能包含内嵌 iframe 子窗口（如某些网站的弹窗/新建流程），子窗口里的可交互元素也会并进快照、用【子窗口 N】分组标出，正文摘要里附有子窗口内容，你同样可以点击/读取它们。若快照提示有未读取成功的内嵌窗口（可能仍在加载），先 wait 等它加载完再重新观察，目标往往会出现，不要因为一时看不到就转去别处乱点。若你刚点击了一个按钮/链接，下一次快照里出现了新的【子窗口 N】分组或元素变多，说明弹窗/面板已经打开，接下来的目标应该在这个新窗口里找——**不要重复点击刚才那个按钮**（可能把弹窗又关掉），直接在弹窗里继续操作。
 快照开头（元素列表之前）的【本站操作技巧】是该网站历史沉淀下来的操作经验（比如"搜索要直接点第一条结果""要先点开下拉再选择"）。它放在元素列表**之前**：**每次选元素、定动作前先对照它**，与技巧描述不符的做法多半在绕弯路，优先按技巧来。当反复失败、找不到元素、或准备执行的动作与技巧不一致时，先回头对照本站技巧调整，而不是硬试同一招；若某条技巧与当前页面明显冲突（页面已改版），说明它已过期，跳过它、以当前页面为准。
 
@@ -361,7 +493,8 @@ function messagesTokens(msgs) {
 }
 
 // opts.json === false 时返回普通文本（用于历史压缩摘要）；默认仍是严格 JSON 动作
-async function callLLM(messages, opts) {
+// t 可选：传会话对象时把本次响应的 total_tokens 累计进 t.tokens 并广播 AGENT_TOKENS（多会话 token 统计）
+async function callLLM(messages, opts, t) {
   const cfg = await getConfig();
   if (!cfg.apiKey) throw new Error('未配置 API Key，请在设置中填写');
   const url = (cfg.baseUrl || DEFAULT_BASE_URL).replace(/\/+$/, '') + '/chat/completions';
@@ -393,6 +526,11 @@ async function callLLM(messages, opts) {
     console.warn('[PageAgent] LLM 返回空白内容，完整响应：' + JSON.stringify(data).slice(0, 500));
     throw new Error('LLM 返回空白内容（可能是输入过长或服务端异常）');
   }
+  // 累计本会话 token 用量并广播（供面板显示总消耗与各会话用量；无会话上下文时跳过）
+  if (t && data.usage) {
+    t.tokens = (t.tokens || 0) + (data.usage.total_tokens || 0);
+    broadcast({ type: 'AGENT_TOKENS', tokens: t.tokens }, t.sid);
+  }
   return content;
 }
 
@@ -411,9 +549,8 @@ function parseAction(text) {
 //   system + 书签索引 + 压缩摘要（如果有） + 原始目标 + 尾部历史窗口
 // 充分使用大上下文：尾部历史从最新往前一直装到放不下为止；历史过长时由 maybeCompress()
 // 把中间部分压缩成摘要（保留原始目标 + 最近几步原文），释放上下文。
-async function buildMessages() {
-  const t = task;
-  const hist = t.history || [];
+async function buildMessages(t) {
+  const hist = (t && t.history) || [];
   const cfg = await getConfig();
   const ctxWin = cfg.contextWindow || DEFAULT_CONTEXT_WINDOW;
   const msgs = [hist[0] || { role: 'system', content: '' }];
@@ -448,7 +585,7 @@ async function buildMessages() {
   //    可能是纠正做法的指导（照它调整、继续推进原始目标），也可能就是明确改目标（以它为准）。
   // 两者即使已出现在历史尾部也重复注入作醒目强调，让"补充说明要被重视、但不必然放弃原目标"充分生效。
   const goalText = (t.goal && String(t.goal).trim()) || (() => {
-    const gi = firstUserIdx();
+    const gi = firstUserIdx(t);
     return gi > 0 ? String(hist[gi].content).slice(0, 600) : '';
   })();
   if (goalText) {
@@ -469,8 +606,8 @@ async function buildMessages() {
 }
 
 // 历史里第一条使用者消息的下标（即"原始目标"）
-function firstUserIdx() {
-  const hist = task.history || [];
+function firstUserIdx(t) {
+  const hist = (t && t.history) || [];
   for (let i = 1; i < hist.length; i++) {
     if (hist[i].role === 'user') return i;
   }
@@ -488,28 +625,26 @@ function isReadAction(content) {
 }
 
 // 上下文水位检查：当前要发送的内容达到窗口 70% 时，触发历史压缩（合并中间、释放空间）
-async function maybeCompress() {
-  const t = task;
+async function maybeCompress(t) {
   if (!t || (t.history || []).length < 12) return;
   const cfg = await getConfig();
   const ctxWin = cfg.contextWindow || DEFAULT_CONTEXT_WINDOW;
   const thresholdPct = (cfg.compressThreshold == null ? COMPRESS_THRESHOLD * 100 : cfg.compressThreshold) / 100;
-  const used = messagesTokens(await buildMessages());
+  const used = messagesTokens(await buildMessages(t));
   if (used < ctxWin * thresholdPct) return;
-  addLog('上下文使用已达 ' + Math.round((used / ctxWin) * 100) + '%，自动压缩历史记录…');
+  addLog(t.sid, '上下文使用已达 ' + Math.round((used / ctxWin) * 100) + '%，自动压缩历史记录…');
   try {
-    await compressContext();
-    addLog('历史已压缩，上下文释放');
+    await compressContext(t);
+    addLog(t.sid, '历史已压缩，上下文释放');
   } catch (e) {
-    addLog('历史压缩失败：' + e.message, true);
+    addLog(t.sid, '历史压缩失败：' + e.message, true);
   }
 }
 
 // 压缩：保留 原始目标 + 最近 TAIL_KEEP_STEPS 步原文，中间"read 调用+结果"成对删除，
 // 其余交给 LLM 总结成"进展/坑/注意点"摘要，并把边界推进到压缩点
-async function compressContext() {
-  const t = task;
-  const hist = t.history || [];
+async function compressContext(t) {
+  const hist = (t && t.history) || [];
   const B = hist.length - TAIL_KEEP_STEPS * 3; // 每步 = 快照 + 动作 + 结果 3 条
   if (B < 3) return; // 历史太短，无法压缩
   const prevBoundary = t.ctxBoundary == null ? 0 : t.ctxBoundary;
@@ -528,35 +663,35 @@ async function compressContext() {
   }
   if (!middle.length) {
     t.ctxBoundary = B; // 无新增可总结，只推进边界
-    await saveTask();
+    await saveTasks();
     return;
   }
-  const summary = await summarizeChunks(middle, t.ctxSummary || '');
+  const summary = await summarizeChunks(middle, t.ctxSummary || '', t);
   t.ctxSummary = summary;
   t.ctxBoundary = B;
-  await saveTask();
+  await saveTasks();
 }
 
 // 分块链式摘要：输入过多时切成小块，逐块合并进同一份摘要（避免单次输入超限）
-async function summarizeChunks(middle, prevSummary) {
+async function summarizeChunks(middle, prevSummary, t) {
   let acc = prevSummary || '';
   let chunk = [];
   let cost = estimateTokens(acc);
   for (const m of middle) {
     const c = estimateTokens(m.content);
     if (chunk.length && cost + c > SUMMARY_CHUNK_TOKENS) {
-      acc = await summarizeOnce(chunk, acc);
+      acc = await summarizeOnce(chunk, acc, t);
       chunk = [];
       cost = estimateTokens(acc);
     }
     chunk.push(m);
     cost += c;
   }
-  if (chunk.length) acc = await summarizeOnce(chunk, acc);
+  if (chunk.length) acc = await summarizeOnce(chunk, acc, t);
   return acc;
 }
 
-async function summarizeOnce(middle, prevSummary) {
+async function summarizeOnce(middle, prevSummary, t) {
   const sys =
     '你是浏览器自动化助手。请把下面这段"已执行过的操作与对话记录"压缩成一份紧凑的中文【任务进展摘要】，供后续继续执行时参考。' +
     '必须保留三部分信息：\n' +
@@ -569,37 +704,37 @@ async function summarizeOnce(middle, prevSummary) {
     (prevSummary ? '【此前摘要】\n' + prevSummary + '\n\n' : '') +
     '【本次要合并的操作记录】\n' +
     middle.map((m) => (m.role === 'assistant' ? '助手决策：' : '观察/结果：') + String(m.content || '').slice(0, 1200)).join('\n');
-  const raw = await callLLM([{ role: 'system', content: sys }, { role: 'user', content: user }], { json: false });
+  const raw = await callLLM([{ role: 'system', content: sys }, { role: 'user', content: user }], { json: false }, t);
   return String(raw || '').trim().slice(0, SUMMARY_MAX_CHARS * 2);
 }
 
 // ---------------- 标签页管理 ----------------
-function currentEntry() {
-  return (task.tabs || []).find((e) => e.ref === task.currentRef) || null;
+function currentEntry(t) {
+  return ((t && t.tabs) || []).find((e) => e.ref === t.currentRef) || null;
 }
 
 // 解析当前操作标签的 tabId；若其已关闭则回退到主标签/第一个存活标签，仍无则返回 null
-async function resolveCurrentTabId() {
-  let entry = currentEntry();
+async function resolveCurrentTabId(t) {
+  let entry = currentEntry(t);
   if (entry) {
     const tab = await getTab(entry.tabId);
     if (tab) return entry.tabId;
-    addLog('当前标签已关闭，自动切换…', true);
+    addLog(t.sid, '当前标签已关闭，自动切换…', true);
   }
-  for (const e of task.tabs || []) {
-    if (e.ref === task.currentRef) continue;
+  for (const e of t.tabs || []) {
+    if (e.ref === t.currentRef) continue;
     const tab = await getTab(e.tabId);
     if (tab) {
-      task.currentRef = e.ref;
-      addLog('自动切换到其他标签', true);
+      t.currentRef = e.ref;
+      addLog(t.sid, '自动切换到其他标签', true);
       return e.tabId;
     }
   }
   return null;
 }
 
-function findTabEntry(ref) {
-  return (task.tabs || []).find((e) => e.ref === ref) || null;
+function findTabEntry(ref, t) {
+  return ((t && t.tabs) || []).find((e) => e.ref === ref) || null;
 }
 
 function tabLabel(entry) {
@@ -628,49 +763,49 @@ function midTruncate(s, max) {
 }
 
 // 新开 Agent 后台标签（不抢焦点），并加入分组。display 为给使用者看的友好文案（search 用），缺省显示 url
-async function openAgentTab(url, display) {
-  const agentTabs = (task.tabs || []).filter((e) => e.role === 'agent');
+async function openAgentTab(url, display, t) {
+  const agentTabs = (t.tabs || []).filter((e) => e.role === 'agent');
   if (agentTabs.length >= MAX_AGENT_TABS) {
     throw new Error('Agent 自开标签已达上限（' + MAX_AGENT_TABS + '），请先 close_tab');
   }
   const t0 = performance.now();
   const tab = await chrome.tabs.create({ url, active: false });
   const ms = Math.round(performance.now() - t0);
-  const ref = 'T' + ++task.tabSeq;
+  const ref = 'T' + ++t.tabSeq;
   const entry = { ref, tabId: tab.id, role: 'agent', title: tab.title || '', url: tab.url || url };
-  task.tabs.push(entry);
-  task.currentRef = ref;
-  await addToGroup(tab.id);
-  await saveTask();
-  addLog((display || '打开 ' + shortUrl(url)) + ' · ' + ms + 'ms');
-  broadcastTabs();
+  t.tabs.push(entry);
+  t.currentRef = ref;
+  await addToGroup(tab.id, t);
+  await saveTasks();
+  addLog(t.sid, (display || '打开 ' + shortUrl(url)) + ' · ' + ms + 'ms');
+  broadcastTabs(t);
   return entry;
 }
 
-async function addToGroup(tabId) {
-  // 1) 本任务已记录分组且仍存活 → 直接加入（不重复建）
-  if (task.groupId) {
+async function addToGroup(tabId, t) {
+  // 1) 本会话已记录分组且仍存活 → 直接加入（不重复建）
+  if (t.groupId) {
     try {
-      await chrome.tabGroups.get(task.groupId);
-      await chrome.tabs.group({ tabIds: [tabId], groupId: task.groupId });
+      await chrome.tabGroups.get(t.groupId);
+      await chrome.tabs.group({ tabIds: [tabId], groupId: t.groupId });
       return;
     } catch (e) {
-      task.groupId = null; // 分组已销毁/不可用，走下方查找或重建
-      await saveTask();
+      t.groupId = null; // 分组已销毁/不可用，走下方查找或重建
+      await saveTasks();
     }
   }
-  // 2) 优先复用浏览器里已存在的 "PageAgent" 分组（跨对话/跨任务都不再重复建）
+  // 2) 优先复用本会话标题同名的分组（PageAgent N，跨会话不复用，各会话分组独立）
   let gid = null;
   try {
     const groups = await chrome.tabGroups.query({});
-    const existing = (groups || []).find((g) => g.title === GROUP_TITLE);
+    const existing = (groups || []).find((g) => g.title === t.groupTitle);
     if (existing) gid = existing.id;
   } catch (e) {}
   if (gid != null) {
     try {
       await chrome.tabs.group({ tabIds: [tabId], groupId: gid });
-      task.groupId = gid;
-      await saveTask();
+      t.groupId = gid;
+      await saveTasks();
       return;
     } catch (e) {
       gid = null; // 加入失败（如跨窗口），回退为新建
@@ -678,44 +813,42 @@ async function addToGroup(tabId) {
   }
   // 3) 确实没有才新建
   const newGid = await chrome.tabs.group({ tabIds: [tabId] });
-  task.groupId = newGid;
-  await saveTask();
+  t.groupId = newGid;
+  await saveTasks();
   chrome.tabGroups
-    .update(newGid, { title: GROUP_TITLE, color: 'grey', collapsed: true })
+    .update(newGid, { title: t.groupTitle, color: 'grey', collapsed: true })
     .catch(() => {});
 }
 
 // 页面动作触发的"新开标签"（window.open 等，content.js 截获不到的）纳入 Agent 自开 @T：
 // 页面动作算 Agent 的行为，新开的页面也归 Agent（本轮结束随分组一起清理），不能算使用者的。
-async function adoptOpenedTab(tabId) {
-  const t = task;
+async function adoptOpenedTab(tabId, t) {
   if (!t || t.state !== 'working') return;
-  if (findTabEntryByTabId(tabId)) return; // 已在任务里（如 openAgentTab 已注册）
+  if (findTabEntryByTabId(tabId, t)) return; // 已在任务里（如 openAgentTab 已注册）
   const tab = await getTab(tabId);
   if (!tab) return;
   if ((t.tabs || []).filter((e) => e.role === 'agent').length >= MAX_AGENT_TABS) return;
   const ref = 'T' + ++t.tabSeq;
   t.tabs.push({ ref, tabId, role: 'agent', title: tab.title || '', url: tab.url || '' });
-  await addToGroup(tabId);
-  await saveTask();
-  broadcastTabs();
+  await addToGroup(tabId, t);
+  await saveTasks();
+  broadcastTabs(t);
   t.history.push({
     role: 'user',
     content: '页面动作新开的页面已在后台打开并纳入任务：@' + ref + '（' + (tab.title || shortUrl(tab.url || '')) + '），属 Agent 自开，本轮结束自动关闭'
   });
-  addLog('页面新开 → 后台打开 ' + shortUrl(tab.url || '新页面'));
+  addLog(t.sid, '页面新开 → 后台打开 ' + shortUrl(tab.url || '新页面'));
 }
 
 // 教我模式：使用者演示时切到/新开一个标签 → 纳入任务（@U 使用者标签）并挂上录制。
 // 使用者只演示、不指挥，切到哪个标签就学哪个标签，录制不因跨标签而断。
-async function adoptTeachTab(tabId) {
-  const t = task;
+async function adoptTeachTab(tabId, t) {
   if (!t) return;
   const ids = t.teachTabIds = t.teachTabIds || [];
   // 已挂录制的标签：只补任务登记，不重复 TEACH_START —— content 的 teachStart 对已录制状态会重置缓冲，
   // 反复切回会丢掉该标签最近未上报的几步；演示中导航重挂由 onUpdated / AGENT_READY 的 rearmTeachRecording 兜底
   if (ids.includes(tabId)) return;
-  let entry = findTabEntryByTabId(tabId);
+  let entry = findTabEntryByTabId(tabId, t);
   if (!entry) {
     const tab = await getTab(tabId);
     if (!tab) return;
@@ -724,7 +857,7 @@ async function adoptTeachTab(tabId) {
     entry = { ref, tabId, role: 'user', title: tab.title || '', url: tab.url || '' };
     t.tabs.push(entry);
     t.history.push({ role: 'user', content: '教我模式：把使用者切到的标签纳入任务 @' + ref + '（' + (tab.title || shortUrl(tab.url || '')) + '），一并录制其操作' });
-    broadcastTabs();
+    broadcastTabs(t);
   }
   ids.push(tabId);
   try {
@@ -732,14 +865,14 @@ async function adoptTeachTab(tabId) {
     await chrome.tabs.sendMessage(tabId, { type: 'TEACH_START' }).catch(() => {});
     console.log('[Teach] 教学切到/新开标签 → 挂载录制 tab=' + tabId);
   } catch (e) { console.log('[Teach] 教学挂载失败 tab=' + tabId + ' → ' + e.message); }
-  await saveTask();
+  await saveTasks();
 }
 
 // 列出浏览器所有标签（供 list_tabs 动作）：标题+网址+tabId，标记当前选中的、任务内的、受限无法操作的
-async function listAllTabs() {
+async function listAllTabs(t) {
   const all = await chrome.tabs.query({});
-  const taskIds = new Set((task.tabs || []).map((e) => e.tabId));
-  const byRef = new Map((task.tabs || []).map((e) => [e.tabId, e.ref]));
+  const taskIds = new Set((t.tabs || []).map((e) => e.tabId));
+  const byRef = new Map((t.tabs || []).map((e) => [e.tabId, e.ref]));
   let active = null;
   try {
     const [a] = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
@@ -764,32 +897,32 @@ async function listAllTabs() {
   return head + '\n' + lines.join('\n');
 }
 
-// 删除 Agent 自开的 PageAgent 标签分组（组内即 @T 标签，删组 = 一步清空全部自开标签）。
-// 找出本任务记录的分组 + 浏览器里所有同名分组一并删，兼顾跨对话/重启残留的旧分组。
-async function removeAgentGroup() {
+// 删除本会话自开的 PageAgent N 标签分组（组内即 @T 标签，删组 = 一步清空该会话自开标签）。
+// 只删本会话记录的分组 + 标题同名分组（跨会话不复用编号，删除不影响其他会话的分组）。
+async function removeAgentGroup(t) {
+  if (!t) return false;
   const ids = new Set();
-  if (task && task.groupId) ids.add(task.groupId);
+  if (t.groupId) ids.add(t.groupId);
   try {
     const groups = await chrome.tabGroups.query({});
-    for (const g of groups || []) if (g.title === GROUP_TITLE) ids.add(g.id);
+    for (const g of groups || []) if (g.title === t.groupTitle) ids.add(g.id);
   } catch (e) {}
   let ok = false;
   for (const id of ids) {
     try { await chrome.tabGroups.remove(id); ok = true; } catch (e) {}
   }
-  if (task) task.groupId = null;
+  t.groupId = null;
   return ok;
 }
 
-// 每轮结束（finish/失败）时清理 Agent 自开的标签：优先删除整个 PageAgent 分组（一步到位），
+// 每轮结束（finish/失败）时清理 Agent 自开的标签：优先删除整个 PageAgent N 分组（一步到位），
 // 不在分组内的 @T（如跨窗口另建过组/分组失败）逐个兜底关闭。
 // 使用者的标签（@MAIN/@U）永不关闭。停止（STOP）不清理，保留待续。
-async function closeAgentTabs() {
-  const t = task;
+async function closeAgentTabs(t) {
   if (!t) return;
   const agents = (t.tabs || []).filter((e) => e.role === 'agent');
   if (!agents.length) return;
-  await removeAgentGroup();
+  await removeAgentGroup(t);
   for (const e of agents) {
     const tab = await getTab(e.tabId); // 组删除可能已带走部分标签，剩余仍在的逐个关
     if (tab) chrome.tabs.remove(e.tabId).catch(() => {});
@@ -800,29 +933,29 @@ async function closeAgentTabs() {
     const main = t.tabs.find((e) => e.role === 'main');
     t.currentRef = main ? main.ref : ((t.tabs[0] || {}).ref || null);
   }
-  await saveTask();
-  broadcastTabs();
+  await saveTasks();
+  broadcastTabs(t);
 }
 
-async function closeAgentTab(ref) {
-  const entry = findTabEntry(ref);
+async function closeAgentTab(ref, t) {
+  const entry = findTabEntry(ref, t);
   if (!entry) throw new Error('要关闭的标签不存在或已关闭：' + ref + '（先 list_tabs 确认再关）');
   if (entry.role === 'main' || entry.role === 'user') throw new Error('@' + entry.ref + ' 是使用者的标签，不可关闭');
   await chrome.tabs.remove(entry.tabId);
-  task.tabs = task.tabs.filter((e) => e.ref !== ref);
-  if (task.currentRef === ref) {
+  t.tabs = t.tabs.filter((e) => e.ref !== ref);
+  if (t.currentRef === ref) {
     // 回退到主标签
-    const main = task.tabs.find((e) => e.role === 'main');
-    task.currentRef = main ? main.ref : ((task.tabs[0] || {}).ref || null);
+    const main = t.tabs.find((e) => e.role === 'main');
+    t.currentRef = main ? main.ref : ((t.tabs[0] || {}).ref || null);
   }
-  await saveTask();
-  addLog('已关闭标签');
-  broadcastTabs();
+  await saveTasks();
+  addLog(t.sid, '已关闭标签');
+  broadcastTabs(t);
 }
 
-function refreshTabEntry(tabId, info) {
-  if (!task) return; // 无对话时（如日常浏览页面加载完成）也常触发，直接忽略
-  const e = (task.tabs || []).find((x) => x.tabId === tabId);
+function refreshTabEntry(tabId, info, t) {
+  if (!t) return; // 无对话时（如日常浏览页面加载完成）也常触发，直接忽略
+  const e = (t.tabs || []).find((x) => x.tabId === tabId);
   if (e) {
     if (info && info.title) e.title = info.title;
     if (info && info.url) e.url = info.url;
@@ -832,11 +965,11 @@ function refreshTabEntry(tabId, info) {
 // ---------------- 快照消息构建 ----------------
 // tipsBlock（可选）：本站操作技巧块。放在 URL/标题与受限页提示之后、元素列表【之前】——
 // LLM 要先读到历史经验再扫元素，避免技巧沉在快照末尾被 90 个元素淹没（否则"加载了但没怎么用"）。
-function buildSnapshotMessage(snap, tipsBlock) {
+function buildSnapshotMessage(snap, tipsBlock, t) {
   const lines = [];
-  lines.push('【任务标签页】共 ' + task.tabs.length + ' 个');
-  for (const e of task.tabs) {
-    const cur = e.ref === task.currentRef ? ' [当前操作]' : '';
+  lines.push('【任务标签页】共 ' + t.tabs.length + ' 个');
+  for (const e of t.tabs) {
+    const cur = e.ref === t.currentRef ? ' [当前操作]' : '';
     const main = e.role === 'main' ? '使用者标签' : (e.role === 'user' ? '使用者已有标签' : 'Agent自开');
     lines.push(`[@${e.ref}] ${main} ${e.title || ''} ${e.url || ''}${cur}`);
   }
@@ -989,29 +1122,28 @@ async function readSnapshotWithFrames(tabId) {
 }
 
 // ---------------- Agent 循环 ----------------
-async function agentStep() {
-  const t = task;
+async function agentStep(t) {
   if (!t || t.state !== 'working') return;
   const myTurn = t.turnId;
-  if (!stillCurrent(myTurn)) return;
+  if (!stillCurrent(t, myTurn)) return;
 
   const cfg = await getConfig();
   if (t.turnSteps >= cfg.maxSteps) {
-    fail('本轮超过最大步数上限（' + cfg.maxSteps + '）');
+    fail(t, '本轮超过最大步数上限（' + cfg.maxSteps + '）');
     return;
   }
   t.steps++;
   t.turnSteps++;
   t.lastActiveAt = Date.now();
-  await saveTask();
-  if (!stillCurrent(myTurn)) return;
+  await saveTasks();
+  if (!stillCurrent(t, myTurn)) return;
 
-  const tabId = await resolveCurrentTabId();
+  const tabId = await resolveCurrentTabId(t);
   if (!tabId) {
-    fail('任务标签页均已关闭');
+    fail(t, '任务标签页均已关闭');
     return;
   }
-  if (!stillCurrent(myTurn)) return;
+  if (!stillCurrent(t, myTurn)) return;
 
   // 1) 读取当前操作标签的页面快照
   //    受限页面（chrome://、about:、扩展管理页等）无法注入内容脚本，直接构造"受限快照"让 LLM 判题另开网页，避免反复失败空转
@@ -1020,7 +1152,7 @@ async function agentStep() {
   let snap = null;
   let lastSnapErr = null;
   if (curTab && isRestrictedUrl(curTab.url)) {
-    addLog('受限页面，自动打开相关网页', true);
+    addLog(t.sid, '受限页面，自动打开相关网页', true);
     snap = { url: curTab.url, title: curTab.title || '', elements: [], excerpt: '', restricted: true };
   } else {
     for (let i = 0; i < 3 && !snap; i++) {
@@ -1036,12 +1168,12 @@ async function agentStep() {
     }
     if (!snap) {
       const tab = await getTab(tabId);
-      addLog('快照失败（3 次）：' + (lastSnapErr ? lastSnapErr.message : '未知原因') + (tab ? ' · ' + tab.url : ' · 标签已不存在'), true);
-      awaitNav(tabId);
+      addLog(t.sid, '快照失败（3 次）：' + (lastSnapErr ? lastSnapErr.message : '未知原因') + (tab ? ' · ' + tab.url : ' · 标签已不存在'), true);
+      awaitNav(t, tabId);
       return;
     }
   }
-  if (!stillCurrent(myTurn)) return;
+  if (!stillCurrent(t, myTurn)) return;
 
   t.snapFrames = (snap && Array.isArray(snap.frames)) ? snap.frames : []; // 供动作路由把全局 ref 拆回 (frameId, 局部 ref)
   t.curPageSig = pageSigOf(snap); // 记录当前页面状态指纹，供"无进展计数"判断重复动作时页面是否真的变了
@@ -1057,21 +1189,21 @@ async function agentStep() {
     tipsCount = tips.length;
     if (tipsCount) {
       tipsBlock = '【本站操作技巧】（该网站历史操作经验，持续有效：决策前先对照再选元素，避免绕弯路；若某条与当前页面明显冲突/已改版，说明已过期，跳过它、以当前页面为准）\n' + tips.map((x) => '· ' + x).join('\n');
-      if (snapHost !== lastTipsLoggedHost) { // 同一站点每轮只在首次进入时显示一次加载提示
-        lastTipsLoggedHost = snapHost;
-        addLog('加载 ' + tipsCount + ' 个相关技巧 ' + Math.round(performance.now() - tt0) + 'ms');
+      if (snapHost !== t.lastTipsHost) { // 同一站点每会话只在首次进入时显示一次加载提示
+        t.lastTipsHost = snapHost;
+        addLog(t.sid, '加载 ' + tipsCount + ' 个相关技巧 ' + Math.round(performance.now() - tt0) + 'ms');
       }
     }
   }
-  addLog('正在浏览 ' + midTruncate(snap.title || shortUrl(snap.url), 16) + ' · ' + Math.round(performance.now() - t0) + 'ms');
-  let snapMsg = buildSnapshotMessage(snap, tipsBlock);
+  addLog(t.sid, '正在浏览 ' + midTruncate(snap.title || shortUrl(snap.url), 16) + ' · ' + Math.round(performance.now() - t0) + 'ms');
+  let snapMsg = buildSnapshotMessage(snap, tipsBlock, t);
   t.history.push({ role: 'user', content: snapMsg });
-  await saveTask();
-  if (!stillCurrent(myTurn)) return;
+  await saveTasks();
+  if (!stillCurrent(t, myTurn)) return;
 
   // 2) LLM 决策：先检查上下文水位，达到 70% 阈值时自动压缩历史释放空间
-  await maybeCompress();
-  if (!stillCurrent(myTurn)) return;
+  await maybeCompress(t);
+  if (!stillCurrent(t, myTurn)) return;
 
   // 2) LLM 决策（JSON 解析失败可重试）
   let action = null;
@@ -1079,30 +1211,30 @@ async function agentStep() {
   for (let i = 0; i < MAX_STEP_LLM_RETRY && !action; i++) {
     let raw = null;
     try {
-      raw = await callLLM(await buildMessages());
+      raw = await callLLM(await buildMessages(t), undefined, t);
       console.log('[PageAgent] LLM 原始输出：' + String(raw).slice(0, 800));
       action = parseAction(raw);
     } catch (e) {
       lastErr = e;
-      addLog('LLM 输出解析失败（' + (i + 1) + '/' + MAX_STEP_LLM_RETRY + '）：' + e.message + (raw ? ' 原文=' + String(raw).slice(0, 100) : ''), true);
+      addLog(t.sid, 'LLM 输出解析失败（' + (i + 1) + '/' + MAX_STEP_LLM_RETRY + '）：' + e.message + (raw ? ' 原文=' + String(raw).slice(0, 100) : ''), true);
       console.warn('[PageAgent] LLM 调用/解析异常：' + e.message);
       await sleep(800 * (i + 1)); // 退避：0.8s / 1.6s / 2.4s / 3.2s，应对偶发空白/限流
     }
   }
   if (!action) {
-    fail('LLM 连续返回无效动作：' + (lastErr && lastErr.message));
+    fail(t, 'LLM 连续返回无效动作：' + (lastErr && lastErr.message));
     return;
   }
-  if (!stillCurrent(myTurn)) return;
+  if (!stillCurrent(t, myTurn)) return;
 
   t.history.push({ role: 'assistant', content: JSON.stringify(action) });
   t.lastActiveAt = Date.now();
-  addLog('决策：' + JSON.stringify(action), true); // 原始动作保留在诊断日志，面板不显示
-  await saveTask();
-  if (!stillCurrent(myTurn)) return;
+  addLog(t.sid, '决策：' + JSON.stringify(action), true); // 原始动作保留在诊断日志，面板不显示
+  await saveTasks();
+  if (!stillCurrent(t, myTurn)) return;
 
   // 3) 执行动作
-  await runAction(action);
+  await runAction(t, action);
 }
 
 // ---------------- 文件下载 ----------------
@@ -1188,7 +1320,7 @@ function rootUrl(url) {
 }
 
 // 写入一条书签；folder 不存在时逐级自动创建。url 一律规整为网站根 URL。
-async function writeBookmark(a) {
+async function writeBookmark(a, t) {
   const title = String(a.title || '').trim().replace(/\s+/g, ' ').slice(0, 200) || '未命名';
   const url = rootUrl(String(a.url || '').trim());
   if (!url) throw new Error('缺少 url');
@@ -1200,7 +1332,7 @@ async function writeBookmark(a) {
   const existing = await findBookmarkByUrl(url);
   if (existing) {
     const oldTitle = String(existing.title || '').replace(/\s+/g, ' ').trim();
-    const merged = await mergeBookmarkTitle(existing.title, title, url);
+    const merged = await mergeBookmarkTitle(t, existing.title, title, url);
     const update = {}; // 可能同时改进标题 + 规整 URL
     if (merged && merged !== oldTitle) update.title = merged;
     if (existing.url !== url) update.url = url;
@@ -1308,33 +1440,32 @@ async function findBookmarks(keyword) {
 const MAX_REVIEW_PICKS = 5; // 单次复盘最多收藏条数
 
 // 复盘入口：收集本轮访问过的站点 → LLM 筛选 → 写入书签（新网址收藏；已收藏的合并改进标题。尽力而为，失败不影响任务完成）
-async function reviewAndBookmark(force, pinnedTurn) {
-  const t = task;
+async function reviewAndBookmark(t, force, pinnedTurn) {
   if (!t) return;
   // force：停止后复盘用（state 已回 idle，仍要跑复盘）；正常 finish 复盘时 force 为空，保持"仅 working 时复盘"
   if (!force && t.state !== 'working') return;
   const myTurn = (pinnedTurn != null) ? pinnedTurn : t.turnId; // 钉住停止那一刻的回合号，中途新指令会打断复盘
-  const sites = collectVisitedSites();
+  const sites = collectVisitedSites(t);
   if (!sites.length) return;
-  addLog('复盘：梳理本次任务访问过的 ' + sites.length + ' 个网站，筛选有用站点…');
-  const picks = await pickBookmarks(sites);
+  addLog(t.sid, '复盘：梳理本次任务访问过的 ' + sites.length + ' 个网站，筛选有用站点…');
+  const picks = await pickBookmarks(t, sites);
   if (!picks.length) return;
   let added = 0, updated = 0;
   for (const p of picks) {
-    if (!stillCurrent(myTurn, force)) break; // 复盘期间被新指令打断
+    if (!stillCurrent(t, myTurn, force)) break; // 复盘期间被新指令打断
     try {
-      const r = await reviewCollectBookmark(p);
+      const r = await reviewCollectBookmark(t, p);
       if (r === 'added') added++;
       else if (r === 'updated') updated++;
     } catch (e) {
-      addLog('复盘收藏失败：' + ((p && p.title) || '') + ' → ' + (e.message || e), true);
+      addLog(t.sid, '复盘收藏失败：' + ((p && p.title) || '') + ' → ' + (e.message || e), true);
     }
   }
   if (added > 0 || updated > 0) {
     const parts = [];
     if (added > 0) parts.push('新增 ' + added + ' 个');
     if (updated > 0) parts.push('改进 ' + updated + ' 个既有书签的使用技巧');
-    addLog('复盘完成：' + parts.join('、'));
+    addLog(t.sid, '复盘完成：' + parts.join('、'));
   }
 }
 
@@ -1345,8 +1476,7 @@ async function reviewAndBookmark(force, pinnedTurn) {
 // 网站按【域名】统计：同一网站的不同页面 URL 合并成一条（一页结果、一页笔记 = 小红书 1 个网站），
 // 保留该域名下第一次访问到的 URL（含路径，保住"这是搜索结果页/单次页"的信号供 LLM 判断取舍）。
 // 注意：不忽略 www 等二级域名前缀——有的公司一个二级域名就是一个独立项目，www.xx.com 与 xx.com 按不同网站算。
-function collectVisitedSites() {
-  const t = task;
+function collectVisitedSites(t) {
   const seen = new Map(); // 域名 -> { url, title, host }
   const add = (url, title) => {
     if (!url) return;
@@ -1377,7 +1507,7 @@ function collectVisitedSites() {
 }
 
 // 调 LLM 复盘：从访问过的站点里挑出值得收藏的，返回 [{title,url,reason}]
-async function pickBookmarks(sites) {
+async function pickBookmarks(t, sites) {
   const cfg = await getConfig();
   if (!cfg.apiKey) return [];
   // 已按域名归并：同站多页只列一条（url 为该站本轮访问的其中一页，用于判断网站类型；域名是判断对象）
@@ -1396,12 +1526,12 @@ async function pickBookmarks(sites) {
     }
   ];
   try {
-    const raw = await callLLM(msgs);
+    const raw = await callLLM(msgs, undefined, t);
     const obj = JSON.parse(raw.replace(/^```(?:json)?/i, '').replace(/```$/i, '').trim());
     const arr = (obj && Array.isArray(obj.bookmarks)) ? obj.bookmarks : [];
     return arr.filter((b) => b && typeof b === 'object' && b.url && /^https?:/i.test(String(b.url)));
   } catch (e) {
-    addLog('复盘筛选失败：' + e.message, true);
+    addLog(t.sid, '复盘筛选失败：' + e.message, true);
     return [];
   }
 }
@@ -1429,7 +1559,7 @@ async function findBookmarkByUrl(url) {
 
 // 用 LLM 把旧标题与新总结合并成更好的标题（"网站名 | 作用 | 使用技巧"三段式、技巧合并去重）；
 // 失败/无新信息时原样返回旧标题，绝不破坏既有书签
-async function mergeBookmarkTitle(oldTitle, newTitle, url) {
+async function mergeBookmarkTitle(t, oldTitle, newTitle, url) {
   const o = String(oldTitle || '').replace(/\s+/g, ' ').trim();
   const n = String(newTitle || '').replace(/\s+/g, ' ').trim();
   if (!n || o === n) return o;
@@ -1440,11 +1570,11 @@ async function mergeBookmarkTitle(oldTitle, newTitle, url) {
     { role: 'user', content: '网址：' + url + '\n旧标题：' + o + '\n新总结标题：' + n }
   ];
   try {
-    const raw = await callLLM(msgs, { json: false });
+    const raw = await callLLM(msgs, { json: false }, t);
     const merged = String(raw).replace(/^["'`]+|["'`]+$/g, '').replace(/\s+/g, ' ').trim().slice(0, 200);
     return merged || o;
   } catch (e) {
-    addLog('书签标题合并失败：' + e.message, true);
+    addLog(t.sid, '书签标题合并失败：' + e.message, true);
     return o;
   }
 }
@@ -1452,7 +1582,7 @@ async function mergeBookmarkTitle(oldTitle, newTitle, url) {
 // 复盘收藏：新网址直接写入书签根目录（不建文件夹，避免每次复盘都多一个文件夹很乱）；
 // 已收藏过则把本次新总结的使用技巧合并进既有标题（保持原位置，持续改进）。
 // 返回 'added'（新收藏）/ 'updated'（改进既有书签）/ 'skipped'（无变化）
-async function reviewCollectBookmark(p) {
+async function reviewCollectBookmark(t, p) {
   const url = rootUrl(String(p.url || '').trim()); // 复盘只收藏网站根 URL，不收藏带路径的局部页面
   if (!/^https?:/i.test(url)) return 'skipped';
   const title = String(p.title || '').trim().replace(/\s+/g, ' ').slice(0, 200) || url;
@@ -1461,18 +1591,18 @@ async function reviewCollectBookmark(p) {
     // 不传 parentId → Chrome 默认放到书签根（其他书签），标题按"网站名 | 作用 | 使用技巧"三段式
     await chrome.bookmarks.create({ title, url });
     await refreshBookmarkIndex();
-    addLog('复盘：收藏 ' + title);
+    addLog(t.sid, '复盘：收藏 ' + title);
     return 'added';
   }
   const oldTitle = String(existing.title || '').replace(/\s+/g, ' ').trim();
-  const merged = await mergeBookmarkTitle(existing.title, title, url);
+  const merged = await mergeBookmarkTitle(t, existing.title, title, url);
   const update = {}; // 可能同时改进标题 + 把既有带路径的 URL 规整为根 URL
   if (merged !== oldTitle) update.title = merged;
   if (existing.url !== url) update.url = url;
-  if (!Object.keys(update).length) { addLog('复盘：已收藏过且无新技巧，跳过 ' + url, true); return 'skipped'; }
+  if (!Object.keys(update).length) { addLog(t.sid, '复盘：已收藏过且无新技巧，跳过 ' + url, true); return 'skipped'; }
   await chrome.bookmarks.update(existing.id, update);
   await refreshBookmarkIndex();
-  addLog('复盘：' + (update.title ? '改进既有书签的使用技巧：' + merged : '规整书签 URL 为根：' + url));
+  addLog(t.sid, '复盘：' + (update.title ? '改进既有书签的使用技巧：' + merged : '规整书签 URL 为根：' + url));
   return 'updated';
 }
 
@@ -1534,11 +1664,10 @@ function pageSigOf(snap) {
   return (snap.url || '') + '|' + (snap.title || '') + '|' + els + '|' + String(snap.excerpt || '').length + '|' + frameSig;
 }
 
-async function runAction(a) {
-  const t = task;
+async function runAction(t, a) {
   if (!t || t.state !== 'working') return;
   const myTurn = t.turnId;
-  if (!stillCurrent(myTurn)) return;
+  if (!stillCurrent(t, myTurn)) return;
   // 记录"这次真实动作之前攒了几次 wait"（供"等待后又重复同一个动作"识别），并清零连续等待计数
   const prevWaits = (a.action !== 'wait') ? (t.consecWaits || 0) : 0;
   if (a.action !== 'wait') t.consecWaits = 0;
@@ -1546,25 +1675,25 @@ async function runAction(a) {
   // ---- 标签操作 ----
   if (a.action === 'open_tab') {
     if (!a.url || !/^(https?|file):/i.test(a.url)) {
-      await pushFailure('open_tab 地址无效：' + a.url);
+      await pushFailure(t, 'open_tab 地址无效：' + a.url);
       return;
     }
     let entry;
     try {
-      entry = await openAgentTab(a.url);
+      entry = await openAgentTab(a.url, null, t);
     } catch (e) {
-      await pushFailure(e.message);
+      await pushFailure(t, e.message);
       return;
     }
-    if (!stillCurrent(myTurn)) return;
-    awaitNav(entry.tabId);
+    if (!stillCurrent(t, myTurn)) return;
+    awaitNav(t, entry.tabId);
     return;
   }
 
   if (a.action === 'search') {
     const query = String(a.query || '').trim();
     if (!query) {
-      await pushFailure('search 缺少关键词');
+      await pushFailure(t, 'search 缺少关键词');
       return;
     }
     const cfg = await getConfig();
@@ -1574,47 +1703,47 @@ async function runAction(a) {
       : template + encodeURIComponent(query);
     let entry;
     try {
-      entry = await openAgentTab(url, '搜索「' + query + '」');
+      entry = await openAgentTab(url, '搜索「' + query + '」', t);
     } catch (e) {
-      await pushFailure(e.message);
+      await pushFailure(t, e.message);
       return;
     }
-    if (!stillCurrent(myTurn)) return;
-    awaitNav(entry.tabId);
+    if (!stillCurrent(t, myTurn)) return;
+    awaitNav(t, entry.tabId);
     return;
   }
 
   if (a.action === 'switch_tab') {
     const t0 = performance.now();
-    const entry = findTabEntry(a.ref);
+    const entry = findTabEntry(a.ref, t);
     if (!entry) {
       // 内部纠错：Agent 切到了不存在的 ref（可能臆造了 @@T6，或标签已被清理）。反馈给模型重新确认，不把原始 ref 噪音刷给用户
-      await pushFailure('要切换的标签不存在或已关闭（ref=' + a.ref + '），先用 list_tabs 查看当前可用标签再切换（@MAIN 一直可用）', true);
+      await pushFailure(t, '要切换的标签不存在或已关闭（ref=' + a.ref + '），先用 list_tabs 查看当前可用标签再切换（@MAIN 一直可用）', true);
       return;
     }
-    task.currentRef = entry.ref;
+    t.currentRef = entry.ref;
     const ms = Math.round(performance.now() - t0);
-    addLog('切换标签 · ' + ms + 'ms');
-    await saveTask();
-    if (!stillCurrent(myTurn)) return;
-    agentStep().catch((e) => fail('运行异常：' + e.message));
+    addLog(t.sid, '切换标签 · ' + ms + 'ms');
+    await saveTasks();
+    if (!stillCurrent(t, myTurn)) return;
+    agentStep(t).catch((e) => fail(t, '运行异常：' + e.message));
     return;
   }
 
   if (a.action === 'list_tabs') {
     try {
       const t0 = performance.now();
-      const text = await listAllTabs();
+      const text = await listAllTabs(t);
       const ms = Math.round(performance.now() - t0);
       t.history.push({ role: 'user', content: text });
-      addLog('列出标签 · ' + ms + 'ms');
-      await saveTask();
+      addLog(t.sid, '列出标签 · ' + ms + 'ms');
+      await saveTasks();
     } catch (e) {
-      await pushFailure('列出标签失败：' + e.message);
+      await pushFailure(t, '列出标签失败：' + e.message);
       return;
     }
-    if (!stillCurrent(myTurn)) return;
-    agentStep().catch((e) => fail('运行异常：' + e.message));
+    if (!stillCurrent(t, myTurn)) return;
+    agentStep(t).catch((e) => fail(t, '运行异常：' + e.message));
     return;
   }
 
@@ -1622,42 +1751,42 @@ async function runAction(a) {
     const t0 = performance.now();
     const tabId = Number(a.tabId);
     if (!Number.isInteger(tabId) || tabId <= 0) {
-      await pushFailure('use_tab 需要 list_tabs 返回的 tabId', true); // 内部纠错，不刷用户面板
+      await pushFailure(t, 'use_tab 需要 list_tabs 返回的 tabId', true); // 内部纠错，不刷用户面板
       return;
     }
     const tab = await getTab(tabId);
     if (!tab) {
-      await pushFailure('要纳入的标签不存在或已关闭（tabId=' + tabId + '），先 list_tabs 刷新后再选', true); // 内部纠错，不刷用户面板
+      await pushFailure(t, '要纳入的标签不存在或已关闭（tabId=' + tabId + '），先 list_tabs 刷新后再选', true); // 内部纠错，不刷用户面板
       return;
     }
     let adoptedRef;
-    const existing = findTabEntryByTabId(tabId);
+    const existing = findTabEntryByTabId(tabId, t);
     if (existing) {
       adoptedRef = existing.ref; // 已在任务里，直接切过去
     } else {
-      adoptedRef = 'U' + (++task.userTabSeq);
-      task.tabs.push({ ref: adoptedRef, tabId, role: 'user', title: tab.title || '', url: tab.url || '' });
+      adoptedRef = 'U' + (++t.userTabSeq);
+      t.tabs.push({ ref: adoptedRef, tabId, role: 'user', title: tab.title || '', url: tab.url || '' });
     }
-    task.currentRef = adoptedRef;
+    t.currentRef = adoptedRef;
     t.history.push({ role: 'user', content: '已把浏览器标签纳入任务：@' + adoptedRef + ' ' + (tab.title || shortUrl(tab.url)) + '（当前操作标签，未切浏览器前台）' });
     const ms = Math.round(performance.now() - t0);
-    addLog('纳入标签（' + (tab.title || shortUrl(tab.url)).slice(0, 30) + '） · ' + ms + 'ms');
-    await saveTask();
-    broadcastTabs();
-    if (!stillCurrent(myTurn)) return;
-    agentStep().catch((e) => fail('运行异常：' + e.message));
+    addLog(t.sid, '纳入标签（' + (tab.title || shortUrl(tab.url)).slice(0, 30) + '） · ' + ms + 'ms');
+    await saveTasks();
+    broadcastTabs(t);
+    if (!stillCurrent(t, myTurn)) return;
+    agentStep(t).catch((e) => fail(t, '运行异常：' + e.message));
     return;
   }
 
   if (a.action === 'close_tab') {
     try {
-      await closeAgentTab(a.ref);
+      await closeAgentTab(a.ref, t);
     } catch (e) {
-      await pushFailure(e.message, true); // 关不存在的标签/关使用者标签 = 内部纠错，不刷用户面板
+      await pushFailure(t, e.message, true); // 关不存在的标签/关使用者标签 = 内部纠错，不刷用户面板
       return;
     }
-    if (!stillCurrent(myTurn)) return;
-    agentStep().catch((e) => fail('运行异常：' + e.message));
+    if (!stillCurrent(t, myTurn)) return;
+    agentStep(t).catch((e) => fail(t, '运行异常：' + e.message));
     return;
   }
 
@@ -1666,14 +1795,14 @@ async function runAction(a) {
     try {
       const res = await saveFile(a);
       t.history.push({ role: 'user', content: '文件已保存：' + res.filename });
-      addLog('保存文件：' + res.filename);
-      await saveTask();
+      addLog(t.sid, '保存文件：' + res.filename);
+      await saveTasks();
     } catch (e) {
-      await pushFailure('保存文件失败：' + e.message);
+      await pushFailure(t, '保存文件失败：' + e.message);
       return;
     }
-    if (!stillCurrent(myTurn)) return;
-    agentStep().catch((e) => fail('运行异常：' + e.message));
+    if (!stillCurrent(t, myTurn)) return;
+    agentStep(t).catch((e) => fail(t, '运行异常：' + e.message));
     return;
   }
 
@@ -1682,29 +1811,29 @@ async function runAction(a) {
     try {
       const text = await readBookmarks(a.folder);
       t.history.push({ role: 'user', content: '书签读取结果：\n' + text });
-      addLog('读取书签');
-      await saveTask();
+      addLog(t.sid, '读取书签');
+      await saveTasks();
     } catch (e) {
-      await pushFailure('读取书签失败：' + e.message);
+      await pushFailure(t, '读取书签失败：' + e.message);
       return;
     }
-    if (!stillCurrent(myTurn)) return;
-    agentStep().catch((e) => fail('运行异常：' + e.message));
+    if (!stillCurrent(t, myTurn)) return;
+    agentStep(t).catch((e) => fail(t, '运行异常：' + e.message));
     return;
   }
 
   if (a.action === 'bookmarks_write') {
     try {
-      const done = await writeBookmark(a);
+      const done = await writeBookmark(a, t);
       t.history.push({ role: 'user', content: '书签写入结果：' + done.msg });
-      addLog(done.created ? '收藏书签' : '更新书签');
-      await saveTask();
+      addLog(t.sid, done.created ? '收藏书签' : '更新书签');
+      await saveTasks();
     } catch (e) {
-      await pushFailure('写入书签失败：' + e.message);
+      await pushFailure(t, '写入书签失败：' + e.message);
       return;
     }
-    if (!stillCurrent(myTurn)) return;
-    agentStep().catch((e) => fail('运行异常：' + e.message));
+    if (!stillCurrent(t, myTurn)) return;
+    agentStep(t).catch((e) => fail(t, '运行异常：' + e.message));
     return;
   }
 
@@ -1712,14 +1841,14 @@ async function runAction(a) {
     try {
       const text = await findBookmarks(a.keyword);
       t.history.push({ role: 'user', content: '书签查找结果：\n' + text });
-      addLog('查找书签');
-      await saveTask();
+      addLog(t.sid, '查找书签');
+      await saveTasks();
     } catch (e) {
-      await pushFailure('查找书签失败：' + e.message);
+      await pushFailure(t, '查找书签失败：' + e.message);
       return;
     }
-    if (!stillCurrent(myTurn)) return;
-    agentStep().catch((e) => fail('运行异常：' + e.message));
+    if (!stillCurrent(t, myTurn)) return;
+    agentStep(t).catch((e) => fail(t, '运行异常：' + e.message));
     return;
   }
 
@@ -1729,13 +1858,13 @@ async function runAction(a) {
     if (text) {
       t.conversation.push({ role: 'agent', text, ok: true, t: Date.now() });
       if (t.conversation.length > MAX_CONVERSATION) t.conversation = t.conversation.slice(-MAX_CONVERSATION);
-      broadcast({ type: 'AGENT_MESSAGE', text, ok: true });
+      broadcast({ type: 'AGENT_MESSAGE', text, ok: true }, t.sid);
     }
     t.turnSteps++;
     t.lastActiveAt = Date.now();
-    await saveTask();
-    if (!stillCurrent(myTurn)) return;
-    agentStep().catch((e) => fail('运行异常：' + e.message));
+    await saveTasks();
+    if (!stillCurrent(t, myTurn)) return;
+    agentStep(t).catch((e) => fail(t, '运行异常：' + e.message));
     return;
   }
 
@@ -1749,43 +1878,43 @@ async function runAction(a) {
         : (mode === 'confirm'
           ? '请确认我理解的步骤对不对：没问题点下方按钮，有出入直接在对话里纠正，我会理解后再来确认'
           : '需要你手动在页面上操作（如验证码、登录等），完成后点击"继续"'));
-    await askUser(String(a.message || fallback), mode);
+    await askUser(t, String(a.message || fallback), mode);
     return;
   }
 
   // ---- 结束本轮 ----
   if (a.action === 'finish') {
     const result = typeof a.result === 'string' ? a.result : JSON.stringify(a.result || '');
-    try { await reviewAndBookmark(); } catch (e) { /* 复盘失败不影响任务完成 */ }
-    try { await reviewAndLearnTips(); } catch (e) { /* 技巧沉淀失败不影响任务完成 */ }
-    if (!stillCurrent(myTurn)) return;
-    complete(result);
+    try { await reviewAndBookmark(t); } catch (e) { /* 复盘失败不影响任务完成 */ }
+    try { await reviewAndLearnTips(t); } catch (e) { /* 技巧沉淀失败不影响任务完成 */ }
+    if (!stillCurrent(t, myTurn)) return;
+    complete(t, result);
     return;
   }
 
-  const tabId = await resolveCurrentTabId();
+  const tabId = await resolveCurrentTabId(t);
   if (!tabId) {
-    fail('任务标签页均已关闭');
+    fail(t, '任务标签页均已关闭');
     return;
   }
-  if (!stillCurrent(myTurn)) return;
+  if (!stillCurrent(t, myTurn)) return;
 
   // ---- 导航 ----
   if (a.action === 'navigate') {
     const url = a.url;
     if (!url || !/^(https?|file):/i.test(url)) {
-      await pushFailure('navigate 地址无效：' + url);
+      await pushFailure(t, 'navigate 地址无效：' + url);
       return;
     }
-    addLog('打开 ' + shortUrl(url));
+    addLog(t.sid, '打开 ' + shortUrl(url));
     t.state = 'awaiting_nav';
     t.awaitingNavAt = Date.now();
     t.waitTabId = tabId;
-    await saveTask();
+    await saveTasks();
     try {
       await chrome.tabs.update(tabId, { url });
     } catch (e) {
-      fail('导航失败：' + e.message);
+      fail(t, '导航失败：' + e.message);
     }
     return; // 等 AGENT_READY / onUpdated 恢复
   }
@@ -1800,28 +1929,28 @@ async function runAction(a) {
       // 空等也算"无进展"，累计到阈值主动请使用者演示（多数情况走下面的"禁止再 wait"就够了，这里兜底）
       t.stuck = (t.stuck || 0) + 1;
       if (t.stuck >= STUCK_TEACH_LIMIT) {
-        await askUser('我在等待页面变化上反复空转、一直没有进展。请你在当前页面上手把手演示一遍正确操作，我会记录学习后照着做。', 'teach');
+        await askUser(t, '我在等待页面变化上反复空转、一直没有进展。请你在当前页面上手把手演示一遍正确操作，我会记录学习后照着做。', 'teach');
         return;
       }
       if (t.consecWaits === 2) {
-        addLog('连续等待没有新进展，推动继续…', true);
+        addLog(t.sid, '连续等待没有新进展，推动继续…', true);
         t.history.push({
           role: 'user',
           content: '你已经连续 wait（假装人类停顿）两次，而中间没有执行任何动作、页面也没有变化。之后禁止再 wait，请直接执行一个实际动作（点击 / 悬浮 / 输入 / 选择 / 滚动 / read）或 finish 结束本轮，不要空等。'
         });
       } else {
-        addLog('仍在连续等待，跳过停顿直接继续', true);
+        addLog(t.sid, '仍在连续等待，跳过停顿直接继续', true);
       }
-      await saveTask();
-      if (!stillCurrent(myTurn)) return;
-      agentStep().catch((e) => fail('运行异常：' + e.message));
+      await saveTasks();
+      if (!stillCurrent(t, myTurn)) return;
+      agentStep(t).catch((e) => fail(t, '运行异常：' + e.message));
       return;
     }
     const ms = Math.round(200 + Math.random() * 600);
-    addLog('假装人类 ' + ms + 'ms');
+    addLog(t.sid, '假装人类 ' + ms + 'ms');
     await sleep(ms);
-    if (!stillCurrent(myTurn)) return;
-    agentStep().catch((e) => fail('运行异常：' + e.message));
+    if (!stillCurrent(t, myTurn)) return;
+    agentStep(t).catch((e) => fail(t, '运行异常：' + e.message));
     return;
   }
 
@@ -1855,13 +1984,13 @@ async function runAction(a) {
     t.stuck = 0; // 换了个新动作 = 在尝试新路径，无进展计数清零
   }
   if (t.stuck >= STUCK_TEACH_LIMIT) {
-    await askUser('我反复尝试了 ' + t.stuck + ' 次同样的操作仍然没有进展，不知道怎么继续了。请你在当前页面上手把手演示一遍正确操作，我会记录学习后照着做。', 'teach');
+    await askUser(t, '我反复尝试了 ' + t.stuck + ' 次同样的操作仍然没有进展，不知道怎么继续了。请你在当前页面上手把手演示一遍正确操作，我会记录学习后照着做。', 'teach');
     return;
   }
-  await saveTask();
-  if (!stillCurrent(myTurn)) return;
+  await saveTasks();
+  if (!stillCurrent(t, myTurn)) return;
   const t0 = performance.now();
-  armFocusGuard(); // 记录动作前的前台标签；动作期间页面若 window.open 抢焦点，后台会把它收回
+  armFocusGuard(t); // 记录动作前的前台标签；动作期间页面若 window.open 抢焦点，后台会把它收回
   // 目标窗口路由：合并快照里 iframe 元素的 ref 是全局编号（frameIndex*1000+局部 ref），
   // 先拆回 (frameId, 局部 ref) 再只发给那个窗口执行，避免全 frame 都收到、返回数组乱掉。
   // 非数字目标（read 页面/scroll/keypress 等）一律落在主窗口（frameId 0）。
@@ -1889,15 +2018,15 @@ async function runAction(a) {
     // sendMessage 抛错 ≈ 页面正在加载/跳转、content 上下文失效
     const tab = await getTab(tabId);
     console.warn('[PageAgent] EXECUTE_ACTION 连接失败 tab=' + tabId + ' ' + (tab ? tab.url : '(标签不存在)') + ' → ' + err.message);
-    addLog('页面动作连接失败（可能页面正在跳转/未加载完成）' + (tab ? '' : '，标签已不存在'), true);
-    awaitNav(tabId);
+    addLog(t.sid, '页面动作连接失败（可能页面正在跳转/未加载完成）' + (tab ? '' : '，标签已不存在'), true);
+    awaitNav(t, tabId);
     return;
   }
-  if (!stillCurrent(myTurn)) return;
+  if (!stillCurrent(t, myTurn)) return;
   if (!res || res.ok === false) {
     const why = (res && (res.message || res.error)) || '动作执行失败';
     console.warn('[PageAgent] 动作执行失败 tab=' + tabId + ' → ' + why);
-    await pushFailure(why, false, sig); // 失败也记入 lastActSig，反复重试同一失败动作会被识别为重复
+    await pushFailure(t, why, false, sig); // 失败也记入 lastActSig，反复重试同一失败动作会被识别为重复
     return;
   }
 
@@ -1910,18 +2039,18 @@ async function runAction(a) {
       ? ('点击「' + label + '」→ 后台打开 ' + shortUrl(res.openTab))
       : ('点击 → 后台打开 ' + shortUrl(res.openTab));
     try {
-      entry = await openAgentTab(res.openTab, display);
+      entry = await openAgentTab(res.openTab, display, t);
     } catch (e) {
-      await pushFailure(e.message, false, sig);
+      await pushFailure(t, e.message, false, sig);
       return;
     }
-    if (!stillCurrent(myTurn)) return;
+    if (!stillCurrent(t, myTurn)) return;
     t.failStreak = 0;
     t.history.push({
       role: 'user',
       content: '点击的链接会新开页面，已在后台打开为 @' + entry.ref + '（' + shortUrl(res.openTab) + '），属 Agent 自开标签，本轮结束自动关闭'
     });
-    awaitNav(entry.tabId);
+    awaitNav(t, entry.tabId);
     return;
   }
 
@@ -1932,40 +2061,66 @@ async function runAction(a) {
   t.failStreak = 0;
   t.lastActSig = sig; // 记录本次动作，供"反复执行同一个动作"识别
   t.actionPageSig = t.curPageSig; // 记录执行动作时的页面状态，供下次重复判断"页面是否真的变了"
-  addLog(friendlyAction(a, res, ms)); // 面板显示极简动作 + 耗时，如"点击 · 50ms"
-  await saveTask();
-  if (!stillCurrent(myTurn)) return;
-  agentStep().catch((e) => fail('运行异常：' + e.message));
+  addLog(t.sid, friendlyAction(a, res, ms)); // 面板显示极简动作 + 耗时，如"点击 · 50ms"
+  await saveTasks();
+  if (!stillCurrent(t, myTurn)) return;
+  agentStep(t).catch((e) => fail(t, '运行异常：' + e.message));
+}
+
+// 当前操作页面的域名（转人工时告诉使用者"哪个网站"）；取不到时用主标签，仍无则"当前页面"
+function currentSiteLabel(t) {
+  let u = '';
+  const cur = currentEntry(t);
+  if (cur && cur.url) u = cur.url;
+  if (!u) {
+    const main = (t.tabs || []).find((e) => e.role === 'main');
+    if (main && main.url) u = main.url;
+  }
+  return hostOf(u) || '当前页面';
+}
+
+// 把给 LLM 看的失败原因转成使用者能看懂的一句话：
+// 去掉括号里的内部指引（如"先 list_tabs 确认再关"）和 @T3/ref 这类内部编号，保留实质原因
+function humanizeWhy(why) {
+  let s = String(why || '').trim();
+  s = s.replace(/（[^）]*）/g, '').replace(/\([^)]*\)/g, '');
+  // 去掉"先用 list_tabs 刷新后再选"这类给 Agent 看的内部指引句子（有时不在括号里）
+  s = s.replace(/[，,]\s*(?:先|请|再)?\s*用?\s*(?:list_tabs|use_tab|switch_tab|open_tab|close_tab|navigate|search|snapshot)[^。]*/g, '');
+  s = s.replace(/[:：]\s*@[A-Z]+\d*/g, '').replace(/@[A-Z]+\d*/g, '标签');
+  s = s.replace(/ref=\s*[^\s,，;；]+/g, '');
+  s = s.replace(/[，,]\s*$/g, '');
+  s = s.replace(/\s+/g, ' ').trim();
+  return s;
 }
 
 // 动作失败：把失败原因写回 history 并继续循环，让 LLM 修正；连续失败则转人工
-async function pushFailure(why, quiet, sig) {
-  const t = task;
+async function pushFailure(t, why, quiet, sig) {
   if (!t || t.state !== 'working') return;
   t.failStreak = (t.failStreak || 0) + 1;
   t.stuck = (t.stuck || 0) + 1; // 失败也是"无进展"，计入 stuck（配合 runAction 的重复识别，累计到阈值转教我）
   if (sig) t.lastActSig = sig; // 失败的动作也算"最近尝试"，这样反复重试同一个失败动作也会被识别为重复
   if (t.curPageSig) t.actionPageSig = t.curPageSig; // 失败也算一次"动作"，记录其时的页面状态
   if (t.stuck >= STUCK_TEACH_LIMIT) {
-    await askUser('我反复尝试了 ' + t.stuck + ' 次仍然没有进展。请你在当前页面上手把手演示一遍正确操作，我会记录学习后照着做。', 'teach');
+    await askUser(t, '我反复尝试了 ' + t.stuck + ' 次仍然没有进展。请你在当前页面上手把手演示一遍正确操作，我会记录学习后照着做。', 'teach');
     return;
   }
   if (t.failStreak >= 3) {
-    await askUser('连续操作失败：' + why + '。可能是验证码、登录或页面状态问题，请手动处理页面后点击"继续"');
+    const site = currentSiteLabel(t);
+    const plain = humanizeWhy(why);
+    await askUser(t, '在 ' + site + ' 上连续操作失败' + (plain ? '：' + plain : '') + '。请检查这个页面：如出现验证码、登录框或弹窗请先手动处理，其他情况也可在页面上自行调整；处理完点击「继续」。');
     return;
   }
   t.history.push({ role: 'user', content: '动作执行失败：' + why + '（先对照快照里的【本站操作技巧】调整做法再重试，别硬试同一招）' });
-  addLog(why, quiet); // quiet=true 只进 SW console，不刷用户面板——内部纠错类失败（如切到不存在的标签 ref），使用者无需看原始 ref/tabId
-  await saveTask();
-  agentStep().catch((e) => fail('运行异常：' + e.message));
+  addLog(t.sid, why, quiet); // quiet=true 只进 SW console，不刷用户面板——内部纠错类失败（如切到不存在的标签 ref），使用者无需看原始 ref/tabId
+  await saveTasks();
+  agentStep(t).catch((e) => fail(t, '运行异常：' + e.message));
 }
 
 // 请求使用者协助：暂停当前回合，等"继续"。
 //   page  = 使用者在【页面上】手动操作（验证码/登录等），操作完点"继续"；
 //   teach = 使用者在【页面上】手把手演示操作，Agent 记录学习（教我模式）；
 //   reply = 使用者在【对话中】直接回复信息。
-async function askUser(msg, mode) {
-  const t = task;
+async function askUser(t, msg, mode) {
   if (!t) return;
   const myTurn = t.turnId;
   const isReply = mode === 'reply';
@@ -1974,8 +2129,8 @@ async function askUser(msg, mode) {
   // 页面操作/教我模式需要把操作标签切到前台；对话回复/确认模式不抢焦点
   const needForeground = !isReply && !isConfirm;
   let tabId = null;
-  if (needForeground) tabId = await resolveCurrentTabId();
-  if (!task || task.turnId !== myTurn || task.state !== 'working') return; // 已被新指令打断
+  if (needForeground) tabId = await resolveCurrentTabId(t);
+  if (!t || t.turnId !== myTurn || t.state !== 'working') return; // 已被新指令打断
   t.state = 'waiting_user';
   t.askText = String(msg);
   t.askMode = isTeach ? 'teach' : (isReply ? 'reply' : (isConfirm ? 'confirm' : 'page'));
@@ -1989,12 +2144,12 @@ async function askUser(msg, mode) {
     t.teachTabIds = []; // 教我模式监听【任务下所有 tab】（不只当前标签），逐个挂上录制
     t.teachEvents = []; // 教你模式的录制缓冲，由 content 上报 TEACH_EVENT 累积
   }
-  await saveTask();
+  await saveTasks();
   // 页面操作/教我模式：把当前操作标签切到前台供使用者操作，并（教我时）启动事件录制
   if (tabId && needForeground) chrome.tabs.update(tabId, { active: true }).catch(() => {});
   if (isTeach) {
     // 把录制挂到任务下所有 tab（使用者标签 @U/@MAIN、Agent 自开 @T），使用者可能在多页/多站之间切换演示
-    const targets = new Set([tabId, ...(task.tabs || []).map((e) => e.tabId).filter(Boolean)]);
+    const targets = new Set([tabId, ...(t.tabs || []).map((e) => e.tabId).filter(Boolean)]);
     for (const id of targets) {
       if (id == null) continue;
       try {
@@ -2004,20 +2159,20 @@ async function askUser(msg, mode) {
         console.log('[Teach] 教学挂载 tab=' + id);
       } catch (e) { console.log('[Teach] 教学挂载失败 tab=' + id + ' → ' + e.message); }
     }
-    await saveTask();
+    await saveTasks();
   }
   clearAlarm();
   const label = isReply ? '请使用者在对话中回复：' : (isTeach ? '请求使用者手把手演示（教我模式）：' : (isConfirm ? '请使用者确认复述：' : '请求使用者手动操作：'));
-  addLog(label + msg);
+  addLog(t.sid, label + msg);
   const tail = isReply ? '（使用者会直接在对话中输入回复）' : (isTeach ? '（Agent 会记录使用者的操作并学习，完成后点"我操作完了"）' : (isConfirm ? '（使用者点"没问题"按钮确认，或直接在对话里纠正）' : '（等使用者完成后点击"继续"）'));
   const head = isReply ? '需要使用者在对话中回复：' : (isTeach ? '需要使用者手把手演示操作：' : (isConfirm ? '需要使用者确认复述：' : '需要使用者手动操作：'));
   t.history.push({ role: 'user', content: head + msg + tail });
   t.conversation.push({ role: 'agent', text: String(msg), ok: false, ask: true, mode: isTeach ? 'teach' : (isReply ? 'reply' : (isConfirm ? 'confirm' : 'page')), t: Date.now() });
   if (t.conversation.length > MAX_CONVERSATION) t.conversation = t.conversation.slice(-MAX_CONVERSATION);
-  await saveTask();
-  broadcast({ type: 'AGENT_ASK', text: String(msg), mode: isTeach ? 'teach' : (isReply ? 'reply' : (isConfirm ? 'confirm' : 'page')) });
-  broadcast({ type: 'AGENT_STATUS', status: 'waiting_user', askMode: isTeach ? 'teach' : (isReply ? 'reply' : (isConfirm ? 'confirm' : 'page')) });
-  broadcastTabs();
+  await saveTasks();
+  broadcast({ type: 'AGENT_ASK', text: String(msg), mode: isTeach ? 'teach' : (isReply ? 'reply' : (isConfirm ? 'confirm' : 'page')) }, t.sid);
+  broadcast({ type: 'AGENT_STATUS', status: 'waiting_user', askMode: isTeach ? 'teach' : (isReply ? 'reply' : (isConfirm ? 'confirm' : 'page')) }, t.sid);
+  broadcastTabs(t);
 }
 
 // ---------------- 站点操作技巧库（复盘沉淀，操作时加载） ----------------
@@ -2027,8 +2182,6 @@ const TIPS_KEY = 'siteTips';         // storage.local 键：{ [host]: string[] }
 const TIPS_ACTION_THRESHOLD = 4;     // 单站点动作数 ≥ 此值视为"绕了弯路/多点了很多次"
 const TIPS_FAIL_THRESHOLD = 2;       // 单站点失败数 ≥ 此值视为"反复失败"
 const TIPS_MAX_NEW = 3;              // 每次复盘最多新增的技巧条数
-
-let lastTipsLoggedHost = ''; // 本轮已显示"加载 x 个相关技巧"的站点（同一站点只显示一次，避免刷屏）
 
 // 域名 = host（只记录域名，不带协议/路径/查询）；入参可能是完整 URL 也可能是裸域名，都能解析
 function hostOf(url) {
@@ -2062,18 +2215,17 @@ async function saveSiteTips(host, tips) {
 
 // 复盘入口（与书签复盘并列，都在 finish 时跑）：把本轮"反复失败 / 绕了弯路多点了很多次"
 // 的操作沉淀成"该网站的操作技巧"（只记域名），并带上该站既有技巧做冲突去重合并，持续全量优化。
-async function reviewAndLearnTips(force, pinnedTurn) {
-  const t = task;
+async function reviewAndLearnTips(t, force, pinnedTurn) {
   if (!t) return;
   // force：停止后复盘用（state 已回 idle，仍要跑复盘）；正常 finish 复盘时 force 为空，保持"仅 working 时复盘"
   if (!force && t.state !== 'working') return;
   const myTurn = (pinnedTurn != null) ? pinnedTurn : t.turnId; // 钉住停止那一刻的回合号，中途新指令会打断复盘
-  const report = collectDifficultyReport();
+  const report = collectDifficultyReport(t);
   if (!report) return;
   const cfg = await getConfig();
   if (!cfg.apiKey) return;
-  if (!stillCurrent(myTurn, force)) return;
-  addLog('复盘：' + report.domains.length + ' 个站点操作有困难，沉淀操作技巧…');
+  if (!stillCurrent(t, myTurn, force)) return;
+  addLog(t.sid, '复盘：' + report.domains.length + ' 个站点操作有困难，沉淀操作技巧…');
   const store = await getTipStore();
   const oldByHost = {};
   for (const h of report.domains) oldByHost[h] = (store[h] || []).join('\n');
@@ -2091,14 +2243,14 @@ async function reviewAndLearnTips(force, pinnedTurn) {
   ];
   let arr = [];
   try {
-    const raw = await callLLM(msgs);
+    const raw = await callLLM(msgs, undefined, t);
     const obj = JSON.parse(raw.replace(/^```(?:json)?/i, '').replace(/```$/i, '').trim());
     arr = (obj && Array.isArray(obj.tips)) ? obj.tips : [];
   } catch (e) {
-    addLog('复盘技巧生成失败：' + e.message, true);
+    addLog(t.sid, '复盘技巧生成失败：' + e.message, true);
     return;
   }
-  if (!stillCurrent(myTurn, force)) return;
+  if (!stillCurrent(t, myTurn, force)) return;
   // 按域名分组：只写报告里的域名，防 LLM 乱加别的站点
   const byHost = new Map();
   for (const item of arr) {
@@ -2110,20 +2262,20 @@ async function reviewAndLearnTips(force, pinnedTurn) {
   }
   if (!byHost.size) return;
   for (const [h, newTips] of byHost) {
-    if (!stillCurrent(myTurn, force)) break;
+    if (!stillCurrent(t, myTurn, force)) break;
     try {
-      const merged = await mergeSiteTips(h, newTips, oldByHost[h]);
+      const merged = await mergeSiteTips(h, newTips, oldByHost[h], t.sid);
       if (!merged || !merged.length) continue;
       await saveSiteTips(h, merged);
-      addLog('复盘：沉淀 ' + h + ' 的操作技巧（共 ' + merged.length + ' 条）');
+      addLog(t.sid, '复盘：沉淀 ' + h + ' 的操作技巧（共 ' + merged.length + ' 条）');
     } catch (e) {
-      addLog('复盘技巧保存失败：' + h + ' → ' + e.message, true);
+      addLog(t.sid, '复盘技巧保存失败：' + h + ' → ' + e.message, true);
     }
   }
 }
 
 // 合并某域名的既有技巧与新技巧：同站同操作的冲突技巧合并处理、有价值的旧技巧保留、限制条数。返回最终列表。
-async function mergeSiteTips(host, newTips, oldTipsText) {
+async function mergeSiteTips(host, newTips, oldTipsText, sid) {
   const cfg = await getConfig();
   if (oldTipsText && cfg.apiKey) {
     const msgs = [
@@ -2134,14 +2286,14 @@ async function mergeSiteTips(host, newTips, oldTipsText) {
       { role: 'user', content: '网站：' + host + '\n旧技巧：\n' + (oldTipsText || '（无）') + '\n新技巧：\n' + newTips.join('\n') }
     ];
     try {
-      const raw = await callLLM(msgs, { json: false });
+      const raw = await callLLM(msgs, { json: false }, getTask(sid) || undefined);
       const arr = JSON.parse(raw.replace(/^```(?:json)?/i, '').replace(/```$/i, '').trim());
       if (Array.isArray(arr) && arr.length) {
         const clean = arr.map((s) => String(s || '').replace(/\s+/g, ' ').trim()).filter(Boolean);
         if (clean.length) return clean;
       }
     } catch (e) {
-      addLog('复盘技巧合并失败：' + e.message, true);
+      addLog(sid, '复盘技巧合并失败：' + e.message, true);
     }
   }
   // 兜底：旧 + 新 简单去重（LLM 合并失败时不让旧技巧丢失）
@@ -2157,8 +2309,7 @@ async function mergeSiteTips(host, newTips, oldTipsText) {
 // 统计本轮各站点的动作数/失败数，返回有"困难信号"站点的报告（供 LLM 沉淀技巧）。
 // 只统计实际操作过的站点：快照【当前页面】URL 之后、到下一个快照之前的动作归属该站点。
 // 困难信号：失败 ≥ TIPS_FAIL_THRESHOLD，或动作 ≥ TIPS_ACTION_THRESHOLD（绕弯路/多点了很多次）。
-function collectDifficultyReport() {
-  const t = task;
+function collectDifficultyReport(t) {
   const slice = (t.history || []).slice(t.turnHistoryStart || 0);
   const sites = new Map(); // host -> { actions, fails, actLines: Map<actionType,count>, actSeq: [], failMsgs: [] }
   const ensure = (h) => {
@@ -2208,133 +2359,82 @@ function bumpAct(site, action) {
 }
 
 // ---------------- 跨页面/跨标签恢复 ----------------
-function findTabEntryByTabId(tabId) {
-  return (task.tabs || []).find((e) => e.tabId === tabId) || null;
+function findTabEntryByTabId(tabId, t) {
+  return (t.tabs || []).find((e) => e.tabId === tabId) || null;
 }
 
-function awaitNav(tabId) {
-  const t = task;
+function awaitNav(t, tabId) {
   if (!t) return;
   t.state = 'awaiting_nav';
   t.awaitingNavAt = Date.now();
   t.waitTabId = tabId;
   t.lastActSig = ''; // 换了操作页面上下文，上一页的动作签名作废
-  const entry = findTabEntryByTabId(tabId);
+  const entry = findTabEntryByTabId(tabId, t);
   t.navWaitIdx = true; // 标记"正在打开页面"行已显示，就绪后合并成一行
-  addLog('正在打开页面，等待就绪…');
-  saveTask();
+  addLog(t.sid, '正在打开页面，等待就绪…');
+  saveTasks();
 }
 
-function tryResume(tabId) {
-  const t = task;
+function tryResume(sid, tabId) {
+  const t = getTask(sid);
   if (!t || t.state !== 'awaiting_nav') return;
   if (t.waitTabId && t.waitTabId !== tabId) return; // 等的不是这个标签
   if (Date.now() - (t.awaitingNavAt || 0) > NAV_TIMEOUT_MS) {
-    fail('页面加载/跳转超时');
+    fail(t, '页面加载/跳转超时');
     return;
   }
   const readyTxt = '页面已就绪 · ' + Math.round(Date.now() - (t.awaitingNavAt || 0)) + 'ms';
   t.state = 'working'; // 同步置位，避免 AGENT_READY 与 onUpdated 双触发
   if (t.navWaitIdx) {
-    updateLog(null, '正在打开页面，等待就绪… ' + readyTxt); // 合并到"等待就绪"那一行
+    updateLog(t.sid, t.navWaitIdx, '正在打开页面，等待就绪… ' + readyTxt); // 合并到"等待就绪"那一行
     t.navWaitIdx = null;
   } else {
-    addLog(readyTxt);
+    addLog(t.sid, readyTxt);
   }
-  saveTask();
-  agentStep().catch((e) => fail('运行异常：' + e.message));
+  saveTasks();
+  agentStep(t).catch((e) => fail(t, '运行异常：' + e.message));
 }
 
 // ---------------- 完成 / 失败（回到 idle，等待下一条指令） ----------------
-async function complete(result) {
-  const t = task;
+async function complete(t, result) {
   if (!t) return;
   if (t.state === 'idle') return; // 已被新指令打断/停止
   t.state = 'idle';
-  await closeAgentTabs().catch(() => {}); // 每轮完成自动关闭 Agent 自开标签（使用者的标签永不关闭）
+  await closeAgentTabs(t).catch(() => {}); // 每轮完成自动关闭 Agent 自开标签（使用者的标签永不关闭）
   t.turnSteps = 0;
   t.result = String(result);
   t.finishedAt = Date.now();
   t.conversation.push({ role: 'agent', text: String(result), ok: true, t: Date.now() });
   if (t.conversation.length > MAX_CONVERSATION) t.conversation = t.conversation.slice(-MAX_CONVERSATION);
   t.history.push({ role: 'assistant', content: '本轮回答：' + String(result) });
-  await saveTask();
-  addLog('本轮完成（第 ' + t.steps + ' 步），等待下一条指令');
-  broadcast({ type: 'AGENT_MESSAGE', text: String(result), ok: true });
-  broadcast({ type: 'AGENT_STATUS', status: 'idle' });
-  broadcastTabs();
+  await saveTasks();
+  addLog(t.sid, '本轮完成（第 ' + t.steps + ' 步），等待下一条指令');
+  broadcast({ type: 'AGENT_MESSAGE', text: String(result), ok: true }, t.sid);
+  broadcast({ type: 'AGENT_STATUS', status: 'idle' }, t.sid);
+  broadcastTabs(t);
   clearAlarm();
 }
 
-async function fail(msg) {
-  const t = task;
+async function fail(t, msg) {
   if (!t) return;
   if (t.state === 'idle') return; // 已被新指令打断/停止
   t.state = 'idle';
-  await closeAgentTabs().catch(() => {}); // 每轮失败也清理 Agent 自开标签（使用者的标签永不关闭）
+  await closeAgentTabs(t).catch(() => {}); // 每轮失败也清理 Agent 自开标签（使用者的标签永不关闭）
   t.turnSteps = 0;
   t.error = String(msg);
   t.finishedAt = Date.now();
   t.conversation.push({ role: 'agent', text: '未完成：' + msg, ok: false, t: Date.now() });
   if (t.conversation.length > MAX_CONVERSATION) t.conversation = t.conversation.slice(-MAX_CONVERSATION);
   t.history.push({ role: 'assistant', content: '本轮未能完成：' + msg });
-  await saveTask();
-  addLog('本轮失败：' + msg + '（可继续下一条指令）');
-  broadcast({ type: 'AGENT_MESSAGE', text: String(msg), ok: false });
-  broadcast({ type: 'AGENT_STATUS', status: 'idle' });
-  broadcastTabs();
+  await saveTasks();
+  addLog(t.sid, '本轮失败：' + msg + '（可继续下一条指令）');
+  broadcast({ type: 'AGENT_MESSAGE', text: String(msg), ok: false }, t.sid);
+  broadcast({ type: 'AGENT_STATUS', status: 'idle' }, t.sid);
+  broadcastTabs(t);
   clearAlarm();
 }
 
 // ---------------- 对话控制 ----------------
-async function startConversation(tabId) {
-  task = {
-    id: 't' + Date.now(),
-    mainTabId: tabId,
-    tabSeq: 0,
-    userTabSeq: 0,
-    tabs: [{ ref: 'MAIN', tabId, role: 'main', title: '', url: '' }],
-    currentRef: 'MAIN',
-    groupId: null,
-    waitTabId: null,
-    goal: '',
-    state: 'idle', // idle = 等待使用者第一条指令
-    turnId: 0,     // 回合号，用于打断旧回合
-    turnHistoryStart: 0, // 本回合在 history 里的起点（复盘时切出本轮访问过的站点）
-    steps: 0,
-    turnSteps: 0,  // 本轮步数（每轮重置，maxSteps 按轮生效）
-    failStreak: 0, // 本轮连续失败次数（>=3 转人工）
-    askText: null, // 等待使用者时的提示文案
-    askMode: 'page', // page=需在页面上操作；reply=需在对话中回复；teach=教我模式（演示学习）
-    waitingReply: false, // 是否正等待使用者在对话中回复
-    teachTabId: null,    // 教我模式主教学标签（进入时当前操作标签）
-    teachTabIds: [],     // 教我模式监听【任务下所有 tab】的录制挂载清单
-    teachEvents: [],     // 教我模式录制缓冲（content 批量上报 TEACH_EVENT 累积）
-    history: [{ role: 'system', content: systemPrompt() }],
-    ctxSummary: null,   // 历史压缩摘要（已完成进展 / 踩过的坑 / 用户注意点）
-    ctxBoundary: 0,     // 历史下标：该下标之前的消息已并入 ctxSummary，之后逐条发送
-    conversation: [],
-    result: null,
-    error: null,
-    startedAt: Date.now(),
-    awaitingNavAt: 0,
-    navWaitIdx: null, // "正在打开页面，等待就绪…"在 logs 里的索引，就绪后合并成一行
-    lastActiveAt: Date.now(),
-    consecWaits: 0,   // 连续 wait 次数（无真实动作插入时累计，防"假装人类"空转）
-    lastActSig: '',   // 最近一次执行（成功或失败）的页面动作签名，识别"反复执行同一个动作"的无进展循环
-    stuck: 0          // 无进展计数：连续失败/重复同一动作/空等累计，换新动作清零，>=STUCK_TEACH_LIMIT 转教我
-  };
-  await saveTask();
-  await refreshBookmarkIndex(); // 把书签载入上下文，作为网站工具索引
-  const mainTab = await getTab(tabId);
-  if (mainTab) {
-    task.tabs[0].title = mainTab.title || '';
-    task.tabs[0].url = mainTab.url || '';
-  }
-  if (bookmarkIndexCache) addLog('已准备好常用网站（书签）', true);
-  broadcast({ type: 'AGENT_STATUS', status: 'idle' });
-  broadcastTabs();
-}
 
 // 教我模式：使用者在对话里说这类话时，暂停并记录其页面操作来学习
 const TEACH_INTENT = /我教你|教你操作|我演示|演示给你|你看我怎么|看好了|你来操作|我来操作|手把手教|跟我学|我做一遍|示范/;
@@ -2353,9 +2453,8 @@ const TEACH_REDEMO_INTENT = /重新演示|重新教|再演示一遍|再演示|�
 const TEACH_CONFIRM_INTENT = /没问题|确认|没错|无误|正确|赞同|就这样|可以|好的|嗯嗯|嗯的|是的|对的|按你教的|按你说的|^对[啊呀]?[！!。.\s]*$|^行[啊呀]?[！!。.\s]*$|^好[啊呀]?[！!。.\s]*$|^OK$|^ok$/;
 
 // 进入教我模式：暂停当前回合，把教学标签切到前台并启动事件录制，等使用者操作完点"我操作完了"
-async function enterTeachMode(content, tabId) {
-  await loadTask();
-  const midTask = !!(task && (task.state === 'working' || task.state === 'awaiting_nav'));
+async function enterTeachMode(t, content, tabId) {
+  const midTask = !!(t && (t.state === 'working' || t.state === 'awaiting_nav'));
   let teachTabId = null;
   if (!midTask) {
     // 空闲/无任务：教学目标是当前前台标签（无任务则以它建对话）
@@ -2363,21 +2462,19 @@ async function enterTeachMode(content, tabId) {
     else {
       try { const [a] = await chrome.tabs.query({ active: true, lastFocusedWindow: true }); teachTabId = a ? a.id : null; } catch (e) {}
     }
-    if (!teachTabId) { addLog('教你模式：未找到可操作的标签页', true); return; }
-    if (!task) await startConversation(teachTabId);
-    const entry = findTabEntryByTabId(teachTabId);
+    if (!teachTabId) { addLog(t.sid, '教你模式：未找到可操作的标签页', true); return; }
+    const entry = findTabEntryByTabId(teachTabId, t);
     if (entry) {
-      task.currentRef = entry.ref;
+      t.currentRef = entry.ref;
     } else {
       const tb = await getTab(teachTabId);
-      if (!tb) { addLog('教你模式：目标标签已关闭', true); return; }
-      const ref = 'U' + ++task.userTabSeq;
-      task.tabs.push({ ref, tabId: teachTabId, role: 'user', title: tb.title || '', url: tb.url || '' });
-      task.currentRef = ref;
-      addLog('教你模式：把当前前台标签纳入任务（@' + ref + '）');
+      if (!tb) { addLog(t.sid, '教你模式：目标标签已关闭', true); return; }
+      const ref = 'U' + ++t.userTabSeq;
+      t.tabs.push({ ref, tabId: teachTabId, role: 'user', title: tb.title || '', url: tb.url || '' });
+      t.currentRef = ref;
+      addLog(t.sid, '教你模式：把当前前台标签纳入任务（@' + ref + '）');
     }
   }
-  const t = task;
   t.turnId++;
   t.state = 'working'; // 临时置 working（覆盖 idle/done/waiting_user），让 askUser 的校验通过
   t.turnSteps = 0;
@@ -2391,30 +2488,27 @@ async function enterTeachMode(content, tabId) {
   t.turnHistoryStart = t.history.length;
   if (!t.goal) {
     let host = '';
-    try { const tb = await getTab(teachTabId || task.mainTabId); host = hostOf((tb && tb.url) || ''); } catch (e) {}
+    try { const tb = await getTab(teachTabId || t.mainTabId); host = hostOf((tb && tb.url) || ''); } catch (e) {}
     t.goal = '学习使用者在 ' + (host || '该网站') + ' 的演示操作';
   }
   t.lastInstruction = content;
   t.history.push({ role: 'user', content });
-  await saveTask();
-  await askUser('请你在这个页面上操作，我会记录你的每一步操作来学习；完成后点「我操作完了」', 'teach');
+  await saveTasks();
+  await askUser(t, '请你在这个页面上操作，我会记录你的每一步操作来学习；完成后点「我操作完了」', 'teach');
 }
 
 // 处理使用者新指令：无对话则新建；有则打断当前回合并开始新回合
-async function processUserMessage(text, tabId) {
+async function processUserMessage(sid, text, tabId) {
   const content = String(text || '').trim();
   if (!content) return;
 
-  await loadTask();
-  if (!task) {
-    if (!tabId) throw new Error('缺少标签页');
-    await startConversation(tabId);
-  }
-  const t = task;
+  await ensureSession(sid, tabId);
+  const t = getTask(sid);
+  if (!t) return;
 
   // 教我模式：使用者说"我教你/我演示"等话时，暂停并记录其页面操作来学习（优先于回复/普通指令判断）
   if (TEACH_INTENT.test(content)) {
-    await enterTeachMode(content, tabId);
+    await enterTeachMode(t, content, tabId);
     return;
   }
 
@@ -2426,7 +2520,7 @@ async function processUserMessage(text, tabId) {
   //     循环一直持续到使用者确认 / 说不教了 / 说先去做为止，不再"一有出入就重开演示"。
   if (t.askMode === 'confirm') {
     if (TEACH_QUIT_INTENT.test(content)) {
-      addLog('使用者终止教学：' + content.slice(0, 40));
+      addLog(t.sid, '使用者终止教学：' + content.slice(0, 40));
       t.askMode = null;
       t.askText = null;
       t.waitTabId = null;
@@ -2442,26 +2536,26 @@ async function processUserMessage(text, tabId) {
         role: 'user',
         content: '使用者决定不再让你按演示教学，回复了：「' + content + '」。请放弃教学演示（已学到的思路可以保留），按你目前的理解自行继续完成原始目标；完成不了的部分可再用 ask_user（mode:page/reply）向使用者求助。'
       });
-      await saveTask();
-      broadcast({ type: 'AGENT_STATUS', status: 'working' });
+      await saveTasks();
+      broadcast({ type: 'AGENT_STATUS', status: 'working' }, t.sid);
       setupAlarm();
-      agentStep().catch((e) => fail('运行异常：' + e.message));
+      agentStep(t).catch((e) => fail(t, '运行异常：' + e.message));
       return;
     }
     if (TEACH_REDEMO_INTENT.test(content)) {
-      addLog('使用者要求重新演示，放弃当前教学、重开新的演示');
+      addLog(t.sid, '使用者要求重新演示，放弃当前教学、重开新的演示');
       t.askMode = null;
-      await saveTask();
-      await enterTeachMode(content, tabId);
+      await saveTasks();
+      await enterTeachMode(t, content, tabId);
       return;
     }
     if (TEACH_CONFIRM_INTENT.test(content)) {
-      addLog('使用者在对话里确认复述无误：' + content.slice(0, 40));
-      await resumeAfterUser(content); // 把使用者的话带进去，避免重复占位
+      addLog(t.sid, '使用者在对话里确认复述无误：' + content.slice(0, 40));
+      await resumeAfterUser(t.sid, content); // 把使用者的话带进去，避免重复占位
       return;
     }
     // 纠正：保留原始目标/goal，进入"再理解-再确认"循环
-    addLog('使用者对复述提出纠正，进入再理解-再确认循环：' + content.slice(0, 60));
+    addLog(t.sid, '使用者对复述提出纠正，进入再理解-再确认循环：' + content.slice(0, 60));
     t.askMode = null;
     t.askText = null;
     t.waitTabId = null;
@@ -2476,17 +2570,17 @@ async function processUserMessage(text, tabId) {
       role: 'user',
       content: '使用者在确认阶段对你的理解提出了纠正：「' + content + '」。请重新理解他的纠正，对照演示步骤与你刚复述的内容修正你的理解（必要时先看当前页面快照核对），然后用 say 复述修正后的步骤，再用 ask_user（mode=confirm）再次请使用者确认。确认循环会一直持续，直到使用者明确说「没问题/确认」放行，或说「不教了/算了」「你先去做吧/你自己来」终止教学——不要未经再次确认就擅自继续执行，也不要自行猜测调整步骤。'
     });
-    await saveTask();
-    broadcast({ type: 'AGENT_STATUS', status: 'working' });
+    await saveTasks();
+    broadcast({ type: 'AGENT_STATUS', status: 'working' }, t.sid);
     setupAlarm();
-    agentStep().catch((e) => fail('运行异常：' + e.message));
+    agentStep(t).catch((e) => fail(t, '运行异常：' + e.message));
     return;
   }
 
   // 教我重录：仍在"演示录制中"（teach），回复说演示有问题/少步骤等 → 放弃当前录制，直接重开一个新的演示
   if (t.askMode === 'teach' && RETEACH_INTENT.test(content)) {
-    addLog('使用者反馈教学有误，放弃当前录制、重开新的演示');
-    await enterTeachMode(content, tabId);
+    addLog(t.sid, '使用者反馈教学有误，放弃当前录制、重开新的演示');
+    await enterTeachMode(t, content, tabId);
     return;
   }
 
@@ -2503,30 +2597,30 @@ async function processUserMessage(text, tabId) {
     t.history.push({ role: 'user', content: '使用者回复：' + content });
     t.conversation.push({ role: 'user', text: content, t: Date.now() });
     if (t.conversation.length > MAX_CONVERSATION) t.conversation = t.conversation.slice(-MAX_CONVERSATION);
-    await saveTask();
-    broadcast({ type: 'AGENT_STATUS', status: 'working' });
+    await saveTasks();
+    broadcast({ type: 'AGENT_STATUS', status: 'working' }, t.sid);
     setupAlarm();
-    agentStep().catch((e) => fail('运行异常：' + e.message));
+    agentStep(t).catch((e) => fail(t, '运行异常：' + e.message));
     return;
   }
 
   // 打断：正在执行/等待使用者的上一条指令先作废（turnId 增一，旧回合的后续 await 会自行退出）
   if (t.state === 'working' || t.state === 'awaiting_nav' || t.state === 'waiting_user') {
-    addLog('收到新指令，打断当前操作…');
+    addLog(t.sid, '收到新指令，打断当前操作…');
   }
   t.turnId++;
   t.state = 'working';
   t.turnSteps = 0;
   t.waitTabId = null;
   t.askText = null;
-  await stopTeachRecording(); // 打断时若正处于教我录制，先停掉录制（sendMessage 守卫读的是 askMode，故需在置空前调用）
+  await stopTeachRecording(t); // 打断时若正处于教我录制，先停掉录制（sendMessage 守卫读的是 askMode，故需在置空前调用）
   t.askMode = null;
   t.failStreak = 0;
   t.consecWaits = 0;   // 新回合重置"连续 wait 空转"计数
   t.lastActSig = '';   // 新回合重置"重复动作"识别
   t.stuck = 0;         // 新回合重置"无进展计数"
   t.lastActiveAt = Date.now();
-  lastTipsLoggedHost = ''; // 新回合重置"技巧加载提示"去重
+  t.lastTipsHost = ''; // 新回合重置"技巧加载提示"去重
 
   t.conversation.push({ role: 'user', text: content, t: Date.now() });
   if (t.conversation.length > MAX_CONVERSATION) t.conversation = t.conversation.slice(-MAX_CONVERSATION);
@@ -2536,53 +2630,53 @@ async function processUserMessage(text, tabId) {
   t.history.push({ role: 'user', content });
 
   await refreshBookmarkIndex(); // 新指令重新载入书签索引（书签可能已变）
-  await saveTask();
-  broadcast({ type: 'AGENT_STATUS', status: 'working' });
+  await saveTasks();
+  broadcast({ type: 'AGENT_STATUS', status: 'working' }, t.sid);
   setupAlarm();
-  agentStep().catch((e) => fail('运行异常：' + e.message));
+  agentStep(t).catch((e) => fail(t, '运行异常：' + e.message));
 }
 
 // 停止教我模式的录制并清理 teach 态（停止/新对话/中断时用）
-async function stopTeachRecording() {
-  if (!task) return;
-  const ids = task.teachTabId ? [task.teachTabId, ...(task.teachTabIds || [])] : (task.teachTabIds || []);
-  if (task.askMode === 'teach') {
+async function stopTeachRecording(t) {
+  if (!t) return;
+  const ids = t.teachTabId ? [t.teachTabId, ...(t.teachTabIds || [])] : (t.teachTabIds || []);
+  if (t.askMode === 'teach') {
     // 对【所有】已挂录制的教学 tab 逐个发 TEACH_STOP 停录
     for (const id of new Set(ids)) {
       if (id == null) continue;
       try { await chrome.tabs.sendMessage(id, { type: 'TEACH_STOP' }).catch(() => {}); } catch (e) {}
     }
   }
-  task.teachTabId = null;
-  task.teachTabIds = [];
-  task.teachEvents = [];
+  t.teachTabId = null;
+  t.teachTabIds = [];
+  t.teachEvents = [];
 }
 
 // 停止当前回合（不结束对话，可继续下一条指令）
-async function stopCurrent() {
-  await loadTask();
+async function stopCurrent(sid) {
+  const t = getTask(sid);
+  if (!t) return;
   clearAlarm();
-  if (!task) return;
-  if (task.state === 'working' || task.state === 'awaiting_nav' || task.state === 'waiting_user') {
-    const myTurn = task.turnId; // 钉住被停止回合的号，供停止后复盘判定是否被打断
-    await stopTeachRecording(); // 教我模式停止时一并停止录制
-    task.state = 'idle';
-    task.waitTabId = null;
-    task.askText = null;
-    task.turnSteps = 0;
-    await saveTask();
-    addLog('已停止当前操作，可继续对话');
-    broadcast({ type: 'AGENT_STATUS', status: 'idle' });
+  if (t.state === 'working' || t.state === 'awaiting_nav' || t.state === 'waiting_user') {
+    const myTurn = t.turnId; // 钉住被停止回合的号，供停止后复盘判定是否被打断
+    await stopTeachRecording(t); // 教我模式停止时一并停止录制
+    t.state = 'idle';
+    t.waitTabId = null;
+    t.askText = null;
+    t.turnSteps = 0;
+    await saveTasks();
+    addLog(t.sid, '已停止当前操作，可继续对话');
+    broadcast({ type: 'AGENT_STATUS', status: 'idle' }, t.sid);
     // 停止后仍做复盘：本轮实际访问过的网站 / 走过的弯路，照常沉淀成书签与操作技巧。
     // 后台执行不阻塞停止按钮的响应；期间若来了新指令（turnId 变化）复盘自动退出。
-    reviewAfterStop(myTurn);
+    reviewAfterStop(t, myTurn);
   }
 }
 
 // 停止后的复盘：任务已回 idle，用 force 让复盘在后台照常执行（LLM 判断本轮访问的网站是否有用、操作是否有困难）。
-async function reviewAfterStop(myTurn) {
-  try { await reviewAndBookmark(true, myTurn); } catch (e) { /* 复盘失败不影响停止 */ }
-  try { await reviewAndLearnTips(true, myTurn); } catch (e) { /* 技巧沉淀失败不影响停止 */ }
+async function reviewAfterStop(t, myTurn) {
+  try { await reviewAndBookmark(t, true, myTurn); } catch (e) { /* 复盘失败不影响停止 */ }
+  try { await reviewAndLearnTips(t, true, myTurn); } catch (e) { /* 技巧沉淀失败不影响停止 */ }
 }
 
 // 事件是否录自 iframe 子窗口（frameId 非 0 或缺失时视为主窗口）
@@ -2627,9 +2721,8 @@ function buildTeachRecipe(events) {
 
 // 使用者手动操作完成，继续当前回合（page / teach 两种模式）。
 // confirmedText：confirm 模式下使用者在对话里输入确认的话（有则带进上下文，避免与按钮占位重复）
-async function resumeAfterUser(confirmedText) {
-  await loadTask();
-  const t = task;
+async function resumeAfterUser(sid, confirmedText) {
+  const t = getTask(sid);
   if (!t || t.state !== 'waiting_user') return;
   if (t.waitingReply) return; // 对话回复模式没有"继续"按钮，回复直接走 processUserMessage
 
@@ -2684,11 +2777,11 @@ async function resumeAfterUser(confirmedText) {
     t.history.push({ role: 'user', content: msg });
     t.conversation.push({ role: 'user', text: '（我已演示完，请按我教的继续）', t: Date.now() });
     if (t.conversation.length > MAX_CONVERSATION) t.conversation = t.conversation.slice(-MAX_CONVERSATION);
-    await saveTask();
-    addLog('教我模式：已记录 ' + events.length + ' 步操作，交给 Agent 学习');
-    broadcast({ type: 'AGENT_STATUS', status: 'working' });
+    await saveTasks();
+    addLog(t.sid, '教我模式：已记录 ' + events.length + ' 步操作，交给 Agent 学习');
+    broadcast({ type: 'AGENT_STATUS', status: 'working' }, t.sid);
     setupAlarm();
-    agentStep().catch((e) => fail('运行异常：' + e.message));
+    agentStep(t).catch((e) => fail(t, '运行异常：' + e.message));
     return;
   }
 
@@ -2709,13 +2802,13 @@ async function resumeAfterUser(confirmedText) {
         if (!recipe) continue;
         const store = await getTipStore();
         const old = (store[host] || []).join('\n');
-        const merged = await mergeSiteTips(host, [recipe], old);
+        const merged = await mergeSiteTips(host, [recipe], old, t.sid);
         if (merged && merged.length) {
           await saveSiteTips(host, merged);
-          addLog('教我模式：使用者确认后，已把该站操作流程沉淀为技巧（' + host + '）');
+          addLog(t.sid, '教我模式：使用者确认后，已把该站操作流程沉淀为技巧（' + host + '）');
         }
       }
-    } catch (e) { addLog('教我模式：技巧沉淀失败 → ' + e.message, true); }
+    } catch (e) { addLog(t.sid, '教我模式：技巧沉淀失败 → ' + e.message, true); }
     t.teachEvents = [];
   }
 
@@ -2729,48 +2822,69 @@ async function resumeAfterUser(confirmedText) {
   t.history.push({ role: 'user', content: isConfirm ? (confirmedText ? '使用者确认了复述的步骤无误（他说：' + confirmedText + '），请按演示继续完成原始目标' : '使用者确认了复述的步骤无误，请按演示继续完成原始目标') : '使用者已完成手动操作，请继续' });
   t.conversation.push({ role: 'user', text: isConfirm ? (confirmedText || '（没问题，按我教的继续）') : '（已完成手动操作，请继续）', t: Date.now() });
   if (t.conversation.length > MAX_CONVERSATION) t.conversation = t.conversation.slice(-MAX_CONVERSATION);
-  await saveTask();
-  addLog(isConfirm ? '使用者确认复述无误，继续执行' : '使用者确认完成手动操作，继续执行');
-  broadcast({ type: 'AGENT_STATUS', status: 'working' });
+  await saveTasks();
+  addLog(t.sid, isConfirm ? '使用者确认复述无误，继续执行' : '使用者确认完成手动操作，继续执行');
+  broadcast({ type: 'AGENT_STATUS', status: 'working' }, t.sid);
   setupAlarm();
-  agentStep().catch((e) => fail('运行异常：' + e.message));
+  agentStep(t).catch((e) => fail(t, '运行异常：' + e.message));
 }
 
-// 新对话：关闭所有 Agent 自开标签、清空记录
-async function clearConversation() {
-  await loadTask();
+// 清空本会话：关闭该会话自开的 Agent 标签并清空对话记录（会话保留；新建走顶部会话栏 ＋）
+async function clearConversation(sid) {
+  const t = getTask(sid);
+  if (!t) return;
   clearAlarm();
-  if (task) {
-    task.state = 'done';
-    await stopTeachRecording(); // 新对话时停止教我模式的录制
-    await removeAgentGroup(); // 删 PageAgent 分组（组内即 Agent 自开标签）
-    for (const e of task.tabs || []) {
-      if (e.role === 'agent') {
-        const tab = await getTab(e.tabId); // 分组外兜底逐个关
-        if (tab) chrome.tabs.remove(e.tabId).catch(() => {});
-      }
-    }
-    task = null;
-  }
-  await chrome.storage.session.remove('task');
-  updateBadge(); // 清空角标
-  broadcast({ type: 'AGENT_CLEARED' });
-  broadcastTabs();
+  await stopTeachRecording(t); // 清空时停止教我模式的录制
+  await closeAgentTabs(t).catch(() => {}); // 关 Agent 自开 @T 标签并删分组（使用者的 @MAIN/@U 永不关闭）
+  t.turnId++; // 使旧回合的任何在途异步链自行退出
+  t.state = 'idle';
+  t.waitTabId = null;
+  t.goal = '';
+  t.lastInstruction = '';
+  t.steps = 0;
+  t.turnSteps = 0;
+  t.failStreak = 0;
+  t.stuck = 0;
+  t.consecWaits = 0;
+  t.lastActSig = '';
+  t.askText = null;
+  t.askMode = 'page';
+  t.waitingReply = false;
+  t.teachTabId = null;
+  t.teachTabIds = [];
+  t.teachEvents = [];
+  t.history = [{ role: 'system', content: systemPrompt() }];
+  t.ctxSummary = null;
+  t.ctxBoundary = 0;
+  t.tokens = 0; // 清空本会话 = 重新开始，token 用量一并清零
+  t.turnHistoryStart = 0;
+  t.conversation = [];
+  t.result = null;
+  t.error = null;
+  t.navWaitIdx = null;
+  t.lastActiveAt = Date.now();
+  await saveTasks();
+  updateBadge(); // 角标随之刷新
+  broadcast({ type: 'AGENT_CLEARED' }, t.sid);
+  broadcastTabs(t);
 }
 
 // ---------------- 注入与消息 ----------------
 // 教我模式中，教学标签在演示时导航到新页 / worker 恢复后：重发 TEACH_START 重挂事件录制。
 // 监听对象是【任务下所有 tab】：任何任务标签导航/恢复时都重挂，并把新挂载的 tab 补进 teachTabIds
 async function rearmTeachRecording(tabId, frameId) {
-  if (!(task && task.state === 'waiting_user' && task.askMode === 'teach')) return;
-  const isTaskTab = !!(task.tabs || []).some((e) => e.tabId === tabId);
-  const isTeachTab = (task.teachTabIds || []).includes(tabId) || task.teachTabId === tabId;
+  const sid = sessionOfTab(tabId); // 按标签路由到所属会话
+  if (!sid) return;
+  const t = getTask(sid);
+  if (!(t && t.state === 'waiting_user' && t.askMode === 'teach')) return;
+  const isTaskTab = !!(t.tabs || []).some((e) => e.tabId === tabId);
+  const isTeachTab = (t.teachTabIds || []).includes(tabId) || t.teachTabId === tabId;
   if (!isTaskTab && !isTeachTab) {
     // 教学期间使用者演示中【新开/导航到】一个此前未知的标签（如点了"新建"打开的新页面）：
     // 使用者只演示不指挥，把新页纳入任务（@U）并挂上录制，跨页演示的后续操作才不漏。
     // 受限页（chrome:// 等）由 adoptTeachTab 自行忽略；已挂录制的标签重复触发会走上面的重挂分支。
     console.log('[Teach] 教学演示新开标签 → 纳入任务并挂录制 tab=' + tabId);
-    await adoptTeachTab(tabId);
+    await adoptTeachTab(tabId, t);
     return;
   }
   // frameId 指定（子窗口就绪，可能是 JS 动态新开的 iframe）：只给该窗口挂录制，
@@ -2786,9 +2900,9 @@ async function rearmTeachRecording(tabId, frameId) {
   try {
     await ensureContentScript(tabId);
     await chrome.tabs.sendMessage(tabId, { type: 'TEACH_START' }).catch(() => {});
-    if (!(task.teachTabIds || []).includes(tabId)) {
-      (task.teachTabIds = task.teachTabIds || []).push(tabId);
-      await saveTask();
+    if (!(t.teachTabIds || []).includes(tabId)) {
+      (t.teachTabIds = t.teachTabIds || []).push(tabId);
+      await saveTasks();
     }
   } catch (e) { console.log('[Teach] 重挂失败 → ' + e.message); }
 }
@@ -2801,11 +2915,13 @@ async function ensureContentScript(tabId) {
   }
 }
 
-function serializeTask() {
-  const t = task;
+function serializeSession(t) {
   if (!t) return null;
   return {
     id: t.id,
+    sid: t.sid,
+    n: t.n,
+    groupTitle: t.groupTitle,
     tabId: t.mainTabId,
     goal: t.goal,
     lastInstruction: t.lastInstruction || null,
@@ -2831,7 +2947,8 @@ function serializeTask() {
     result: t.result,
     error: t.error,
     startedAt: t.startedAt,
-    finishedAt: t.finishedAt
+    finishedAt: t.finishedAt,
+    tokens: t.tokens || 0
   };
 }
 
@@ -2852,24 +2969,64 @@ async function handleMessage(msg, sender) {
       await saveConfig(msg.config || {});
       return { ok: true };
     case 'GET_STATE':
-      await loadTask();
-      return { task: serializeTask(), config: await getConfig() };
+      await loadTasks();
+      const sessions = Object.keys(tasks)
+        .map((sid) => serializeSession(tasks[sid]))
+        .sort((a, b) => a.n - b.n);
+      return { activeId, sessions, config: await getConfig() };
+    case 'CREATE_SESSION': { // 顶部会话栏 ＋：新建一个空闲会话
+      const t = await createSession();
+      if (!t) return { ok: false, error: '最多 ' + MAX_SESSIONS + ' 个会话' };
+      return { ok: true, sid: t.sid, n: t.n };
+    }
+    case 'DELETE_SESSION': { // 会话栏 ×：删会话（面板已确认），关其 @T 并释放编号
+      const sid = msg.sid;
+      const t = getTask(sid);
+      if (!t) return { ok: true, activeId };
+      if (t.state === 'working' || t.state === 'awaiting_nav' || t.state === 'waiting_user') {
+        await stopCurrent(sid); // 非空闲会话先停掉当前回合
+      }
+      await stopTeachRecording(t);
+      await closeAgentTabs(t).catch(() => {}); // 关 Agent 自开标签并删分组（使用者的标签永不关闭）
+      delete tasks[sid];
+      if (activeId === sid) {
+        const rest = Object.keys(tasks).map((k) => tasks[k]).sort((a, b) => b.n - a.n); // 切到剩余编号最大的
+        activeId = rest.length ? rest[0].sid : null;
+      }
+      await saveTasks();
+      clearAlarm();
+      return { ok: true, activeId };
+    }
+    case 'SET_ACTIVE':
+      setActive(msg.sid);
+      return { ok: true };
+    case 'VIEW_TAB': { // 求助卡「查看」：把浏览器聚焦到该会话当前操作页面的标签上
+      const t = getTask(msg.sid);
+      if (!t) return { ok: false };
+      const tabId = await resolveCurrentTabId(t);
+      if (!tabId) return { ok: false, error: '当前没有可查看的标签' };
+      const tab = await getTab(tabId);
+      if (!tab) return { ok: false };
+      await chrome.tabs.update(tabId, { active: true }).catch(() => {});
+      if (tab.windowId) chrome.windows.update(tab.windowId, { focused: true }).catch(() => {});
+      return { ok: true };
+    }
     case 'SEND':
-      // 新指令：首条会创建对话，后续延续同一对话
-      await processUserMessage(msg.text, msg.tabId);
+      // 新指令：首条会创建会话并把 @MAIN 钉到当前标签，后续延续同一会话
+      await processUserMessage(msg.sid, msg.text, msg.tabId);
       return { ok: true };
     case 'START': // 兼容：等同 SEND
       if (!msg.tabId) throw new Error('缺少标签页');
-      await processUserMessage(msg.goal || msg.text, msg.tabId);
+      await processUserMessage(msg.sid, msg.goal || msg.text, msg.tabId);
       return { ok: true };
     case 'STOP':
-      await stopCurrent();
+      await stopCurrent(msg.sid);
       return { ok: true };
     case 'RESUME': // 使用者手动操作完成，继续当前回合
-      await resumeAfterUser();
+      await resumeAfterUser(msg.sid);
       return { ok: true };
     case 'CLEAR':
-      await clearConversation();
+      await clearConversation(msg.sid);
       return { ok: true };
     case 'GET_TIPS': // 面板技巧管理：读取全部站点操作技巧 { [host]: string[] }
       return { tips: await getTipStore() };
@@ -2917,31 +3074,38 @@ async function handleMessage(msg, sender) {
     case 'TEACH_EVENT': { // 教我模式：content 批量上报录制的用户操作
       const src = sender && sender.tab ? sender.tab.id : null;
       const evts = Array.isArray(msg.events) ? msg.events : [];
-      // 监听任务下所有 tab：任何已挂载录制（teachTabIds）或教学主标签上报的事件都收
-      const teachIds = (task && task.teachTabIds) || [];
-      const matched = !!(task && task.askMode === 'teach' && (src != null && (teachIds.includes(src) || task.teachTabId === src)));
+      // 按上报标签定位会话：正常应落在教学会话；兜底退回唯一教学会话
+      const tt = getTask(sessionOfTab(src)) || getTask(findTeachSid());
+      if (!tt) return { ok: true };
+      const teachIds = (tt.teachTabIds) || [];
+      const matched = !!(tt.askMode === 'teach' && (src != null && (teachIds.includes(src) || tt.teachTabId === src)));
       console.log('[Teach] 收到 TEACH_EVENT tab=' + src + ' 条数=' + evts.length + ' 匹配教学会话=' + matched + ' 类型=[' + evts.map((e) => e.t).join(',') + ']');
       if (matched && evts.length) {
-        task.teachEvents = task.teachEvents || [];
+        tt.teachEvents = tt.teachEvents || [];
         // 给每条事件补上来源 tab / host / frame（收尾按网站分组沉淀技巧用；frameId 标记 iframe 内步骤，复现时按窗口定位）
         const srcHost = hostOf(sender && sender.tab ? (sender.tab.url || '') : '');
         const srcFrame = (sender && sender.frameId) || 0;
         for (const e of evts) { e.tab = src; e.host = srcHost || e.host || ''; e.frameId = e.frameId || srcFrame; }
-        task.teachEvents.push(...evts);
-        console.log('[Teach] 累计 teachEvents=' + task.teachEvents.length);
-        await saveTask();
-        broadcast({ type: 'AGENT_TEACH_STEPS', count: task.teachEvents.length }); // 面板实时步数
+        tt.teachEvents.push(...evts);
+        console.log('[Teach] 累计 teachEvents=' + tt.teachEvents.length);
+        await saveTasks();
+        broadcast({ type: 'AGENT_TEACH_STEPS', count: tt.teachEvents.length }, tt.sid); // 面板实时步数
       }
       return { ok: true };
     }
-    case 'AGENT_DEBUG': // content script 回报的调试日志
-      if (task) addLog('[页面] ' + String(msg.text || ''), true);
+    case 'AGENT_DEBUG': { // content script 回报的调试日志
+      const tt = getTask(sessionOfTab(sender && sender.tab ? sender.tab.id : null)) || activeTask();
+      if (tt) addLog(tt.sid, '[页面] ' + String(msg.text || ''), true);
       return { ok: true };
+    }
     case 'AGENT_READY': // 顶层 frame content script 注入完成（可能是 navigate 后的新页面或新开的后台标签）
       if (sender && sender.tab) {
         console.log('[PageAgent] AGENT_READY tab=' + sender.tab.id + ' ' + (sender.tab.url || ''));
-        refreshTabEntry(sender.tab.id, sender.tab);
-        tryResume(sender.tab.id);
+        const tt = getTask(sessionOfTab(sender.tab.id));
+        if (tt) {
+          refreshTabEntry(sender.tab.id, sender.tab, tt);
+          tryResume(tt.sid, sender.tab.id);
+        }
         rearmTeachRecording(sender.tab.id); // 教我模式中用户演示时导航到新页：重挂录制
       }
       return { ok: true };
@@ -2956,21 +3120,24 @@ async function handleMessage(msg, sender) {
   }
 }
 
-// 页面加载完成事件（AGENT_READY 消息的兜底）
+// 页面加载完成事件（AGENT_READY 消息的兜底）；只影响所属会话，其他会话不受影响
 chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
   if (changeInfo.status === 'complete') {
-    const isWait = !!(task && task.state === 'awaiting_nav' && task.waitTabId === tabId);
+    const sid = sessionOfTab(tabId);
+    const tt = getTask(sid);
+    const isWait = !!(tt && tt.state === 'awaiting_nav' && tt.waitTabId === tabId);
     if (isWait) console.log('[PageAgent] onUpdated complete tab=' + tabId + '（正是等待中的标签，触发恢复）');
-    refreshTabEntry(tabId, null);
-    tryResume(tabId);
+    if (tt) refreshTabEntry(tabId, null, tt);
+    if (sid) tryResume(sid, tabId);
     rearmTeachRecording(tabId); // 教我模式中演示导航到新页：重挂录制
   }
 });
 
-// 标签被使用者或系统关闭时，若正是任务标签则移除记录
+// 标签被使用者或系统关闭时，只移除所属会话的记录（"开页面关页面互不影响"）
 chrome.tabs.onRemoved.addListener((tabId) => {
-  const t = task;
-  if (!t) return;
+  const sid = sessionOfTab(tabId);
+  if (!sid) return;
+  const t = getTask(sid);
   const e = (t.tabs || []).find((x) => x.tabId === tabId);
   if (!e) return;
   t.tabs = t.tabs.filter((x) => x.tabId !== tabId);
@@ -2982,9 +3149,9 @@ chrome.tabs.onRemoved.addListener((tabId) => {
   if (t.state === 'awaiting_nav' && t.waitTabId === tabId) {
     t.state = 'working';
     t.waitTabId = null;
-    saveTask().then(() => pushFailure('等待中的标签已被关闭：' + e.ref));
+    saveTasks().then(() => pushFailure(t, '等待中的标签已被关闭：' + e.ref));
   } else {
-    saveTask();
+    saveTasks();
   }
 });
 
