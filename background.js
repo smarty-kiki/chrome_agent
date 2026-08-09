@@ -143,6 +143,7 @@ async function createSession(tabId) {
     teachTabId: null,    // 教我模式主教学标签（进入时当前操作标签）
     teachTabIds: [],     // 教我模式监听【任务下所有 tab】的录制挂载清单
     teachEvents: [],     // 教我模式录制缓冲（content 批量上报 TEACH_EVENT 累积）
+    llmLogs: [],         // 大模型往返日志（面板"日志"视图）：每步决策 { t, req, res }
     history: [{ role: 'system', content: systemPrompt() }],
     ctxSummary: null,   // 历史压缩摘要（已完成进展 / 踩过的坑 / 用户注意点）
     ctxBoundary: 0,     // 历史下标：该下标之前的消息已并入 ctxSummary，之后逐条发送
@@ -233,6 +234,43 @@ function addLog(sid, m, quiet) {
 // 改写面板最后一行动作行（如把"正在打开页面，等待就绪…"补上就绪时间）
 function updateLog(sid, idx, m) {
   broadcast({ type: 'AGENT_ACTIVITY_UPDATE', text: String(m) }, sid);
+}
+
+// ---------------- 大模型往返日志（面板"日志"视图用） ----------------
+// 每步 LLM 决策记录一条：给大模型发了什么【从简】（消息条数 + 输入量 + 当前页面）、返回了什么【全量】。
+// 存进 t.llmLogs（GET_STATE 带出，面板切走/重开仍在），同时广播 AGENT_LLM_LOG 实时推送。
+const MAX_LLM_LOG = 150; // 每会话保留的大模型往返日志条数上限
+const MAX_LLM_LOG_RES = 6000; // 单条日志里原始返回的最大字符数（防止长 finish 结果把面板撑爆）
+
+// 发送内容的简况：消息条数 + 输入字符量 + 当前操作页面（取自 history 末条快照里的 URL）
+function llmReqBrief(t, msgs) {
+  let chars = 0;
+  for (const m of msgs) chars += String(m.content || '').length;
+  let page = '';
+  const hist = (t && t.history) || [];
+  const last = hist[hist.length - 1];
+  if (last && last.content) {
+    const m = String(last.content).match(/URL:\s*(\S+)/);
+    if (m) page = shortUrl(m[1]);
+  }
+  const size = chars > 1000 ? (chars / 1000).toFixed(1) + 'k' : String(chars);
+  return '发送 ' + msgs.length + ' 条 · 输入约 ' + size + ' 字符' + (page ? ' · ' + page : '');
+}
+
+function logLLMExchange(t, msgs, raw) {
+  try {
+    if (!t || !t.sid) return;
+    if (!t.llmLogs) t.llmLogs = [];
+    const entry = {
+      t: Date.now(),
+      req: llmReqBrief(t, msgs),
+      res: String(raw || '').slice(0, MAX_LLM_LOG_RES)
+    };
+    t.llmLogs.push(entry);
+    if (t.llmLogs.length > MAX_LLM_LOG) t.llmLogs.splice(0, t.llmLogs.length - MAX_LLM_LOG);
+    console.log('[PageAgent] LLM 往返：' + entry.req);
+    broadcast({ type: 'AGENT_LLM_LOG', req: entry.req, res: entry.res, t: entry.t }, t.sid);
+  } catch (e) { /* 日志失败不影响主流程 */ }
 }
 
 // 防"页面动作触发的 window.open 抢前台焦点"（target=_blank 链接已在 content.js 截获，这里是 JS 新开的兜底）：
@@ -468,7 +506,7 @@ function systemPrompt() {
 - 目标是"总结/摘要"时：用 read 读取（可跨标签读取多个页面），然后 finish 输出简洁、结构化的中文总结。
 - 目标要求"保存为文件/导出/下载"时：用 save_file 把总结或抓取结果写成文件（文件名带合适的扩展名），保存后再 finish 告知使用者文件路径。
 - 任务涉及"我的书签/收藏"时：查询/盘点用 bookmarks_read（可指定 folder 只看某个文件夹）；要把某网址加入收藏用 bookmarks_write（folder 填目标文件夹名，不填就放"其他书签"）。
-- 任务涉及某个已知网站/工具（如"去 Claude 问个问题""打开我的网盘""在知乎搜 XX"）时：先查【网站工具索引】（书签，标题即用途），凭标题匹配网址直接用 open_tab 打开；索引里没找到就 bookmark_find 搜书签，再没有才用 search 网页搜索。
+- 任务涉及某个已知网站/工具（如"打开我的网盘""在知乎搜 XX"），或指令要做的场景能在【网站工具索引】里匹配到能干这事的网站（如"压缩图片""查论文"）时：先查【网站工具索引】（书签，标题即用途），凭标题匹配网址直接用 open_tab 打开；索引里没找到就 bookmark_find 搜书签，再没有才用 search 网页搜索。
 - 目标是"操作"时：逐步执行直到达成，最后 finish 输出操作结果。
 - 遇到验证码、登录墙、人机验证弹窗，或某动作反复失败无法推进时，用 ask_user（mode=page）请使用者在【页面上】手动操作（把需要做什么写清楚）；需要使用者提供信息/补充说明时，用 ask_user（mode=reply）请使用者在【对话中】直接回复。某个动作反复尝试仍无进展（连续好几次同样的操作或失败）时，主动用 ask_user（mode=teach）请使用者在当前页面上手把手演示正确操作来学习——系统也会在你重复多次后自动弹出教学请求。**不要无限重试浪费时间**。
 - type 会覆盖输入框原有内容；填表前先 click 聚焦。
@@ -558,7 +596,7 @@ async function buildMessages(t) {
   if (bookmarkIndexCache) {
     msgs.push({
       role: 'system',
-      content: '【你的网站工具索引：来自浏览器书签，标题即用途】每条为"文件夹/标题 — 网址"。当指令涉及某个网站/工具时，直接从索引里匹配标题对应的网址，用 open_tab 打开；索引未列全时用 bookmark_find 按关键词精确查找。\n' + bookmarkIndexCache
+      content: '【你的网站工具索引：来自浏览器书签，标题即用途】每条为"文件夹/标题 — 网址"，标题写明了网站能干什么。指令点名某网站/工具、或指令要做的场景能在标题的用途描述里匹配到对应网站（如"压缩图片""查论文"）时，直接 open_tab 打开该网址；索引匹配不到再用 bookmark_find 按关键词精确查找。\n' + bookmarkIndexCache
     });
   }
   // 压缩摘要：中间历史已被合并成"进展 + 踩过的坑 + 用户注意点"
@@ -1211,7 +1249,9 @@ async function agentStep(t) {
   for (let i = 0; i < MAX_STEP_LLM_RETRY && !action; i++) {
     let raw = null;
     try {
-      raw = await callLLM(await buildMessages(t), undefined, t);
+      const msgs = await buildMessages(t);
+      raw = await callLLM(msgs, undefined, t);
+      logLLMExchange(t, msgs, raw); // 记录大模型往返（发送简况 + 原始返回），供面板"日志"视图排查
       console.log('[PageAgent] LLM 原始输出：' + String(raw).slice(0, 800));
       action = parseAction(raw);
     } catch (e) {
@@ -2876,6 +2916,7 @@ async function clearConversation(sid) {
   t.teachTabId = null;
   t.teachTabIds = [];
   t.teachEvents = [];
+  t.llmLogs = []; // 清空本会话：大模型往返日志一并清零
   t.history = [{ role: 'system', content: systemPrompt() }];
   t.ctxSummary = null;
   t.ctxBoundary = 0;
@@ -2966,6 +3007,7 @@ function serializeSession(t) {
     teachTabId: t.teachTabId || null,
     teachTabIds: t.teachTabIds || [],
     teachEvents: t.teachEvents || [],
+    llmLogs: t.llmLogs || [], // 大模型往返日志（面板"日志"视图，切走/重开面板不丢）
     navWaitIdx: t.navWaitIdx || null,
     result: t.result,
     error: t.error,

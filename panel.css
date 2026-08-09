@@ -91,7 +91,13 @@ input:focus { outline: none; border-color: var(--accent); }
   border-bottom: 1px solid var(--border);
   background: var(--bg-2);
   flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  gap: 8px;
 }
+#statusText { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+#logToggle { padding: 1px 8px; font-size: 11px; flex-shrink: 0; }
+#logToggle.log-active { background: var(--accent); border-color: var(--accent); color: #fff; }
 /* ---------------- 顶部会话栏 ---------------- */
 #sessionBar {
   display: flex;
@@ -418,6 +424,47 @@ input:focus { outline: none; border-color: var(--accent); }
 }
 .msg.agent.md hr { border: none; border-top: 1px solid var(--border); margin: .5em 0; }
 
+/* ---------------- 大模型往返日志视图 ---------------- */
+#logList {
+  flex: 1;
+  overflow-y: auto;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+#logList[hidden] { display: none; }
+#messages[hidden] { display: none; }
+.llm-log {
+  background: var(--bg-3);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 8px 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.llm-log-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 11px;
+}
+.llm-log-time { color: var(--muted); font-family: ui-monospace, "SF Mono", Menlo, monospace; flex-shrink: 0; }
+.llm-log-req { color: var(--accent); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.llm-log-res {
+  margin: 0;
+  background: #14161b;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 6px 8px;
+  white-space: pre-wrap;
+  word-break: break-all;
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  font-size: 11px;
+  color: var(--text);
+}
+
 /* ---------------- 底部输入 ---------------- */
 #inputBar {
   border-top: 1px solid var(--border);
@@ -468,6 +515,7 @@ button:disabled { opacity: .5; cursor: default; }
 .danger { background: transparent; border-color: var(--danger); color: var(--danger); }
 
 /* ---------------- 元素排查调试工具 ---------------- */
+#settings #debugBtn { width: 100%; } /* 设置里的排查按钮对齐输入框宽度 */
 #debugBtn.debug-active {
   background: var(--accent);
   border-color: var(--accent);

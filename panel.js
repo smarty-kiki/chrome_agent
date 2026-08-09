@@ -10,11 +10,13 @@
 
 const $ = (s) => document.querySelector(s);
 const MAX_SESSIONS = 5;
+const MAX_LLM_LOG = 150; // 日志视图每会话保留的大模型往返条数上限（与后台一致）
 
 let currentTabId = null;
 let activeSid = null; // 当前查看的会话
 let teachStepEl = null; // 教我模式卡里实时步数元素（AGENT_TEACH_STEPS 更新）
 let pickActive = false; // 元素排查模式是否开启（调试工具，AGENT_DEBUG_PICK_STATE 同步）
+let logView = false; // 日志视图是否开启（状态栏"日志"切换：会话消息 / 大模型往返日志）
 
 // 每会话缓存：sid -> { sid, n, msgs: [], tabs: [], status, statusLabel, statusClass, askMode, teachSteps }
 const sessionCache = {};
@@ -33,7 +35,8 @@ function ensureCache(sid, n) {
       statusClass: '',
       askMode: 'page',
       teachSteps: 0,
-      tokens: 0
+      tokens: 0,
+      logs: [] // 大模型往返日志（每步 { t, req, res }）
     };
   }
   return sessionCache[sid];
@@ -92,7 +95,7 @@ async function refreshTab() {
 // ---------------- 状态 / 消息渲染 ----------------
 function setStatus(text, cls) {
   const bar = $('#statusBar');
-  bar.textContent = text;
+  $('#statusText').textContent = text;
   bar.className = cls || '';
 }
 
@@ -537,6 +540,7 @@ function switchSession(sid) {
   const cache = ensureCache(sid);
   renderSessionMsgs(sid);
   renderTabs(cache.tabs);
+  if (logView) renderLogList(); // 日志视图开着时切会话也要跟着换
   setSessionStatus(cache);
   chrome.runtime.sendMessage({ type: 'SET_ACTIVE', sid }).catch(() => {});
 }
@@ -580,6 +584,7 @@ function resetSessionUI(sid) {
   c.askMode = 'page';
   c.teachSteps = 0;
   c.tokens = 0; // 清空本会话：token 用量一并清零
+  c.logs = []; // 大模型往返日志一并清空
   renderSessionBar();
   renderHeaderTokens();
   if (sid === activeSid) {
@@ -673,6 +678,63 @@ function updateDebugBtn() {
   const b = $('#debugBtn');
   b.textContent = pickActive ? '退出排查' : '排查';
   b.classList.toggle('debug-active', pickActive);
+}
+
+// ---------------- 大模型往返日志视图 ----------------
+// 状态栏「日志」切换：把消息区从会话对话切到本会话的大模型往返日志（每步发了什么、返回了什么）。
+// 数据来自后台 AGENT_LLM_LOG 广播 + GET_STATE 恢复（llmLogs），按会话缓存。
+function setLogView(on) {
+  logView = on;
+  $('#messages').hidden = on;
+  $('#logList').hidden = !on;
+  const btn = $('#logToggle');
+  btn.textContent = on ? '对话' : '日志';
+  btn.classList.toggle('log-active', on);
+  if (on) renderLogList();
+}
+
+function fmtLogTime(ts) {
+  const d = new Date(ts || Date.now());
+  const p = (n) => String(n).padStart(2, '0');
+  return p(d.getHours()) + ':' + p(d.getMinutes()) + ':' + p(d.getSeconds());
+}
+
+function logEl(entry) {
+  const el = document.createElement('div');
+  el.className = 'llm-log';
+  const head = document.createElement('div');
+  head.className = 'llm-log-head';
+  const time = document.createElement('span');
+  time.className = 'llm-log-time';
+  time.textContent = fmtLogTime(entry.t);
+  const req = document.createElement('span');
+  req.className = 'llm-log-req';
+  req.textContent = entry.req || '';
+  req.title = entry.req || '';
+  head.appendChild(time);
+  head.appendChild(req);
+  const res = document.createElement('pre');
+  res.className = 'llm-log-res';
+  res.textContent = entry.res || '（空）';
+  el.appendChild(head);
+  el.appendChild(res);
+  return el;
+}
+
+function renderLogList() {
+  const box = $('#logList');
+  box.innerHTML = '';
+  const cache = activeCache();
+  const logs = (cache && cache.logs) || [];
+  if (!logs.length) {
+    const hint = document.createElement('div');
+    hint.className = 'chat-hint';
+    hint.textContent = '暂无大模型往返日志（本会话还没调用过模型）';
+    box.appendChild(hint);
+  } else {
+    for (const e of logs) box.appendChild(logEl(e));
+  }
+  box.scrollTop = box.scrollHeight;
 }
 
 // ---------------- 网站操作技巧管理 ----------------
@@ -811,6 +873,7 @@ function hydrateCache(s) {
   cache.askMode = s.askMode || 'page';
   cache.teachSteps = (s.teachEvents || []).length;
   cache.tokens = s.tokens || 0;
+  cache.logs = s.llmLogs || []; // 恢复大模型往返日志（切走/重开面板不丢）
   cache.status = (s.state === 'working' || s.state === 'awaiting_nav') ? 'working'
     : s.state === 'waiting_user' ? 'waiting_user' : 'idle';
   cache.statusLabel = cache.status === 'working' ? '运行中…'
@@ -858,6 +921,7 @@ async function init() {
   });
   $('#stopBtn').addEventListener('click', onStop);
   $('#debugBtn').addEventListener('click', onDebug);
+  $('#logToggle').addEventListener('click', () => setLogView(!logView));
   $('#tipsBtn').addEventListener('click', openTipsPanel);
   $('#tipsClose').addEventListener('click', () => { $('#tipsPanel').hidden = true; });
   $('#clearBtn').addEventListener('click', onClear);
@@ -932,6 +996,11 @@ async function init() {
         break;
       case 'AGENT_DEBUG_PICK_RESULT':
         pushMsg(sid, { kind: 'debug', res: msg.result });
+        break;
+      case 'AGENT_LLM_LOG': // 大模型往返日志：更新缓存；日志视图开着时实时补一条并滚到底
+        cache.logs.push({ t: msg.t, req: msg.req, res: msg.res });
+        if (cache.logs.length > MAX_LLM_LOG) cache.logs.splice(0, cache.logs.length - MAX_LLM_LOG);
+        if (sid === activeSid && logView) renderLogList();
         break;
       default:
         break;
