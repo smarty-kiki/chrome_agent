@@ -255,6 +255,13 @@ function activityEl(text) {
   el.textContent = text;
   return el;
 }
+// 非阻塞提示行（输入卡住等）：比活动行醒目一点（accent 色），但同样不需要使用者操作
+function nudgeEl(text) {
+  const el = document.createElement('div');
+  el.className = 'msg nudge';
+  el.textContent = text;
+  return el;
+}
 function hintEl() {
   const el = document.createElement('div');
   el.className = 'chat-hint';
@@ -427,7 +434,8 @@ function pushMsg(sid, desc, silent) {
       el = activityEl(desc.text);
       const acts = document.querySelectorAll('.msg.activity');
       if (acts.length > 60) acts[0].remove();
-    } else if (desc.kind === 'ask') el = askEl(cache, desc);
+    } else if (desc.kind === 'nudge') el = nudgeEl(desc.text);
+    else if (desc.kind === 'ask') el = askEl(cache, desc);
     else if (desc.kind === 'debug') el = debugEl(desc.res);
     box.appendChild(el);
     if (!silent) box.scrollTop = box.scrollHeight;
@@ -445,6 +453,7 @@ function renderSessionMsgs(sid) {
     if (m.kind === 'user') box.appendChild(userEl(m.text));
     else if (m.kind === 'agent') box.appendChild(agentEl(m.text, m.ok));
     else if (m.kind === 'activity') box.appendChild(activityEl(m.text));
+    else if (m.kind === 'nudge') box.appendChild(nudgeEl(m.text));
     else if (m.kind === 'ask') box.appendChild(askEl(cache, m));
     else if (m.kind === 'debug') box.appendChild(debugEl(m.res));
   }
@@ -813,6 +822,7 @@ function hydrateCache(s) {
   let renderedAsk = false;
   for (const c of s.conversation || []) {
     if (c.ask) { cache.msgs.push({ kind: 'ask', text: c.text, mode: c.mode || 'page' }); renderedAsk = true; }
+    else if (c.kind === 'nudge') cache.msgs.push({ kind: 'nudge', text: c.text });
     else cache.msgs.push(c.role === 'user' ? { kind: 'user', text: c.text } : { kind: 'agent', text: c.text, ok: c.ok !== false });
   }
   // 兜底：等待中但求助气泡不在对话记录里（如记录被裁剪）
@@ -908,6 +918,9 @@ async function init() {
       case 'AGENT_TABS':
         cache.tabs = msg.tabs || [];
         if (sid === activeSid) renderTabs(cache.tabs);
+        break;
+      case 'AGENT_NUDGE': // 非阻塞提示（如输入卡住提醒介入）：仅提示，不改状态、不等待
+        pushMsg(sid, { kind: 'nudge', text: msg.text || '' });
         break;
       case 'AGENT_CLEARED': // 后台清空某会话（CLEAR）
         resetSessionUI(sid);

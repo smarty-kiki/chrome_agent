@@ -2059,6 +2059,16 @@ async function runAction(t, a) {
     content: '动作结果：' + JSON.stringify(res).slice(0, 800)
   });
   t.failStreak = 0;
+  // 输入动作卡住（耗时 >10s 或内容没落地）→ 非阻塞提醒使用者介入；Agent 不等待、继续执行。
+  // 同一"卡住阶段"只提醒一次，输入恢复顺畅后解除标记，下次再卡会再提醒。
+  if (a.action === 'type' && res.inputStuck) {
+    if (!t.inputNudged) {
+      t.inputNudged = true;
+      nudgeUser(t, '在 ' + currentSiteLabel(t) + ' 上的输入动作超过 10 秒还没生效（后台标签可能被浏览器节流，或网站没接受输入）。你可以把该标签切到前台手动输入，Agent 会继续执行，不用等你。');
+    }
+  } else if (a.action === 'type') {
+    t.inputNudged = false;
+  }
   t.lastActSig = sig; // 记录本次动作，供"反复执行同一个动作"识别
   t.actionPageSig = t.curPageSig; // 记录执行动作时的页面状态，供下次重复判断"页面是否真的变了"
   addLog(t.sid, friendlyAction(a, res, ms)); // 面板显示极简动作 + 耗时，如"点击 · 50ms"
@@ -2067,16 +2077,19 @@ async function runAction(t, a) {
   agentStep(t).catch((e) => fail(t, '运行异常：' + e.message));
 }
 
-// 当前操作页面的域名（转人工时告诉使用者"哪个网站"）；取不到时用主标签，仍无则"当前页面"
+// 当前操作页面的标识（转人工/提醒时告诉使用者"哪个页面"）：
+// 优先用标签标题（一眼认出是哪个页面），标题为空或太短再用域名，仍无则"当前页面"
 function currentSiteLabel(t) {
-  let u = '';
+  let title = '', url = '';
   const cur = currentEntry(t);
-  if (cur && cur.url) u = cur.url;
-  if (!u) {
+  if (cur) { title = cur.title || ''; url = cur.url || ''; }
+  if (!title) {
     const main = (t.tabs || []).find((e) => e.role === 'main');
-    if (main && main.url) u = main.url;
+    if (main) { title = main.title || ''; url = main.url || ''; }
   }
-  return hostOf(u) || '当前页面';
+  const ttl = String(title).replace(/\s+/g, ' ').trim();
+  if (ttl) return ttl.length > 30 ? ttl.slice(0, 30) + '…' : ttl;
+  return hostOf(url) || '当前页面';
 }
 
 // 把给 LLM 看的失败原因转成使用者能看懂的一句话：
@@ -2173,6 +2186,16 @@ async function askUser(t, msg, mode) {
   broadcast({ type: 'AGENT_ASK', text: String(msg), mode: isTeach ? 'teach' : (isReply ? 'reply' : (isConfirm ? 'confirm' : 'page')) }, t.sid);
   broadcast({ type: 'AGENT_STATUS', status: 'waiting_user', askMode: isTeach ? 'teach' : (isReply ? 'reply' : (isConfirm ? 'confirm' : 'page')) }, t.sid);
   broadcastTabs(t);
+}
+
+// 非阻塞提醒：写一条提示给使用者看，但不改变会话状态、不等待他介入（Agent 继续执行）。
+// 与 askUser 的区别：askUser 转 waiting_user 必须等"继续"，这里只是提醒。
+function nudgeUser(t, text) {
+  if (!t) return;
+  t.conversation.push({ role: 'agent', text: String(text), kind: 'nudge', t: Date.now() });
+  if (t.conversation.length > MAX_CONVERSATION) t.conversation = t.conversation.slice(-MAX_CONVERSATION);
+  broadcast({ type: 'AGENT_NUDGE', text: String(text) }, t.sid);
+  addLog(t.sid, '提示：' + text);
 }
 
 // ---------------- 站点操作技巧库（复盘沉淀，操作时加载） ----------------

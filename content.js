@@ -646,6 +646,7 @@
       }
 
       case 'type': {
+        const t0 = performance.now(); // 记录开始时间，用于判定"输入卡住超过 10 秒"
         const el = findTarget(a.target);
         if (!el) return { ok: false, message: notFoundMsg(a.target) };
         el.focus();
@@ -684,7 +685,16 @@
         } else {
           return { ok: false, message: '目标不是可输入元素（' + el.tagName + '）' };
         }
-        return { ok: true, label: elementLabel(el) };
+        // 输入落地校验 + 超时判定：后台标签常被浏览器节流、或网站没接受合成输入（打进去又回退），
+        // 此时 inputStuck=true 让后台非阻塞地提醒使用者介入（Agent 不等待、继续执行）。
+        let inputStuck = false;
+        if (text.trim() !== '') {
+          await sleep(350); // 等一拍，让网站处理合成 input 事件 / 受控组件回写后再验
+          const got = el.isContentEditable ? (el.textContent || '') : (el.value || '');
+          inputStuck = got.trim() === '';
+        }
+        if (performance.now() - t0 > 10000) inputStuck = true;
+        return { ok: true, label: elementLabel(el), inputStuck, ms: Math.round(performance.now() - t0) };
       }
 
       case 'select': {

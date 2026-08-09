@@ -356,6 +356,17 @@ input:focus { outline: none; border-color: var(--accent); }
   word-break: break-all;
 }
 
+/* 非阻塞提示行（输入卡住等）：accent 色提醒使用者介入，但不需要操作、不影响对话 */
+.msg.nudge {
+  align-self: stretch;
+  font-size: 12px;
+  color: var(--accent);
+  background: rgba(79, 140, 255, .06);
+  border: 1px dashed rgba(79, 140, 255, .4);
+  border-radius: 8px;
+  padding: 6px 10px;
+}
+
 /* ---------------- 消息内 Markdown（紧凑排版） ---------------- */
 /* Agent 回复按 Markdown 渲染后气泡带 .md：关掉 pre-wrap（HTML 已无裸换行，避免块间多余空行）；
    块间距压到 0.35em、标题不大幅放大，行距紧凑不浪费阅读空间 */
