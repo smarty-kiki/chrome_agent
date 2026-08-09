@@ -1,0 +1,38 @@
+{
+  "manifest_version": 3,
+  "name": "PageAgent - AI 浏览器助手",
+  "version": "0.1.0",
+  "description": "基于 DeepSeek 的跨页面浏览器 Agent：理解页面、执行操作目标或总结摘要目标。",
+  "minimum_chrome_version": "102",
+  "permissions": [
+    "storage",
+    "tabs",
+    "scripting",
+    "sidePanel",
+    "alarms",
+    "tabGroups",
+    "downloads",
+    "bookmarks",
+    "webNavigation"
+  ],
+  "host_permissions": [
+    "<all_urls>"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_title": "打开 PageAgent"
+  },
+  "side_panel": {
+    "default_path": "panel.html"
+  },
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["content.js"],
+      "run_at": "document_idle",
+      "all_frames": true
+    }
+  ]
+}
