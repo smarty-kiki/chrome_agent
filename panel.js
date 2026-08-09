@@ -17,7 +17,7 @@ async function loadConfig() {
   const { config } = await chrome.runtime.sendMessage({ type: 'GET_CONFIG' });
   $('#apiKey').value = config.apiKey || '';
   $('#baseUrl').value = config.baseUrl || 'https://api.deepseek.com/v1';
-  $('#model').value = config.model || 'deepseek-chat';
+  $('#model').value = config.model || 'deepseek-v4-flash';
   $('#temperature').value = config.temperature ?? 0.2;
   $('#maxSteps').value = config.maxSteps || 25;
   $('#searchTemplate').value = config.searchTemplate || 'https://www.bing.com/search?q=';

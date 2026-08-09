@@ -17,7 +17,7 @@
 'use strict';
 
 const DEFAULT_BASE_URL = 'https://api.deepseek.com/v1';
-const DEFAULT_MODEL = 'deepseek-chat';
+const DEFAULT_MODEL = 'deepseek-v4-flash'; // DeepSeek V4 Flash（deepseek-chat/reasoner 旧别名已退役）
 const DEFAULT_TEMPERATURE = 0.2;
 const DEFAULT_MAX_STEPS = 25;
 const NAV_TIMEOUT_MS = 120000;   // 页面加载/跳转等待上限

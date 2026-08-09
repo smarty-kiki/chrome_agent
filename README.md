@@ -23,7 +23,7 @@
 - **多标签编排**：Agent 会自主开后台标签（不抢焦点、不影响你浏览），自开标签自动归入 "PageAgent" 标签分组统一管理；你交给它的那个标签（@MAIN）不入组。点击页面里"新开页面"的链接（`target="_blank"`）也不会抢你的焦点——会改为**后台打开**并纳入 Agent 自开标签（@T 系，本轮结束随分组一起清理，不当作你的页面）；个别用 JS `window.open` 新开页面的网站，后台会兜底把焦点还给你。
 - **全标签感知**：Agent 能用 `list_tabs` 读取浏览器里**所有**已打开的标签（标题+网址，标记当前前台选中的那个、已在任务里的和无法操作的受限页），回答"我现在正在看哪个页面""我开了哪些标签"这类问题；也能用 `use_tab` 把你已打开的任意标签**纳入任务**继续操作（如"在我已经打开的某某标签里做 XX"），同样不抢焦点、不切浏览器前台，不打扰你浏览。
 - **跨页面运行**：`open_tab` / `navigate` 后自动等待对应标签就绪并继续同一任务（历史上下文跨标签保留）。
-- **可配置大模型**：默认 DeepSeek（`deepseek-chat`），接口为 OpenAI 兼容格式，可换任意兼容端点（OpenAI、代理、本地 Ollama 网关等）。
+- **可配置大模型**：默认 DeepSeek V4 Flash（`deepseek-v4-flash`，1M 上下文），接口为 OpenAI 兼容格式，可换任意兼容端点（OpenAI、代理、本地 Ollama 网关等）。注：`deepseek-chat`/`deepseek-reasoner` 是 V3/R1 时代的旧别名，已于 2026-07-24 退役，请改用 V4 新 ID。
 
 ## 安装
 
@@ -39,7 +39,7 @@
 | --- | --- | --- |
 | API Key | DeepSeek API Key（[申请](https://platform.deepseek.com)） | 空 |
 | Base URL | OpenAI 兼容接口地址 | `https://api.deepseek.com/v1` |
-| 模型 | `deepseek-chat`（V3）或 `deepseek-reasoner`（R1） | `deepseek-chat` |
+| 模型 | `deepseek-v4-flash`（V4 Flash，推荐）或 `deepseek-v4-pro` | `deepseek-v4-flash` |
 | 温度 | 0–2 | 0.2 |
 | 最大步数 | Agent 最多执行的决策步数 | 25 |
 | 上下文窗口 | 按 token 估算的输入上下文上限 | 1000000（DeepSeek V4 为 1M） |
