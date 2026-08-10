@@ -15,7 +15,6 @@ const MAX_LLM_LOG = 150; // 日志视图每会话保留的大模型往返条数�
 let currentTabId = null;
 let activeSid = null; // 当前查看的会话
 let teachStepEl = null; // 教我模式卡里实时步数元素（AGENT_TEACH_STEPS 更新）
-let pickActive = false; // 元素排查模式是否开启（调试工具，AGENT_DEBUG_PICK_STATE 同步）
 let logView = false; // 日志视图是否开启（状态栏"日志"切换：会话消息 / 大模型往返日志）
 
 // 每会话缓存：sid -> { sid, n, msgs: [], tabs: [], status, statusLabel, statusClass, askMode, teachSteps }
@@ -360,63 +359,6 @@ function makeResumeBtn(cache, label, busyText, confirmText) {
   return btn;
 }
 
-// 诊断结果卡（元素排查）：可见（绿）/ 祖先被收录（琥珀）/ 不可见（红），逐行着色，不用 emoji
-function debugEl(res) {
-  const card = document.createElement('div');
-  card.className = 'msg debug-pick';
-  const win = res.windowName || '窗口';
-  const head = document.createElement('div');
-  head.textContent = '排查 · ' + win + ' · 你点的元素：<' + String(res.tag || '').toUpperCase() + '>' + (res.label ? ' ' + res.label : '');
-  card.appendChild(head);
-  if (res.seen) {
-    if (res.matched === 'self') {
-      const line = document.createElement('div');
-      line.className = 'dp-seen';
-      line.textContent = '可见 → ref=' + res.ref + (res.dynamic ? '（动态识别）' : '');
-      card.appendChild(line);
-    } else if (res.matched === 'editor') {
-      const line = document.createElement('div');
-      line.className = 'dp-editor';
-      line.textContent = '你点的元素不可见，但它所在/包裹的可输入区被看到了 → ref=' + res.ref + '（' + (res.label || '') + '）Agent 能点它写入';
-      card.appendChild(line);
-    } else {
-      const line = document.createElement('div');
-      line.className = 'dp-ancestor';
-      line.textContent = '未直接收录，但祖先被看到 → ref=' + res.ref + '（<' + String(res.ancestorTag || '').toUpperCase() + '> ' + (res.label || '') + '）';
-      card.appendChild(line);
-    }
-  } else {
-    if (res.matched === 'editor-uncollected') {
-      const line = document.createElement('div');
-      line.className = 'dp-editor-uncollected';
-      line.textContent = '附近存在可输入区（<' + String(res.tag || '').toUpperCase() + '> ' + (res.label || '') + '），但 Agent 收录不到 → 浏览侧识别缺口';
-      card.appendChild(line);
-      for (const r of res.reasons || []) {
-        const rl = document.createElement('div');
-        rl.className = 'dp-reason';
-        rl.textContent = '· ' + r;
-        card.appendChild(rl);
-      }
-    } else {
-      const line = document.createElement('div');
-      line.className = 'dp-notseen';
-      line.textContent = '不可见';
-      card.appendChild(line);
-      for (const r of res.reasons || []) {
-        const rl = document.createElement('div');
-        rl.className = 'dp-reason';
-        rl.textContent = '· ' + r;
-        card.appendChild(rl);
-      }
-    }
-  }
-  const loc = document.createElement('div');
-  loc.className = 'dp-loc';
-  loc.textContent = '定位：' + (res.selector || '-');
-  card.appendChild(loc);
-  return card;
-}
-
 // 把一条消息写入会话缓存；若该会话正是当前查看的，同步渲染到 DOM
 function pushMsg(sid, desc, silent) {
   const cache = ensureCache(sid);
@@ -439,7 +381,6 @@ function pushMsg(sid, desc, silent) {
       if (acts.length > 60) acts[0].remove();
     } else if (desc.kind === 'nudge') el = nudgeEl(desc.text);
     else if (desc.kind === 'ask') el = askEl(cache, desc);
-    else if (desc.kind === 'debug') el = debugEl(desc.res);
     box.appendChild(el);
     if (!silent) box.scrollTop = box.scrollHeight;
   }
@@ -458,7 +399,6 @@ function renderSessionMsgs(sid) {
     else if (m.kind === 'activity') box.appendChild(activityEl(m.text));
     else if (m.kind === 'nudge') box.appendChild(nudgeEl(m.text));
     else if (m.kind === 'ask') box.appendChild(askEl(cache, m));
-    else if (m.kind === 'debug') box.appendChild(debugEl(m.res));
   }
   // 恢复/切回时只有"确实在等用户"的那张确认卡按钮有效（askEl 已把更早的卡禁用）；
   // 若该会话并不在等用户（已继续/已停止/已空闲），历史确认卡的按钮一律作废，避免误点。
@@ -651,33 +591,37 @@ async function onClear() {
   $('#input').focus();
 }
 
-// ---------------- 元素排查调试工具 ----------------
-// 点按钮进入"选择元素"模式：页面上悬停高亮、点元素返回诊断（Agent 能否看到 + 原因）。
-// 状态由 AGENT_DEBUG_PICK_STATE 广播同步（页面按 Esc 退出时按钮也会复位）。
-async function onDebug() {
-  if (pickActive) {
-    pickActive = false;
-    updateDebugBtn();
-    await chrome.runtime.sendMessage({ type: 'DEBUG_PICK_STOP', tabId: currentTabId });
-    setStatus('排查模式已关闭', '');
-    return;
-  }
+// ---------------- 诊断工具 ----------------
+// 点「诊断」把当前标签页的合并快照（Agent 浏览侧看到的：可交互元素 + 正文摘要 + 子窗口）提取为
+// JSON 复制到剪贴板，方便排查浏览侧识别问题（元素有没有被看到、role/text 对不对、iframe 有没有合并）。
+async function onDiag() {
   if (!currentTabId) await refreshTab();
   if (!currentTabId) { setStatus('未获取到当前标签页，请切换到网页后再试', 'fail'); return; }
   try {
-    await chrome.runtime.sendMessage({ type: 'DEBUG_PICK_START', tabId: currentTabId });
-    pickActive = true;
-    updateDebugBtn();
-    setStatus('排查模式：悬停高亮元素，点击看 Agent 能否看到；Esc 退出', 'debug');
+    const res = await chrome.runtime.sendMessage({ type: 'DIAG_SNAPSHOT', tabId: currentTabId });
+    if (!res || !res.ok) throw new Error((res && res.error) || '读取快照失败');
+    const snap = res.snapshot || {};
+    const nEls = Array.isArray(snap.elements) ? snap.elements.length : 0;
+    await copyText(JSON.stringify(snap, null, 2));
+    setStatus('快照已复制到剪贴板（' + (snap.title || '当前页') + ' · ' + nEls + ' 个元素）', 'ok');
   } catch (e) {
-    setStatus('进入排查模式失败：' + (e.message || e), 'fail');
+    setStatus('诊断失败：' + (e.message || e), 'fail');
   }
 }
 
-function updateDebugBtn() {
-  const b = $('#debugBtn');
-  b.textContent = pickActive ? '退出排查' : '排查';
-  b.classList.toggle('debug-active', pickActive);
+// 剪贴板写入：navigator.clipboard 不可用（面板未获焦点等）时退回隐藏 textarea + execCommand('copy')
+async function copyText(text) {
+  try {
+    await navigator.clipboard.writeText(text);
+    return;
+  } catch (e) {}
+  const ta = document.createElement('textarea');
+  ta.value = text;
+  ta.style.position = 'fixed';
+  ta.style.opacity = '0';
+  document.body.appendChild(ta);
+  ta.select();
+  try { document.execCommand('copy'); } finally { ta.remove(); }
 }
 
 // ---------------- 大模型往返日志视图 ----------------
@@ -920,7 +864,7 @@ async function init() {
     }
   });
   $('#stopBtn').addEventListener('click', onStop);
-  $('#debugBtn').addEventListener('click', onDebug);
+  $('#diagBtn').addEventListener('click', onDiag);
   $('#logToggle').addEventListener('click', () => setLogView(!logView));
   $('#tipsBtn').addEventListener('click', openTipsPanel);
   $('#tipsClose').addEventListener('click', () => { $('#tipsPanel').hidden = true; });
@@ -988,14 +932,6 @@ async function init() {
         break;
       case 'AGENT_CLEARED': // 后台清空某会话（CLEAR）
         resetSessionUI(sid);
-        break;
-      case 'AGENT_DEBUG_PICK_STATE':
-        pickActive = !!msg.on;
-        updateDebugBtn();
-        if (!pickActive) setStatus('就绪', '');
-        break;
-      case 'AGENT_DEBUG_PICK_RESULT':
-        pushMsg(sid, { kind: 'debug', res: msg.result });
         break;
       case 'AGENT_LLM_LOG': // 大模型往返日志：更新缓存；日志视图开着时实时补一条并滚到底
         cache.logs.push({ t: msg.t, req: msg.req, res: msg.res });

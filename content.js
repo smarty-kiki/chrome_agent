@@ -251,18 +251,38 @@
     };
   }
 
+  // 隐藏输入捕获架构（如腾讯文档）：可见的"编辑器框"是一堆 div 渲染层，真正可编辑的只有一个
+  // 角落里 tiny 的 contenteditable（实测是 5×1 的 div#melo-hidden-editor[role=textbox]）。
+  // 输入进那个隐藏编辑器、由引擎重渲染到可见层。findVisibleEditorHost 从隐藏编辑器向上找
+  // "可见的编辑框"：最深的、够大且有可见文本的祖先——即用户看到的、快照要展示给大模型的宿主。
+  function findVisibleEditorHost(hiddenEl) {
+    let fallback = null;
+    let cur = hiddenEl.parentElement;
+    while (cur && cur !== document.body) {
+      const r = cur.getBoundingClientRect();
+      const text = (cur.innerText || '').replace(/\s+/g, '').trim();
+      if (r.width > 150 && r.height > 80 && text.length > 0) {
+        if (!fallback) fallback = cur;
+        // 跳过悬浮层（position:absolute/fixed）：文档平台的提示浮层（如腾讯文档"control+~ 无障碍"
+        // 提示）也是够大够深的祖先，选它当宿主会误报输入卡住（打字内容渲染在 surface 上、不在浮层里）。
+        // 优先取"够大且有文字"的祖先里最深的非悬浮层——真正承载正文的 surface；全悬浮时退回最深的。
+        const pos = getComputedStyle(cur).position;
+        if (pos !== 'absolute' && pos !== 'fixed') return cur;
+      }
+      cur = cur.parentElement;
+    }
+    return fallback;
+  }
+
   // ---------------- 构建页面快照 ----------------
-  // mapOut 可选：排查模式传临时 Map，收集"ref -> 元素"映射而不覆盖 agent 正在用的 refMap，
-  // 避免诊断时把 agent 已生成的 ref 编号冲掉、导致它下一步动作定位错元素。
-  function buildSnapshot(mapOut) {
-    const map = mapOut instanceof Map ? mapOut : refMap;
+  function buildSnapshot() {
+    const map = refMap;
     const items = [];
     const seen = new Set();
     let ref = 0;
 
     const nodes = document.querySelectorAll(INTERACTIVE);
     for (const el of nodes) {
-      if (!isVisible(el)) continue;
       if (seen.has(el)) continue;
 
       // 父级已被收录（嵌套可点元素，如 button 里的 a），跳过以去噪
@@ -275,9 +295,52 @@
       if (nested) continue;
 
       if (ref >= MAX_ELEMENTS) break;
+
+      // 隐藏输入捕获编辑器识别（腾讯文档等）：真实可编辑的是角落里又小又透明的 contenteditable
+      // （实测 5×1 的 div#melo-hidden-editor[role=textbox]，且 opacity:0——正常可见性检查会把
+      // 它整只挡掉）。输入进那个隐藏编辑器、由引擎重渲染到可见层。这里先于 isVisible 特判：
+      // 命中就把"可见编辑框"宿主提升成 editor（文字=文档内容或占位文案），真实输入面 inputEl
+      // 留给 type 动作路由（见下），避免大模型看到个莫名的空 textbox 认不出写作区。
+      const r0 = el.getBoundingClientRect();
+      let host = null;
+      let inputEl = null;
+      if (el.isContentEditable && (r0.width < 40 || r0.height < 40 || getComputedStyle(el).opacity === '0')) {
+        host = findVisibleEditorHost(el);
+        if (host) {
+          inputEl = el;                        // 真实输入面：隐藏编辑器
+          seen.add(el);
+          seen.add(host);                      // 宿主已作为编辑器收录，动态扫描别再把它当可点元素重复收
+          const item = describe(host, ++ref);  // 展示/操作对象换成可见宿主
+          item.role = 'editor';                // 明确"文档正文编辑区"，让大模型认得出这是写作区
+          if (!item.text && !item.hint) item.hint = '(空编辑区)';
+          // 画布渲染的文档页（如腾讯文档 melo-page-main-view）：正文真正画在 canvas 上，宿主的
+          // DOM 文本只是界面提示（"AI帮我创建文档"/无障碍提示），不是文档内容——不标出来的话大模型
+          // 会把界面杂文案当成正文。从宿主向上探几个祖先层找"尺寸≈宿主"的画布（页面 canvas 常在
+          // zoomable 层、宿主的祖先里），命中就改写 hint 说明"内容画在 canvas 上、DOM 不可见"。
+          try {
+            const hr = host.getBoundingClientRect();
+            const near = (a, b) => b > 0 && a > 100 && Math.abs(a - b) < b * 0.25;
+            for (let cur = host, i = 0; cur && i < 5; cur = cur.parentElement, i++) {
+              const cv = cur.querySelector('canvas');
+              if (!cv) continue;
+              const cr = cv.getBoundingClientRect();
+              if (near(cr.width, hr.width) && near(cr.height, hr.height)) {
+                item.hint = '(画布渲染编辑区：正文画在 canvas 上，DOM 不可见)';
+                item.text = '';
+                break;
+              }
+            }
+          } catch (e) {}
+          map.set(ref, { el: host, inputEl, selector: item.selector, desc: (item.text || item.hint || item.role || item.tag).slice(0, 30) });
+          items.push(item);
+        }
+        continue; // 隐藏编辑器（无论有没有宿主）都走特判分支，不进普通可交互路径
+      }
+
+      if (!isVisible(el)) continue;
       seen.add(el);
       const item = describe(el, ++ref);
-      map.set(ref, { el, selector: item.selector, desc: (item.text || item.hint || item.role || item.tag).slice(0, 30) });
+      map.set(ref, { el, inputEl, selector: item.selector, desc: (item.text || item.hint || item.role || item.tag).slice(0, 30) });
       items.push(item);
     }
 
@@ -649,18 +712,27 @@
         const t0 = performance.now(); // 记录开始时间，用于判定"输入卡住超过 10 秒"
         const el = findTarget(a.target);
         if (!el) return { ok: false, message: notFoundMsg(a.target) };
-        el.focus();
         const text = String(a.text ?? '');
-        if (el.isContentEditable) {
+        // 隐藏输入捕获编辑器（如腾讯文档 melo-hidden-editor）：可见宿主是纯 div，真实输入面
+        // 在 inputEl；宿主自身没标 editable 时也退回其内部可编辑子孙（textbox/textarea）兜底。
+        const entry = refMap.get(a.target);
+        const inputEl = entry && entry.inputEl && document.contains(entry.inputEl) ? entry.inputEl : null;
+        let target = inputEl || el;
+        if (!inputEl && !target.isContentEditable && target.tagName !== 'INPUT' && target.tagName !== 'TEXTAREA') {
+          const leaf = target.querySelector('textarea, [contenteditable], [role="textbox"]');
+          if (leaf) target = leaf;
+        }
+        target.focus();
+        if (target.isContentEditable) {
           // 富文本编辑器（ProseMirror/Slate/Quill/腾讯文档等）不走 textContent，
           // 直接赋 textContent 进不了它们的内部模型、内容不渲染，看起来就像"没开始写"。
           // 正路是走 document.execCommand('insertText')，它会进编辑器内部状态、触发它们自己的
           // 事件；全选（覆盖语义）后再逐字插入，模拟真人打字节奏。
-          try { el.scrollIntoView({ block: 'center' }); } catch (e) {}
-          el.focus();
+          try { target.scrollIntoView({ block: 'center' }); } catch (e) {}
+          target.focus();
           const sel = window.getSelection();
           const range = document.createRange();
-          range.selectNodeContents(el);
+          range.selectNodeContents(target);
           sel.removeAllRanges();
           sel.addRange(range);
           let insertedAll = true;
@@ -672,16 +744,16 @@
           }
           if (!insertedAll) {
             // 兜底：不认 execCommand 的编辑器，直接整段替换 DOM + 派发 input
-            el.textContent = text;
-            el.dispatchEvent(new InputEvent('input', { bubbles: true, data: text }));
+            target.textContent = text;
+            target.dispatchEvent(new InputEvent('input', { bubbles: true, data: text }));
           }
-        } else if (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA') {
-          setNativeValue(el, '', false); // 覆盖原内容
+        } else if (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA') {
+          setNativeValue(target, '', false); // 覆盖原内容
           for (const ch of text) {
-            setNativeValue(el, el.value + ch, false);
+            setNativeValue(target, target.value + ch, false);
             await humanTypeGap(); // 逐字输入
           }
-          setNativeValue(el, el.value, true); // 收尾触发 change
+          setNativeValue(target, target.value, true); // 收尾触发 change
         } else {
           return { ok: false, message: '目标不是可输入元素（' + el.tagName + '）' };
         }
@@ -690,8 +762,16 @@
         let inputStuck = false;
         if (text.trim() !== '') {
           await sleep(350); // 等一拍，让网站处理合成 input 事件 / 受控组件回写后再验
-          const got = el.isContentEditable ? (el.textContent || '') : (el.value || '');
-          inputStuck = got.trim() === '';
+          if (inputEl) {
+            // 隐藏编辑器自身常被引擎清空（内容渲染到可见层），照旧校验会误报"输入卡住"；
+            // 改看可见宿主是否真的出现了输入内容。
+            const hostText = (el.innerText || '').replace(/\s+/g, '');
+            const probe = text.trim().replace(/\s+/g, '').slice(0, 30);
+            inputStuck = hostText === '' || !hostText.includes(probe);
+          } else {
+            const got = target.isContentEditable ? (target.textContent || '') : (target.value || '');
+            inputStuck = got.trim() === '';
+          }
         }
         if (performance.now() - t0 > 10000) inputStuck = true;
         return { ok: true, label: elementLabel(el), inputStuck, ms: Math.round(performance.now() - t0) };
@@ -1086,222 +1166,6 @@
     return batch; // 剩余缓冲直接随消息响应带回（避免与 TEACH_EVENT 重复上报，也防止最后几步被竞态吞掉）
   }
 
-  // ---------------- 元素排查模式（面板调试工具） ----------------
-  // 面板点「排查」→ 页面进入"选择元素"模式（DevTools 式）：鼠标悬停高亮目标，
-  // 点击元素即用【真实的快照收集逻辑】判定"在当前 Agent 浏览能力下，这个元素能不能被看到"，
-  // 并给出原因（是否可见 / 是否语义可点 / 是否绑点击处理器 / 是否被祖先收录 / 是否超上限），
-  // 方便快速定位"浏览侧 bug"（元素 Agent 根本看不到）还是模型/决策问题。
-  // 支持所有 frame（content.js 全 frame 注入）：iframe 弹层里的卡片也能悬停/点击诊断。
-  let pickOn = false;
-  let pickHoverEl = null;
-  let pickOverlay = null;
-
-  function pickEnsureOverlay() {
-    if (pickOverlay && pickOverlay.isConnected) return pickOverlay;
-    const d = document.createElement('div');
-    d.style.cssText = [
-      'position:fixed', 'pointer-events:none', 'z-index:2147483647',
-      'background:rgba(79,140,255,.18)', 'outline:2px solid #4f8cff',
-      'outline-offset:-2px', 'box-sizing:border-box', 'display:none'
-    ].join(';');
-    (document.body || document.documentElement).appendChild(d);
-    pickOverlay = d;
-    return d;
-  }
-
-  function pickMove(e) {
-    if (!pickOn) return;
-    const el = e.target;
-    if (!el || el.nodeType !== 1 || el === pickHoverEl) return;
-    pickHoverEl = el;
-    const r = el.getBoundingClientRect();
-    const ov = pickEnsureOverlay();
-    ov.style.left = r.left + 'px';
-    ov.style.top = r.top + 'px';
-    ov.style.width = r.width + 'px';
-    ov.style.height = r.height + 'px';
-    ov.style.display = 'block';
-  }
-
-  function pickOut(e) {
-    if (pickOn && !e.relatedTarget) pickClear(); // 指针离开文档才隐藏高亮
-  }
-
-  function pickClear() {
-    pickHoverEl = null;
-    if (pickOverlay) pickOverlay.style.display = 'none';
-  }
-
-  function pickClick(e) {
-    if (!pickOn) return;
-    e.preventDefault(); // 截断默认动作（导航/提交），排查时点错不会真的触发页面行为
-    e.stopImmediatePropagation();
-    const el = e.target;
-    if (!el || el.nodeType !== 1) return;
-    chrome.runtime.sendMessage({ type: 'DEBUG_PICK_RESULT', result: diagnosePick(el) }).catch(() => {});
-  }
-
-  function pickKeydown(e) {
-    if (pickOn && e.key === 'Escape') { e.preventDefault(); exitPickMode('esc'); }
-  }
-
-  function enterPickMode() {
-    if (pickOn) return;
-    pickOn = true;
-    document.addEventListener('mouseover', pickMove, true);
-    document.addEventListener('mouseout', pickOut, true);
-    document.addEventListener('click', pickClick, true);
-    document.addEventListener('keydown', pickKeydown, true);
-  }
-
-  // reason='esc'：页面按键退出，通知 background 广播关闭其它 frame 并同步面板按钮
-  function exitPickMode(reason) {
-    if (!pickOn) return;
-    pickOn = false;
-    document.removeEventListener('mouseover', pickMove, true);
-    document.removeEventListener('mouseout', pickOut, true);
-    document.removeEventListener('click', pickClick, true);
-    document.removeEventListener('keydown', pickKeydown, true);
-    pickClear();
-    if (reason === 'esc') chrome.runtime.sendMessage({ type: 'DEBUG_PICK_ESCAPE' }).catch(() => {});
-  }
-
-  // 元素是否有 cursor:pointer（样式表声明命中，或运行时静止手型）
-  function cursorPointer(el) {
-    try {
-      if (getComputedStyle(el).cursor === 'pointer') return true;
-      const sels = pointerSelectors();
-      for (const s of sels) { if (el.matches && el.matches(s)) return true; }
-    } catch (_) {}
-    return false;
-  }
-
-  // 排查辅助：点在"自身不可见"的元素上时，找它附近【已被快照收录】的可输入区（祖先链 + 自身子树）。
-  // 文档平台的正文里，你点到的多半是输入区内部/外层的内容块（div/p/空段落），自身不被收录是正常的；
-  // 关键看真正能写字的区在不在快照里——在，Agent 就能通过它点进编辑器打字。
-  function collectedEditorNear(el, dbgMap) {
-    const isInputEntry = (entry) => isEditor(entry.el);
-    let cur = el.parentElement;
-    while (cur && cur !== document.body) {
-      for (const [ref, entry] of dbgMap) {
-        if (entry.el === cur && isInputEntry(entry)) return { ref, where: 'ancestor', label: elementLabel(cur) };
-      }
-      cur = cur.parentElement;
-    }
-    const tw = document.createTreeWalker(el, NodeFilter.SHOW_ELEMENT);
-    let n = tw.currentNode, i = 0;
-    while ((n = tw.nextNode()) && i < 500) {
-      i++;
-      for (const [ref, entry] of dbgMap) {
-        if (entry.el === n && isInputEntry(entry)) return { ref, where: 'descendant', label: elementLabel(n) };
-      }
-    }
-    return null;
-  }
-
-  // 排查辅助：找附近【存在于 DOM 中】的输入区（不管有没有被收录）。返回 null 说明这附近真没有任何可写区。
-  // 与 collectedEditorNear 的区别：它只看快照里有没有；这个看 DOM 里存不存在。两者结合能区分
-  // "输入区在快照里但 Agent 够得着"和"输入区存在但浏览侧收录漏了"（如画布渲染、0 尺寸隐藏 textarea）。
-  function anyEditorNear(el) {
-    try {
-      const sel = 'textarea, [contenteditable], [role~="textbox"], [role~="searchbox"]';
-      const anc = el.closest && el.closest(sel);
-      if (anc && anc !== el) return { el: anc, where: 'ancestor' };
-      const desc = el.querySelector && el.querySelector(sel);
-      if (desc) return { el: desc, where: 'descendant' };
-    } catch (_) {}
-    return null;
-  }
-
-  // 判定"Agent 当前能否看到该元素"：跑一遍真实的快照收集（传临时 map，不影响 agent 的 refMap），
-  // 再沿自身→祖先找第一个被收录的元素。三种结论：
-  //   self     = 元素自身被收录 → Agent 直接看到它（给出 ref）
-  //   ancestor = 自身未被收录，但最近的可点祖先被收录 → Agent 看到的是那个祖先（常见"点在内层文字/图标上"）
-  //   none     = 完全看不到 → 给出具体原因，判断是否为浏览侧 bug
-  function diagnosePick(el) {
-    const dbgMap = new Map();
-    const snap = buildSnapshot(dbgMap);
-    const selfLabel = elementLabel(el);
-    const selfTag = el.tagName ? el.tagName.toLowerCase() : '';
-    const windowName = IS_TOP_FRAME ? '主窗口' : ('子窗口' + (document.title ? '「' + document.title.slice(0, 20) + '」' : ''));
-
-    let hitRef = null, hitEl = null, depth = 0, cur = el;
-    while (cur && cur !== document.documentElement && depth < 12) {
-      for (const [ref, entry] of dbgMap) {
-        if (entry.el === cur) { hitRef = ref; hitEl = cur; break; }
-      }
-      if (hitRef != null) break;
-      cur = cur.parentElement;
-      depth++;
-    }
-
-    const itemOf = (ref) => snap.elements.find((x) => x.ref === ref);
-    if (hitRef != null && hitEl === el) {
-      const item = itemOf(hitRef);
-      return {
-        seen: true, matched: 'self', ref: hitRef,
-        label: item ? (item.text || item.hint || item.role || item.tag) : selfLabel,
-        tag: selfTag, selector: cssPath(el), dynamic: !!(item && item.dynamic),
-        windowName
-      };
-    }
-    if (hitRef != null) {
-      const item = itemOf(hitRef);
-      return {
-        seen: true, matched: 'ancestor', ref: hitRef,
-        label: item ? (item.text || item.hint || item.role || item.tag) : '',
-        tag: selfTag, ancestorTag: hitEl.tagName ? hitEl.tagName.toLowerCase() : '',
-        selector: cssPath(hitEl), dynamic: !!(item && item.dynamic), windowName
-      };
-    }
-    // 自身与祖先都没被收录。但对编辑器场景，用户常点到输入区内部/外壳的内容块——真正能写字的
-    // 元素（contenteditable/textbox/textarea）可能在祖先链或子树里且已被收录；也可能 DOM 里存在但
-    // 快照没收进来（画布渲染、0 尺寸隐藏 textarea），那才是浏览侧收集逻辑的真缺口。两种都单独给结论：
-    const collectedEditor = collectedEditorNear(el, dbgMap);
-    if (collectedEditor) {
-      const item = itemOf(collectedEditor.ref);
-      return {
-        seen: true, matched: 'editor', ref: collectedEditor.ref,
-        where: collectedEditor.where,
-        label: item ? (item.text || item.hint || item.role || item.tag) : collectedEditor.label,
-        tag: selfTag, selector: cssPath(el), windowName
-      };
-    }
-    const anyEditor = anyEditorNear(el);
-    if (anyEditor) {
-      return {
-        seen: false, matched: 'editor-uncollected', ref: null,
-        where: anyEditor.where,
-        label: elementLabel(anyEditor.el),
-        tag: anyEditor.el.tagName ? anyEditor.el.tagName.toLowerCase() : '',
-        selector: cssPath(el), windowName,
-        reasons: whyNotSeen(anyEditor.el, dbgMap)
-      };
-    }
-    return {
-      seen: false, matched: 'none', ref: null, label: selfLabel, tag: selfTag,
-      selector: cssPath(el), windowName,
-      reasons: whyNotSeen(el, dbgMap)
-    };
-  }
-
-  // 完全看不到时的原因拆解（对照 buildSnapshot 的收录规则，逐条说明卡在哪一步）
-  function whyNotSeen(el, dbgMap) {
-    const reasons = [];
-    if (!isVisible(el)) reasons.push('不可见：display/visibility/opacity 为隐藏，或宽高为 0');
-    const itv = !!(el.matches && el.matches(INTERACTIVE));
-    const clickable = hasClickHandler(el) || cursorPointer(el);
-    if (!itv && !clickable) {
-      reasons.push('不在可点判定内：非 a/button/[role=…] 等语义元素，无 onclick/React 处理器，也无 cursor:pointer');
-    }
-    const textAria = !!(el.textContent || '').trim() || el.getAttribute('aria-label') || el.getAttribute('title') || el.alt;
-    if (!textAria) reasons.push('没有文字/可访问名：缺 text、aria-label、title、alt（动态候选必须带其一）');
-    if (isVisible(el) && (itv || clickable) && textAria && !reasons.length) {
-      if (dbgMap.size >= MAX_ELEMENTS) reasons.push('快照元素已达上限 ' + MAX_ELEMENTS + ' 个，此元素排在候选之外');
-      else reasons.push('符合可点判定但未被收录（可能命中父级去重或扫描截断）');
-    }
-    return reasons;
-  }
 
   // ---------------- 消息通信 ----------------
   chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
@@ -1321,12 +1185,6 @@
           teachLog('MSG TEACH_STOP 收到，返回 events=' + (Array.isArray(flushed) ? flushed.length : 0) + ' 条');
           return { ok: true, events: flushed }; // 把剩余缓冲随响应带回，background 合并进本轮步骤
         }
-        case 'DEBUG_PICK_START':
-          enterPickMode();
-          return { ok: true };
-        case 'DEBUG_PICK_STOP':
-          exitPickMode('stop');
-          return { ok: true };
         default:
           return { ok: false, error: '未知消息类型 ' + msg.type };
       }

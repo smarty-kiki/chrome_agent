@@ -3107,34 +3107,20 @@ async function handleMessage(msg, sender) {
       await chrome.storage.local.set({ [TIPS_KEY]: store });
       return { ok: true };
     }
-    case 'DEBUG_PICK_START': { // 面板排查：进入元素选择模式（不指定 frameId → 发所有 frame，iframe 子窗也能诊断）
+    case 'DIAG_SNAPSHOT': { // 面板诊断：提取当前标签页合并快照（agent 同款 readSnapshotWithFrames 管线），面板复制到剪贴板
       let tabId = msg.tabId;
       if (tabId == null) {
         const [tab] = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
         tabId = tab && tab.id;
       }
       if (tabId == null) throw new Error('未找到当前标签页');
-      try {
-        await chrome.tabs.sendMessage(tabId, { type: 'DEBUG_PICK_START' });
-      } catch (e) {
-        throw new Error('无法在页面进入排查模式（页面未加载完成或为受限页）');
+      const tab = await getTab(tabId);
+      if (tab && isRestrictedUrl(tab.url)) {
+        return { ok: true, snapshot: { url: tab.url, title: tab.title || '', elements: [], excerpt: '', frames: [{ frameId: 0, index: 0, url: tab.url, title: tab.title || '' }], restricted: true } };
       }
-      broadcast({ type: 'AGENT_DEBUG_PICK_STATE', on: true });
-      return { ok: true };
-    }
-    case 'DEBUG_PICK_STOP': { // 面板手动关闭排查模式（发所有 frame + 同步面板按钮）
-      if (msg.tabId != null) chrome.tabs.sendMessage(msg.tabId, { type: 'DEBUG_PICK_STOP' }).catch(() => {});
-      broadcast({ type: 'AGENT_DEBUG_PICK_STATE', on: false });
-      return { ok: true };
-    }
-    case 'DEBUG_PICK_ESCAPE': { // 页面按 Esc 退出（content 上报）→ 广播关掉其它 frame + 同步面板
-      if (sender && sender.tab) chrome.tabs.sendMessage(sender.tab.id, { type: 'DEBUG_PICK_STOP' }).catch(() => {});
-      broadcast({ type: 'AGENT_DEBUG_PICK_STATE', on: false });
-      return { ok: true };
-    }
-    case 'DEBUG_PICK_RESULT': { // 排查模式：content 诊断结果 → 转发面板（补 frameId 区分主/子窗口）
-      broadcast({ type: 'AGENT_DEBUG_PICK_RESULT', result: msg.result, frameId: (sender && sender.frameId) || 0 });
-      return { ok: true };
+      await ensureContentScript(tabId);
+      const snapshot = await readSnapshotWithFrames(tabId);
+      return { ok: true, snapshot };
     }
     case 'TEACH_EVENT': { // 教我模式：content 批量上报录制的用户操作
       const src = sender && sender.tab ? sender.tab.id : null;

@@ -514,26 +514,5 @@ button:disabled { opacity: .5; cursor: default; }
 .primary { background: var(--accent); border-color: var(--accent); color: #fff; flex: 1; }
 .danger { background: transparent; border-color: var(--danger); color: var(--danger); }
 
-/* ---------------- 元素排查调试工具 ---------------- */
-#settings #debugBtn { width: 100%; } /* 设置里的排查按钮对齐输入框宽度 */
-#debugBtn.debug-active {
-  background: var(--accent);
-  border-color: var(--accent);
-  color: #fff;
-}
-.msg.debug-pick {
-  align-self: stretch;
-  background: #14161b;
-  border: 1px dashed var(--accent);
-  font-family: ui-monospace, "SF Mono", Menlo, monospace;
-  font-size: 11px;
-  color: var(--text);
-}
-.msg.debug-pick .dp-seen { color: var(--ok); }
-.msg.debug-pick .dp-ancestor { color: #ffb454; }
-.msg.debug-pick .dp-editor { color: #ffb454; }
-.msg.debug-pick .dp-editor-uncollected { color: var(--danger); }
-.msg.debug-pick .dp-notseen { color: var(--danger); }
-.msg.debug-pick .dp-reason { color: var(--muted); }
-.msg.debug-pick .dp-loc { color: var(--muted); word-break: break-all; }
-#statusBar.debug { color: var(--accent); }
+/* ---------------- 诊断工具 ---------------- */
+#settings #diagBtn { width: 100%; } /* 设置里的诊断按钮对齐输入框宽度 */

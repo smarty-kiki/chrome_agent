@@ -41,10 +41,10 @@
     <label>搜索模板（任务与当前页无关时用）
       <input id="searchTemplate" placeholder="https://www.bing.com/search?q=">
     </label>
-    <label>排查工具（调试）
-      <button id="debugBtn" class="ghost" title="排查元素：进入选择模式，页面上悬停高亮、点元素看 Agent 能否看到（Esc 退出）">排查</button>
+    <label>诊断（调试）
+      <button id="diagBtn" class="ghost" title="把当前标签页 Agent 浏览侧看到的页面快照（可交互元素清单 + 正文摘要 + 子窗口）提取为 JSON 复制到剪贴板">诊断</button>
     </label>
-    <div class="hint">上下文窗口默认 1000000（DeepSeek V4 为 1M）；上下文使用达到压缩阈值（默认 70%）时自动把中间历史压缩成摘要，保留原始目标与最近几步。搜索模板含 {q} 时替换为关键词，否则直接拼接。排查：进入元素选择模式，页面上悬停高亮、点元素看 Agent 能否看到及原因；Esc 退出。Base URL 可换任意 OpenAI 兼容地址。</div>
+    <div class="hint">上下文窗口默认 1000000（DeepSeek V4 为 1M）；上下文使用达到压缩阈值（默认 70%）时自动把中间历史压缩成摘要，保留原始目标与最近几步。搜索模板含 {q} 时替换为关键词，否则直接拼接。诊断：把当前标签页 Agent 提取的页面快照复制到剪贴板，方便核对元素有没有被看到、role 描述对不对。Base URL 可换任意 OpenAI 兼容地址。</div>
   </section>
 
   <section id="sessionBar"></section>
