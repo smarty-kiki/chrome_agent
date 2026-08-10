@@ -815,6 +815,32 @@
         return { ok: true, label: elementLabel(target), at: [Math.round(x), Math.round(y)] };
       }
 
+      case 'dblclickAt': { // 按视口坐标双击：画布表格/文档单元格要"双击进入就地编辑"才可输入（单击只是选中），双击后页面出现就地编辑框
+        const x = Number(a.x), y = Number(a.y);
+        if (!Number.isFinite(x) || !Number.isFinite(y)) return { ok: false, message: 'dblclickAt 需要数字坐标 x,y（视口坐标）' };
+        let target = null;
+        try { target = document.elementFromPoint(x, y); } catch (e) {}
+        if (!target || target === document.documentElement || target === document.body) {
+          return { ok: false, message: '坐标 (' + Math.round(x) + ',' + Math.round(y) + ') 处没有元素' };
+        }
+        const anchor = target.closest ? target.closest('a') : null;
+        if (anchor) {
+          const tgt = String(anchor.target || anchor.getAttribute('target') || '').trim().toLowerCase();
+          const href = anchor.getAttribute('href');
+          if (tgt === '_blank' && href && /^(https?|file):/i.test(href)) {
+            return { ok: true, openTab: new URL(href, location.href).href, label: elementLabel(target) };
+          }
+        }
+        await humanClickGap();
+        // 标准双击序列：两轮 down/up/click（第二次 detail=2）再补 dblclick，框架监听哪种都能命中
+        const base = { clientX: x, clientY: y, bubbles: true, cancelable: true, button: 0, view: window, composed: true };
+        const fire = (type, detail) => target.dispatchEvent(new MouseEvent(type, { ...base, detail }));
+        fire('mousedown', 1); fire('mouseup', 1); fire('click', 1);
+        await sleep(60); // 双击间隔（系统双击判定的时间窗口）
+        fire('mousedown', 2); fire('mouseup', 2); fire('click', 2); fire('dblclick', 2);
+        return { ok: true, label: elementLabel(target), at: [Math.round(x), Math.round(y)] };
+      }
+
       case 'clickText': { // 兜底：元素列表解决不了时，大模型对页面文字做语义判断、直接试点"可能可点"的文字
         const raw = String(a.text || '').trim();
         if (!raw) return { ok: false, message: 'clickText 缺少要点的文字 text' };
