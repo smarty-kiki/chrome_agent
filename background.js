@@ -457,6 +457,7 @@ function systemPrompt() {
 
 1. 页面操作（target 用快照里的数字 ref，如 3；ref 是全局编号，若元素标在【子窗口 N】分组里，直接用它所在行的 ref 即可，系统会自动定位到那个 iframe）：
    {"action":"click","target":<ref>}                       点击元素
+   {"action":"clickAt","x":<视口坐标>,"y":<视口坐标>}       按视口坐标点击：点【画布文字】块里列出的坐标——画布渲染的表格/文档内容画在 canvas 上、不在 DOM 里，单元格无法用 ref 定位，用这个动作按坐标点选具体位置/单元格（x、y 直接填【画布文字】里括号内的数字）
    {"action":"clickText","text":"页面上的文字","frame":<可选，子窗口号>}   兜底点击：元素列表里没有合适的可点元素时，直接点页面上看到的文字——按语义判断它可能可点（如"提交""确定""新建空白文档"这种按钮/卡片/链接样式的文字）。frame 填目标所在【子窗口 N】的 N（主窗口不填）。点文字也失败就不要再死磕，换 wait/hover/ask_user(teach) 推进
    {"action":"hover","target":<ref>}                       悬浮在元素上（不点击），让"悬浮才出现"的元素（如列表行悬浮才显示的编辑/删除按钮、下拉菜单）显示出来；悬浮后系统会重新截图，那些元素会出现在下一次快照里。适合：目标元素当前快照里没有、但你知道悬浮某个元素就会出现它的场景
    {"action":"type","target":<ref>,"text":"..."}           输入文本（覆盖原有内容）
@@ -576,7 +577,7 @@ function parseAction(text) {
   let t = String(text || '').trim();
   t = t.replace(/^```(?:json)?/i, '').replace(/```$/i, '').trim();
   const obj = JSON.parse(t);
-  const ALLOWED = new Set(['open_tab', 'switch_tab', 'use_tab', 'list_tabs', 'close_tab', 'search', 'save_file', 'bookmarks_read', 'bookmarks_write', 'bookmark_find', 'ask_user', 'say', 'click', 'clickText', 'hover', 'type', 'select', 'scroll', 'read', 'wait', 'keypress', 'navigate', 'finish']);
+  const ALLOWED = new Set(['open_tab', 'switch_tab', 'use_tab', 'list_tabs', 'close_tab', 'search', 'save_file', 'bookmarks_read', 'bookmarks_write', 'bookmark_find', 'ask_user', 'say', 'click', 'clickAt', 'clickText', 'hover', 'type', 'select', 'scroll', 'read', 'wait', 'keypress', 'navigate', 'finish']);
   if (!obj || typeof obj !== 'object' || !ALLOWED.has(obj.action)) {
     throw new Error('非法动作：' + (obj && obj.action));
   }
@@ -1041,6 +1042,12 @@ function buildSnapshotMessage(snap, tipsBlock, t) {
       );
     }
   }
+  if (snap.canvas && Array.isArray(snap.canvas.text) && snap.canvas.text.length) {
+    lines.push('【画布文字】（画布渲染的可见内容：正文画在 canvas 上、DOM 里读不到，坐标是视口坐标。要读取/点选具体单元格，用 clickAt 动作并填对应的 x、y；点选后页面会重画，重新快照可读到新位置的内容）');
+    for (const it of snap.canvas.text) {
+      lines.push(`· "${it.t}" @(${it.x},${it.y})` + (it.f ? ' · ' + it.f : ''));
+    }
+  }
   lines.push('【正文摘要】' + (snap.excerpt || ''));
   return lines.join('\n');
 }
@@ -1091,6 +1098,7 @@ async function readSnapshotWithFrames(tabId) {
   const frameMeta = [];
   const frameElements = []; // 每个成功读取窗口的原始元素列表（截断前），供下面分帧保留
   let merged = { url: mainSnap.url, title: mainSnap.title, excerpt: mainSnap.excerpt, elements: [], frames: frameMeta };
+  merged.canvas = mainSnap.canvas; // 画布文字（画布渲染页面的可见内容）——只取主窗口的画布文字，子窗口的暂不合并
   // 主窗口（frameId 0）固定是第 0 帧
   frameMeta.push({ frameId: 0, index: 0, url: mainSnap.url || '', title: mainSnap.title || '' });
   const mainList = [];
@@ -1658,6 +1666,7 @@ function friendlyAction(a, res, ms) {
     : '';
   switch (a.action) {
     case 'click': return T('点击' + (label ? '「' + label + '」' : '') + frameNote);
+    case 'clickAt': return T('点坐标(' + (Number.isFinite(Number(a.x)) ? Math.round(a.x) : '?') + ',' + (Number.isFinite(Number(a.y)) ? Math.round(a.y) : '?') + ')');
     case 'clickText': return T('按文字点「' + short(a.text) + '」' + (typeof a.frame === 'number' && a.frame > 0 ? '（子窗' + a.frame + '）' : ''));
     case 'hover': return T('悬浮' + (label ? '「' + label + '」' : '') + frameNote);
     case 'type': return T('输入' + (short(a.text) ? '「' + short(a.text) + '」' : (label ? '「' + label + '」' : '')) + frameNote);
@@ -2397,7 +2406,7 @@ function collectDifficultyReport(t) {
         if (a.action === 'open_tab' || a.action === 'navigate' || a.action === 'search') {
           cur = ensure(hostOf(a.url));
           if (cur) { cur.actions++; bumpAct(cur, a.action); }
-        } else if (a.action === 'click' || a.action === 'clickText' || a.action === 'hover' || a.action === 'type' || a.action === 'select' || a.action === 'scroll' || a.action === 'keypress') {
+        } else if (a.action === 'click' || a.action === 'clickAt' || a.action === 'clickText' || a.action === 'hover' || a.action === 'type' || a.action === 'select' || a.action === 'scroll' || a.action === 'keypress') {
           if (cur) { cur.actions++; bumpAct(cur, a.action); }
         }
       } catch (e) {}

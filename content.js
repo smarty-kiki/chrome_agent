@@ -32,6 +32,37 @@
 
   let refMap = new Map(); // ref -> { el, selector }
 
+  // ---------------- 画布文字钩子接收端 ----------------
+  // canvas-hook.js 在 document_start + MAIN world 拦截页面画布绘制（fillText/strokeText），armed 后把
+  // 画到 canvas 上的文字批量 postMessage 回传（pa_ct）。这里接收进缓冲区，快照时由 collectCanvasText
+  // 取走并重置钩子状态：每次快照只反映"当前可见内容"（画布应用交互后重画，重画完才有新字），
+  // 旧视图的文字不会串进下一次快照。
+  let canvasTextBuffer = [];
+  window.addEventListener('message', (ev) => {
+    const d = ev.data || {};
+    if (d && Array.isArray(d.pa_ct)) {
+      for (const e of d.pa_ct) {
+        if (e && typeof e.t === 'string' && e.t) canvasTextBuffer.push(e);
+      }
+      if (canvasTextBuffer.length > 1500) canvasTextBuffer.splice(0, canvasTextBuffer.length - 1500);
+    }
+  });
+
+  // 让 MAIN world 钩子开始记录，收走"自上次快照以来画上的文字"，随后重置钩子状态。
+  // 返回条目数组（钩子坐标：canvas 设备坐标 + 可见标记 v）。
+  async function collectCanvasText() {
+    let hasCanvas = false;
+    try { hasCanvas = !!document.querySelector('canvas'); } catch (e) {}
+    if (!hasCanvas) return [];
+    try { window.postMessage({ pa_arm: true }, '*'); } catch (e) {}
+    try { window.postMessage({ pa_flush: true }, '*'); } catch (e) {}
+    await sleep(60); // 等 MAIN world 把已画内容批量回传（postMessage 跨世界异步送达）
+    const got = canvasTextBuffer;
+    canvasTextBuffer = [];
+    try { window.postMessage({ pa_reset: true }, '*'); } catch (e) {}
+    return got;
+  }
+
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
   // 拟人化节奏：点击随机间隔 0.5s~2s（避免连点）；输入逐字、15ms~45ms/字（快但逐字）
@@ -274,8 +305,35 @@
     return fallback;
   }
 
+  // 画布渲染宿主：从隐藏编辑器向上走祖先链，找"最深的、内含尺寸≈自身的大画布"的容器。
+  // 文档/表格的内容真正画在 canvas 上（melo-page-main-view / 网格 canvas），画布所在且尺寸匹配的
+  // 容器才是要展示给大模型的宿主。比 findVisibleEditorHost 更准：那种"找有文字的祖先"在表格页会一路
+  // 升到整页 workbench（标题栏/工具条文字），画布 1044×270 对不上它的尺寸，画布渲染就识别不出来、
+  // 界面文案全当正文。注意每层要遍历全部 canvas：网格页用 0×0 假 canvas 占位（group_col_canvas/
+  // group_row_canvas），只取第一个会漏掉真正画网格的画布。非画布页面返回 null，退回 findVisibleEditorHost。
+  function findCanvasHost(hiddenEl) {
+    const near = (a, b) => b > 0 && a > 100 && Math.abs(a - b) < b * 0.25;
+    let cur = hiddenEl.parentElement;
+    for (let i = 0; cur && cur !== document.body && i < 8; cur = cur.parentElement, i++) {
+      const r = cur.getBoundingClientRect();
+      for (const cv of cur.querySelectorAll('canvas')) {
+        const cr = cv.getBoundingClientRect();
+        if (near(cr.width, r.width) && near(cr.height, r.height)) return cur; // 从深到浅，第一个命中即最深
+      }
+    }
+    return null;
+  }
+
+  // el 的祖先里是否已有收录（宿主被更大的已收录容器包住时，编辑面已被覆盖，不再重复提升宿主）
+  function hasSeenAncestor(el, seenSet) {
+    for (let p = el.parentElement; p && p !== document.body; p = p.parentElement) {
+      if (seenSet.has(p)) return true;
+    }
+    return false;
+  }
+
   // ---------------- 构建页面快照 ----------------
-  function buildSnapshot() {
+  function buildSnapshot(canvasEntries) {
     const map = refMap;
     const items = [];
     const seen = new Set();
@@ -307,37 +365,56 @@
       let host = null;
       let inputEl = null;
       if (el.isContentEditable && (r0.width < 40 || r0.height < 40 || getComputedStyle(el).opacity === '0')) {
-        host = findVisibleEditorHost(el);
-        if (host && !seen.has(host)) {
+        // 画布渲染宿主优先：文档/表格的内容画在 canvas 上，宿主应从"内含尺寸≈自身的大画布"的祖先里
+        // 找（findCanvasHost），比"找有文字的祖先"（findVisibleEditorHost）准——表格页按文字找会一路
+        // 升到整页 workbench（标题栏/工具条文字），画布 1044×270 对不上它的尺寸，画布渲染识别不出、
+        // 界面文案全当正文。非画布页面 findCanvasHost 返回 null，退回原逻辑。
+        const canvasHost = findCanvasHost(el);
+        host = canvasHost || findVisibleEditorHost(el);
+        if (host && !seen.has(host) && !hasSeenAncestor(host, seen)) {
           inputEl = el;                        // 真实输入面：隐藏编辑器
           seen.add(el);
           seen.add(host);                      // 宿主已作为编辑器收录，动态扫描别再把它当可点元素重复收
           const item = describe(host, ++ref);  // 展示/操作对象换成可见宿主
           item.role = 'editor';                // 明确"文档正文编辑区"，让大模型认得出这是写作区
-          if (!item.text && !item.hint) item.hint = '(空编辑区)';
-          // 画布渲染的文档/表格页（如腾讯文档 melo-page-main-view / 网格 canvas）：内容真正画在
-          // canvas 上，宿主的 DOM 文本只是界面提示（"AI帮我创建文档"/模板推荐），不是内容——不标出来
-          // 的话大模型会把界面杂文案当成正文。从宿主向上探几个祖先层找"尺寸≈宿主"的画布（页面 canvas
-          // 常在 zoomable 层、宿主的祖先里）。注意每层要遍历全部 canvas：表格页会用 0×0 的假 canvas
-          // 当占位（group_col_canvas/group_row_canvas），只取第一个就会漏掉真正画网格的画布。
-          try {
-            const hr = host.getBoundingClientRect();
-            const near = (a, b) => b > 0 && a > 100 && Math.abs(a - b) < b * 0.25;
-            outer:
-            for (let cur = host, i = 0; cur && i < 5; cur = cur.parentElement, i++) {
-              for (const cv of cur.querySelectorAll('canvas')) {
-                const cr = cv.getBoundingClientRect();
-                if (near(cr.width, hr.width) && near(cr.height, hr.height)) {
-                  item.hint = '(画布渲染编辑区：内容画在 canvas 上，DOM 不可见)';
-                  item.text = '';
-                  break outer;
+          if (canvasHost) {
+            // 画布渲染的文档/表格页（如腾讯文档 melo-page-main-view / 网格 canvas）：内容真正画在
+            // canvas 上，宿主的 DOM 文本只是界面提示（"AI帮我创建文档"/模板推荐），不是内容——不标出
+            // 来的话大模型会把界面杂文案当成正文。
+            // 通用读取通道：画布渲染的应用往往在 DOM 里保留一个文字镜像（即输入捕获用的隐藏编辑器 el
+            // 本身，如表格公式栏 / 文档合成编辑器），当前焦点/选中区域的内容会回显进去。el 文字非空就
+            // 并入 text，大模型就能读到"当前选中处"的实际内容——不依赖任何网站专属 id，凡是画布渲染 +
+            // DOM 文字镜像的应用都适用；纯 canvas 无镜像的应用读不到（只能靠视觉/截图）。
+            const mirrorText = (el.textContent || '').trim().slice(0, 120);
+            if (mirrorText) {
+              item.hint = '(画布渲染编辑区：内容画在 canvas 上 DOM 不可见；text 为当前焦点/选中处的文字镜像，即该处实际内容。要读其他区域，先点选目标位置再重新快照)';
+              item.text = mirrorText;
+            } else {
+              item.hint = '(画布渲染编辑区：内容画在 canvas 上，DOM 不可见)';
+              item.text = '';
+            }
+          } else {
+            if (!item.text && !item.hint) item.hint = '(空编辑区)';
+            // 兜底：非画布宿主也向上扫几层，别漏掉更高层画布（旧逻辑保留）
+            try {
+              const hr = host.getBoundingClientRect();
+              const near = (a, b) => b > 0 && a > 100 && Math.abs(a - b) < b * 0.25;
+              outer:
+              for (let cur = host, i = 0; cur && i < 5; cur = cur.parentElement, i++) {
+                for (const cv of cur.querySelectorAll('canvas')) {
+                  const cr = cv.getBoundingClientRect();
+                  if (near(cr.width, hr.width) && near(cr.height, hr.height)) {
+                    item.hint = '(画布渲染编辑区：内容画在 canvas 上，DOM 不可见)';
+                    item.text = '';
+                    break outer;
+                  }
                 }
               }
-            }
-          } catch (e) {}
+            } catch (e) {}
+          }
           map.set(ref, { el: host, inputEl, selector: item.selector, desc: (item.text || item.hint || item.role || item.tag).slice(0, 30) });
           items.push(item);
-        } else if (host && seen.has(host)) {
+        } else if (host && (seen.has(host) || hasSeenAncestor(host, seen))) {
           // 宿主已被更早的编辑器收录（表格里公式栏先把整表提升成编辑器、就地编辑框随后到）：
           // 不重复提升宿主，把这个小编辑器本身暴露成可输入元素，给 Agent 一个能直接打字的编辑面。
           seen.add(el);
@@ -441,12 +518,41 @@
         else if (f.hasAttribute && f.hasAttribute('srcdoc')) iframeSrcs.push('[srcdoc]');
       }
     } catch (e) {}
+    // 画布文字块：把钩子收到的条目换算成视口坐标，只保留"主画布范围内 + 可见画布画的"——
+    // 中间渲染层（display:none）画的坐标不可信、小画布（滚动条/占位）画的不算正文，都滤掉。
+    // 坐标换算：钩子给的是 canvas 设备坐标（bitmap 像素），先按主画布 bitmap/CSS 缩放比转成 CSS 像素，
+    // 再加画布左上角视口偏移，得到可直接用于 clickAt 的视口坐标。
+    const canvasBlock = (() => {
+      if (!Array.isArray(canvasEntries) || !canvasEntries.length) return null;
+      try {
+        let main = null, mainArea = 0;
+        for (const cv of document.querySelectorAll('canvas')) {
+          const r = cv.getBoundingClientRect();
+          if (r.width > 60 && r.height > 60 && r.width * r.height > mainArea) { main = cv; mainArea = r.width * r.height; }
+        }
+        if (!main) return null;
+        const r = main.getBoundingClientRect();
+        const sx = main.width > 0 ? r.width / main.width : 1;
+        const sy = main.height > 0 ? r.height / main.height : 1;
+        const text = [];
+        for (const e of canvasEntries) {
+          if (e.v === 0) continue;
+          if (e.x < 0 || e.y < 0 || e.x > main.width || e.y > main.height) continue;
+          if (text.length >= 400) break;
+          text.push({ t: e.t.slice(0, 120), x: Math.round(r.left + e.x * sx), y: Math.round(r.top + e.y * sy), f: e.f || '' });
+        }
+        return text.length
+          ? { rect: { left: Math.round(r.left), top: Math.round(r.top), width: Math.round(r.width), height: Math.round(r.height) }, text }
+          : null;
+      } catch (e) { return null; }
+    })();
     return {
       url: location.href,
       title: document.title,
       elements: items,
       excerpt: bodyText,
-      iframes: iframeSrcs
+      iframes: iframeSrcs,
+      canvas: canvasBlock || undefined
     };
   }
 
@@ -681,6 +787,32 @@
         el.click();
         el.focus();
         return { ok: true, label: elementLabel(el) };
+      }
+
+      case 'clickAt': { // 按视口坐标点击：画布文字钩子给出坐标后，点画布上具体位置/单元格（内容不在 DOM，无法用 ref 定位）
+        const x = Number(a.x), y = Number(a.y);
+        if (!Number.isFinite(x) || !Number.isFinite(y)) return { ok: false, message: 'clickAt 需要数字坐标 x,y（视口坐标）' };
+        let target = null;
+        try { target = document.elementFromPoint(x, y); } catch (e) {}
+        if (!target || target === document.documentElement || target === document.body) {
+          return { ok: false, message: '坐标 (' + Math.round(x) + ',' + Math.round(y) + ') 处没有元素' };
+        }
+        // 命中"会新开页面"的链接同 click 一样截获，交给 background 后台打开（不抢焦点）
+        const anchor = target.closest ? target.closest('a') : null;
+        if (anchor) {
+          const tgt = String(anchor.target || anchor.getAttribute('target') || '').trim().toLowerCase();
+          const href = anchor.getAttribute('href');
+          if (tgt === '_blank' && href && /^(https?|file):/i.test(href)) {
+            return { ok: true, openTab: new URL(href, location.href).href, label: elementLabel(target) };
+          }
+        }
+        await humanClickGap(); // 拟人：随机 0.5s~2s
+        // 画布应用（表格）用 mousedown/mouseup/click 做单元格命中；带 clientX/clientY 合成事件即可定位。
+        const opts = { clientX: x, clientY: y, bubbles: true, cancelable: true, button: 0, view: window, composed: true };
+        target.dispatchEvent(new MouseEvent('mousedown', opts));
+        target.dispatchEvent(new MouseEvent('mouseup', opts));
+        target.dispatchEvent(new MouseEvent('click', opts));
+        return { ok: true, label: elementLabel(target), at: [Math.round(x), Math.round(y)] };
       }
 
       case 'clickText': { // 兜底：元素列表解决不了时，大模型对页面文字做语义判断、直接试点"可能可点"的文字
@@ -1186,8 +1318,10 @@
       switch (msg.type) {
         case 'PING':
           return { pong: true };
-        case 'GET_SNAPSHOT':
-          return buildSnapshot();
+        case 'GET_SNAPSHOT': {
+          const canvasEntries = await collectCanvasText(); // 画布文字：收最新一批并重置钩子，供 buildSnapshot 带出
+          return buildSnapshot(canvasEntries);
+        }
         case 'EXECUTE_ACTION':
           return executeAction(msg.action || {});
         case 'TEACH_START':
