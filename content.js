@@ -748,7 +748,9 @@
   function keyCode(key) {
     const map = {
       Enter: 13, Escape: 27, Tab: 9, Backspace: 8, Delete: 46,
-      ArrowUp: 38, ArrowDown: 40, ArrowLeft: 37, ArrowRight: 39, ' ': 32
+      ArrowUp: 38, ArrowDown: 40, ArrowLeft: 37, ArrowRight: 39, ' ': 32,
+      F1: 112, F2: 113, F3: 114, F4: 115, F5: 116, F6: 117, F7: 118,
+      F8: 119, F9: 120, F10: 121, F11: 122, F12: 123
     };
     return map[key] || 0;
   }
@@ -877,7 +879,41 @@
         await sleep(300); // 等跳转 + 表格重画
         const now = String(nameBox.value || '').trim().toUpperCase();
         const ok = now === ref;
-        return { ok, message: ok ? '已跳到 ' + ref : '跳转未生效：名称框仍显示 ' + (now || '(空)') + '，可用 clickAt 坐标点选兜底', at: [ref, now] };
+        // ---- 跳格成功后把焦点交还给表格网格 ----
+        // 名称框回车后焦点常留在输入框上，导致后续 F2/打字作用不到表格（F2 按在输入框上不进编辑）。
+        // 表格的键盘处理器挂在"网格表面"容器上、键事件会冒泡，所以把焦点放到网格内部元素即可：
+        // 先 blur 名称框（应用可能自己把焦点还回网格），焦点仍不在网格上时，再找大画布的可聚焦祖先/画布本身。
+        if (ok) {
+          try { nameBox.blur(); } catch (e) {}
+          await sleep(60); // 给应用机会自行把焦点还回网格
+          let g = document.activeElement;
+          const gIsInput = g && (g.tagName === 'INPUT' || g.tagName === 'TEXTAREA' || g.isContentEditable);
+          if (!g || g === document.body || g === document.documentElement || gIsInput) {
+            g = null;
+            try {
+              for (const c of document.querySelectorAll('canvas')) {
+                const r = c.getBoundingClientRect();
+                if (r.width < 200 || r.height < 200) continue; // 小画布（图标/头像）跳过，只认大网格
+                let cur = c;
+                for (let i = 0; cur && cur !== document.body && i < 6; i++) {
+                  const at = cur.getAttribute && cur.getAttribute('tabindex');
+                  if (at != null && at !== '-1') { g = cur; break; } // 网格表面的可聚焦容器
+                  cur = cur.parentElement;
+                }
+                g = g || (c.closest('[role="grid"],[role="application"],[role="table"],[role="treegrid"]') || c);
+                break;
+              }
+              if (g) { g.focus(); await sleep(30); }
+            } catch (e) {}
+          }
+        }
+        // 诊断：跳格+焦点交还后，焦点落在哪个元素（日志里能直接看到，方便排查 F2 是否作用到表格）
+        let foc = '';
+        try {
+          const f = document.activeElement;
+          foc = f && f !== document.body && f !== document.documentElement ? (elementLabel(f) || f.tagName) : 'body';
+        } catch (e) {}
+        return { ok, message: ok ? '已跳到 ' + ref + '，焦点在「' + foc + '」' : '跳转未生效：名称框仍显示 ' + (now || '(空)') + '，可用 clickAt 坐标点选兜底', at: [ref, now] };
       }
 
       case 'clickText': { // 兜底：元素列表解决不了时，大模型对页面文字做语义判断、直接试点"可能可点"的文字
