@@ -2268,12 +2268,20 @@ async function getSiteTips(host) {
   return store[host] || [];
 }
 
-async function saveSiteTips(host, tips) {
+// 全站技巧总条数（面板技巧按钮的角标数字）
+async function totalTipCount() {
+  const store = await getTipStore();
+  return Object.values(store).reduce((n, arr) => n + (Array.isArray(arr) ? arr.length : 0), 0);
+}
+
+async function saveSiteTips(host, tips, sid) {
   const store = await getTipStore();
   store[host] = (tips || [])
     .map((s) => String(s).replace(/\s+/g, ' ').trim().slice(0, 120))
     .filter(Boolean);
   await chrome.storage.local.set({ [TIPS_KEY]: store });
+  // 复盘/教我沉淀了新技巧后，广播新总数让面板技巧按钮的数字跟着变（带来源会话 sid，面板按会话路由也能收到）
+  if (sid != null) broadcast({ type: 'TIPS_CHANGED', count: await totalTipCount() }, sid);
 }
 
 // 复盘入口（与书签复盘并列，都在 finish 时跑）：把本轮"反复失败 / 绕了弯路多点了很多次"
@@ -2329,7 +2337,7 @@ async function reviewAndLearnTips(t, force, pinnedTurn) {
     try {
       const merged = await mergeSiteTips(h, newTips, oldByHost[h], t.sid);
       if (!merged || !merged.length) continue;
-      await saveSiteTips(h, merged);
+      await saveSiteTips(h, merged, t.sid);
       addLog(t.sid, '复盘：沉淀 ' + h + ' 的操作技巧（共 ' + merged.length + ' 条）');
     } catch (e) {
       addLog(t.sid, '复盘技巧保存失败：' + h + ' → ' + e.message, true);
@@ -2867,7 +2875,7 @@ async function resumeAfterUser(sid, confirmedText) {
         const old = (store[host] || []).join('\n');
         const merged = await mergeSiteTips(host, [recipe], old, t.sid);
         if (merged && merged.length) {
-          await saveSiteTips(host, merged);
+          await saveSiteTips(host, merged, t.sid);
           addLog(t.sid, '教我模式：使用者确认后，已把该站操作流程沉淀为技巧（' + host + '）');
         }
       }

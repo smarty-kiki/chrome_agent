@@ -285,14 +285,16 @@
     for (const el of nodes) {
       if (seen.has(el)) continue;
 
-      // 父级已被收录（嵌套可点元素，如 button 里的 a），跳过以去噪
+      // 父级已被收录（嵌套可点元素，如 button 里的 a），跳过以去噪；
+      // 但 contenteditable/textarea 是"可输入面"：宿主整块被收录为编辑器时，内部真正的输入框
+      // 仍要放行（表格就地编辑框在整表编辑器内部），否则 Agent 会没有可打字的真实输入元素。
       let p = el.parentElement;
       let nested = false;
       while (p && p !== document.body) {
         if (seen.has(p)) { nested = true; break; }
         p = p.parentElement;
       }
-      if (nested) continue;
+      if (nested && el.tagName !== 'TEXTAREA' && !el.isContentEditable) continue;
 
       if (ref >= MAX_ELEMENTS) break;
 
@@ -306,32 +308,43 @@
       let inputEl = null;
       if (el.isContentEditable && (r0.width < 40 || r0.height < 40 || getComputedStyle(el).opacity === '0')) {
         host = findVisibleEditorHost(el);
-        if (host) {
+        if (host && !seen.has(host)) {
           inputEl = el;                        // 真实输入面：隐藏编辑器
           seen.add(el);
           seen.add(host);                      // 宿主已作为编辑器收录，动态扫描别再把它当可点元素重复收
           const item = describe(host, ++ref);  // 展示/操作对象换成可见宿主
           item.role = 'editor';                // 明确"文档正文编辑区"，让大模型认得出这是写作区
           if (!item.text && !item.hint) item.hint = '(空编辑区)';
-          // 画布渲染的文档页（如腾讯文档 melo-page-main-view）：正文真正画在 canvas 上，宿主的
-          // DOM 文本只是界面提示（"AI帮我创建文档"/无障碍提示），不是文档内容——不标出来的话大模型
-          // 会把界面杂文案当成正文。从宿主向上探几个祖先层找"尺寸≈宿主"的画布（页面 canvas 常在
-          // zoomable 层、宿主的祖先里），命中就改写 hint 说明"内容画在 canvas 上、DOM 不可见"。
+          // 画布渲染的文档/表格页（如腾讯文档 melo-page-main-view / 网格 canvas）：内容真正画在
+          // canvas 上，宿主的 DOM 文本只是界面提示（"AI帮我创建文档"/模板推荐），不是内容——不标出来
+          // 的话大模型会把界面杂文案当成正文。从宿主向上探几个祖先层找"尺寸≈宿主"的画布（页面 canvas
+          // 常在 zoomable 层、宿主的祖先里）。注意每层要遍历全部 canvas：表格页会用 0×0 的假 canvas
+          // 当占位（group_col_canvas/group_row_canvas），只取第一个就会漏掉真正画网格的画布。
           try {
             const hr = host.getBoundingClientRect();
             const near = (a, b) => b > 0 && a > 100 && Math.abs(a - b) < b * 0.25;
+            outer:
             for (let cur = host, i = 0; cur && i < 5; cur = cur.parentElement, i++) {
-              const cv = cur.querySelector('canvas');
-              if (!cv) continue;
-              const cr = cv.getBoundingClientRect();
-              if (near(cr.width, hr.width) && near(cr.height, hr.height)) {
-                item.hint = '(画布渲染编辑区：正文画在 canvas 上，DOM 不可见)';
-                item.text = '';
-                break;
+              for (const cv of cur.querySelectorAll('canvas')) {
+                const cr = cv.getBoundingClientRect();
+                if (near(cr.width, hr.width) && near(cr.height, hr.height)) {
+                  item.hint = '(画布渲染编辑区：内容画在 canvas 上，DOM 不可见)';
+                  item.text = '';
+                  break outer;
+                }
               }
             }
           } catch (e) {}
           map.set(ref, { el: host, inputEl, selector: item.selector, desc: (item.text || item.hint || item.role || item.tag).slice(0, 30) });
+          items.push(item);
+        } else if (host && seen.has(host)) {
+          // 宿主已被更早的编辑器收录（表格里公式栏先把整表提升成编辑器、就地编辑框随后到）：
+          // 不重复提升宿主，把这个小编辑器本身暴露成可输入元素，给 Agent 一个能直接打字的编辑面。
+          seen.add(el);
+          const item = describe(el, ++ref);
+          item.role = 'editor';
+          item.hint = '(就地编辑框，可直接输入)';
+          map.set(ref, { el, inputEl: el, selector: item.selector, desc: (item.text || item.hint || item.role || item.tag).slice(0, 30) });
           items.push(item);
         }
         continue; // 隐藏编辑器（无论有没有宿主）都走特判分支，不进普通可交互路径

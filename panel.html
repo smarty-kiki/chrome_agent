@@ -9,7 +9,10 @@
 <body>
   <header>
     <div class="logo">PageAgent<span id="tokenTotal" class="logo-tokens" title="">Token 0</span></div>
-    <button id="toggleSettings" class="ghost" title="设置">设置</button>
+    <div class="header-actions">
+      <button id="tipsBtn" class="ghost" title="查看 / 编辑 / 删除各网站的操作技巧">技巧</button>
+      <button id="toggleSettings" class="ghost" title="设置">设置</button>
+    </div>
   </header>
 
   <section id="settings" hidden>
@@ -47,13 +50,6 @@
     <div class="hint">上下文窗口默认 1000000（DeepSeek V4 为 1M）；上下文使用达到压缩阈值（默认 70%）时自动把中间历史压缩成摘要，保留原始目标与最近几步。搜索模板含 {q} 时替换为关键词，否则直接拼接。诊断：把当前标签页 Agent 提取的页面快照复制到剪贴板，方便核对元素有没有被看到、role 描述对不对。Base URL 可换任意 OpenAI 兼容地址。</div>
   </section>
 
-  <section id="sessionBar"></section>
-
-  <section id="statusBar">
-    <span id="statusText">就绪</span>
-    <button id="logToggle" class="ghost" title="切换：会话消息 / 大模型原始往返日志（本会话，每步发了什么、返回了什么）">日志</button>
-  </section>
-
   <section id="tipsPanel" hidden>
     <div class="tips-head">
       <span>网站操作技巧</span>
@@ -62,6 +58,13 @@
     </div>
     <div id="tipsList"></div>
     <div class="hint">技巧按网站域名记录（不带路径）。Agent 操作这些网站时会自动加载【本站操作技巧】并放在快照最前优先遵循；卡住或反复失败时会提示对照技巧调整做法。复盘时自动沉淀"反复失败/绕弯路"的新技巧，与既有技巧冲突会自动合并。这里可手动查看、编辑、删除。</div>
+  </section>
+
+  <section id="sessionBar"></section>
+
+  <section id="statusBar">
+    <span id="statusText">就绪</span>
+    <button id="logToggle" class="ghost" title="切换：会话消息 / 大模型原始往返日志（本会话，每步发了什么、返回了什么）">日志</button>
   </section>
 
   <main id="chat">
@@ -80,7 +83,6 @@
     <div class="input-actions">
       <button id="sendBtn" class="primary">发送</button>
       <button id="stopBtn" class="danger" title="停止当前操作（对话可继续）">■ 停止</button>
-      <button id="tipsBtn" class="ghost" title="查看 / 编辑 / 删除各网站的操作技巧">技巧</button>
       <button id="clearBtn" class="ghost" title="清空本会话：关闭本会话 Agent 自开标签并清空记录（会话保留；新建走上方 ＋）">清空本会话</button>
     </div>
   </footer>

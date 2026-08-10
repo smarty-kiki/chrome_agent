@@ -682,6 +682,18 @@ function renderLogList() {
 }
 
 // ---------------- 网站操作技巧管理 ----------------
+// 技巧按钮角标数字：全站技巧总条数（init / 后台广播 TIPS_CHANGED 时刷新）
+async function updateTipsBtn() {
+  try {
+    const { tips } = await chrome.runtime.sendMessage({ type: 'GET_TIPS' });
+    setTipsBtnCount(tips || {});
+  } catch (e) { /* 后台未就绪时保持原样 */ }
+}
+function setTipsBtnCount(store) {
+  const n = Object.values(store || {}).reduce((s, arr) => s + (Array.isArray(arr) ? arr.length : 0), 0);
+  $('#tipsBtn').textContent = '技巧 ' + n;
+}
+
 // 打开技巧面板：读取全部站点技巧并渲染（查看 / 编辑 / 删除）
 async function openTipsPanel() {
   try {
@@ -700,6 +712,7 @@ function renderTips(store) {
   const countEl = $('#tipsCount');
   const total = domains.reduce((n, d) => n + (store[d] || []).length, 0);
   countEl.textContent = domains.length ? total + ' 条 · ' + domains.length + ' 个站点' : '（暂无技巧）';
+  setTipsBtnCount(store); // 手动编辑/删除后技巧按钮的数字同步
   for (const d of domains) {
     const tips = store[d] || [];
     const box = document.createElement('div');
@@ -866,8 +879,14 @@ async function init() {
   $('#stopBtn').addEventListener('click', onStop);
   $('#diagBtn').addEventListener('click', onDiag);
   $('#logToggle').addEventListener('click', () => setLogView(!logView));
-  $('#tipsBtn').addEventListener('click', openTipsPanel);
+  // 技巧按钮可切换：开着再点收起，关着点开（重开时刷新列表）
+  $('#tipsBtn').addEventListener('click', () => {
+    const p = $('#tipsPanel');
+    if (p.hidden) openTipsPanel();
+    else p.hidden = true;
+  });
   $('#tipsClose').addEventListener('click', () => { $('#tipsPanel').hidden = true; });
+  updateTipsBtn(); // 顶栏技巧按钮显示当前全站技巧总数
   $('#clearBtn').addEventListener('click', onClear);
 
   // 广播消息：按 msg.sid 路由到所属会话；非当前会话只更新缓存与会话栏状态点，不碰 DOM
@@ -937,6 +956,10 @@ async function init() {
         cache.logs.push({ t: msg.t, req: msg.req, res: msg.res });
         if (cache.logs.length > MAX_LLM_LOG) cache.logs.splice(0, cache.logs.length - MAX_LLM_LOG);
         if (sid === activeSid && logView) renderLogList();
+        break;
+      case 'TIPS_CHANGED': // 后台复盘/教我沉淀了新技巧：刷新技巧按钮数字；面板开着时顺带刷新列表
+        updateTipsBtn();
+        if (!$('#tipsPanel').hidden) openTipsPanel();
         break;
       default:
         break;
