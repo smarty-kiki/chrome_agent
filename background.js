@@ -459,6 +459,7 @@ function systemPrompt() {
    {"action":"click","target":<ref>}                       点击元素
    {"action":"clickAt","x":<视口坐标>,"y":<视口坐标>}       按视口坐标点击：点【画布文字】块里列出的坐标——画布渲染的表格/文档内容画在 canvas 上、不在 DOM 里，单元格无法用 ref 定位，用这个动作按坐标点选具体位置/单元格（x、y 直接填【画布文字】里括号内的数字）
    {"action":"dblclickAt","x":<视口坐标>,"y":<视口坐标>}     按视口坐标双击：画布表格/文档的单元格"单击只是选中、要编辑必须双击进入就地编辑"。双击后页面上会出现就地编辑框（快照里的"就地编辑框，可直接输入"元素），再 type 进那个编辑框、keypress Enter 提交
+   {"action":"gotoCell","ref":"D8"}                          表格专用：按格子引用跳格（D8 / $A$1 / E5:G8）。在快照里找到"单元格名称框"（值形如 D2 的输入框）→ 输格号 → 回车 → 读回验证。编辑画布表格优先用它定位目标格，比坐标点选稳
    {"action":"clickText","text":"页面上的文字","frame":<可选，子窗口号>}   兜底点击：元素列表里没有合适的可点元素时，直接点页面上看到的文字——按语义判断它可能可点（如"提交""确定""新建空白文档"这种按钮/卡片/链接样式的文字）。frame 填目标所在【子窗口 N】的 N（主窗口不填）。点文字也失败就不要再死磕，换 wait/hover/ask_user(teach) 推进
    {"action":"hover","target":<ref>}                       悬浮在元素上（不点击），让"悬浮才出现"的元素（如列表行悬浮才显示的编辑/删除按钮、下拉菜单）显示出来；悬浮后系统会重新截图，那些元素会出现在下一次快照里。适合：目标元素当前快照里没有、但你知道悬浮某个元素就会出现它的场景
    {"action":"type","target":<ref>,"text":"..."}           输入文本（覆盖原有内容）
@@ -495,7 +496,7 @@ function systemPrompt() {
 - 元素 ref 是数字；标签 ref 带 @ 前缀。绝不臆造，找不到就先 scroll/read/switch_tab 再观察。
 - 想对列表/表格里的某一行执行操作（编辑 / 删除 / 更多菜单等）却找不到对应按钮时，别急着放弃——很多站点的行内操作按钮是**悬浮在那一行上才出现**的：用 hover 悬浮那一行（或其上的任意元素）让按钮显示出来，重截快照后就能看到并点击了。在页面上找不到下一步该点的按钮/入口时，同样先想想它是不是要 hover 某个列表项才会出现，用 hover 动作去试。
 - 可交互元素列表解决不了问题时，可以用 clickText 兜底：有些按钮/卡片是纯 JS 动态渲染、提取不到列表里，但你仍能从正文和【子窗口 N】内容里看到它们的文字。对**明显可点**的文字（按钮/链接样式，或语境上显然是个入口，如"提交""创建""登录""新建空白文档"）用 clickText 按语义试点——点的是文字，不需要它出现在列表里。clickText 连续失败几次仍无进展就不要再赌，改用 wait 等弹层/内容加载、hover 让悬浮项出现、或 ask_user(teach) 请使用者演示。
-- 画布表格/文档（快照里有【画布文字】块、单元格内容画在 canvas 上）的编辑链路：单击只是选中，**编辑必须双击进入就地编辑**。通用做法：clickAt 按坐标单击选中目标格子 → dblclickAt 双击同一坐标，唤起就地编辑框（快照里会出现"就地编辑框，可直接输入"的元素）→ type 进那个编辑框 → keypress Enter 提交（或 clickAt 点别的格子收起）→ 重新快照，从【画布文字】确认单元格值已更新。若 dblclickAt 唤不起编辑框，退回备用做法：clickAt 选中后直接 type（不少表格支持选中后直接打字覆盖原内容）再 keypress Enter。
+- 画布表格/文档（快照里有【画布文字】块、单元格内容画在 canvas 上）的操作：表格类页面一般都有**单元格名称框**（快照里标注"单元格名称框"、值形如 D2 的输入框——Excel/Sheets/WPS/腾讯等电子表格的通用特征），用它定位目标格**优先用 gotoCell**（如 gotoCell D8：名称框输格号+回车跳格），比坐标点选稳。编辑目标格配方：gotoCell 跳到目标格 → keypress F2 进入就地编辑 → type 输入新值 → keypress Enter 提交 → 重新快照从【画布文字】确认值已更新。F2 进不了编辑、或页面没有名称框时退回坐标方案：clickAt 按坐标单击选中 → dblclickAt 双击唤起就地编辑框 → type → keypress Enter。
 - 任务没给具体网址、需要查资料/搜信息时，用 search 动作（后台自动开搜索页）；知道确切网址时用 open_tab。
 - 当前页是受限页面（快照里会明确标注"受限页面"，如 chrome://、about:、扩展管理页、新标签页）时，绝对不要尝试操作它，直接用 open_tab 打开任务相关网址或 search 搜索。
 - 需要访问新页面做独立工作时，优先 open_tab / search 新开后台标签，避免打扰使用者的浏览。
@@ -579,7 +580,7 @@ function parseAction(text) {
   let t = String(text || '').trim();
   t = t.replace(/^```(?:json)?/i, '').replace(/```$/i, '').trim();
   const obj = JSON.parse(t);
-  const ALLOWED = new Set(['open_tab', 'switch_tab', 'use_tab', 'list_tabs', 'close_tab', 'search', 'save_file', 'bookmarks_read', 'bookmarks_write', 'bookmark_find', 'ask_user', 'say', 'click', 'clickAt', 'dblclickAt', 'clickText', 'hover', 'type', 'select', 'scroll', 'read', 'wait', 'keypress', 'navigate', 'finish']);
+  const ALLOWED = new Set(['open_tab', 'switch_tab', 'use_tab', 'list_tabs', 'close_tab', 'search', 'save_file', 'bookmarks_read', 'bookmarks_write', 'bookmark_find', 'ask_user', 'say', 'click', 'clickAt', 'dblclickAt', 'gotoCell', 'clickText', 'hover', 'type', 'select', 'scroll', 'read', 'wait', 'keypress', 'navigate', 'finish']);
   if (!obj || typeof obj !== 'object' || !ALLOWED.has(obj.action)) {
     throw new Error('非法动作：' + (obj && obj.action));
   }
@@ -1045,7 +1046,7 @@ function buildSnapshotMessage(snap, tipsBlock, t) {
     }
   }
   if (snap.canvas && Array.isArray(snap.canvas.text) && snap.canvas.text.length) {
-    lines.push('【画布文字】（画布渲染的可见内容：正文画在 canvas 上、DOM 里读不到，坐标是视口坐标。要读取/点选具体单元格，用 clickAt 动作并填对应的 x、y；要编辑某格，单击选中后 dblclickAt 双击同坐标进入就地编辑、type 输入、keypress Enter 提交。点选/编辑后页面会重画，重新快照可读到新位置/新值的内容）');
+    lines.push('【画布文字】（画布渲染的可见内容：正文画在 canvas 上、DOM 里读不到，坐标是视口坐标。表格类页面优先用 gotoCell 按格号定位（如 gotoCell D8）再 F2 编辑，比坐标稳；坐标也可直接 clickAt/dblclickAt 点选。操作后页面会重画，重新快照可读到新位置/新值）');
     for (const it of snap.canvas.text) {
       lines.push(`· "${it.t}" @(${it.x},${it.y})` + (it.f ? ' · ' + it.f : ''));
     }
@@ -1670,6 +1671,7 @@ function friendlyAction(a, res, ms) {
     case 'click': return T('点击' + (label ? '「' + label + '」' : '') + frameNote);
     case 'clickAt': return T('点坐标(' + (Number.isFinite(Number(a.x)) ? Math.round(a.x) : '?') + ',' + (Number.isFinite(Number(a.y)) ? Math.round(a.y) : '?') + ')');
     case 'dblclickAt': return T('双击坐标(' + (Number.isFinite(Number(a.x)) ? Math.round(a.x) : '?') + ',' + (Number.isFinite(Number(a.y)) ? Math.round(a.y) : '?') + ')');
+    case 'gotoCell': return T('跳格到 ' + String(a.ref || '?'));
     case 'clickText': return T('按文字点「' + short(a.text) + '」' + (typeof a.frame === 'number' && a.frame > 0 ? '（子窗' + a.frame + '）' : ''));
     case 'hover': return T('悬浮' + (label ? '「' + label + '」' : '') + frameNote);
     case 'type': return T('输入' + (short(a.text) ? '「' + short(a.text) + '」' : (label ? '「' + label + '」' : '')) + frameNote);
@@ -2409,7 +2411,7 @@ function collectDifficultyReport(t) {
         if (a.action === 'open_tab' || a.action === 'navigate' || a.action === 'search') {
           cur = ensure(hostOf(a.url));
           if (cur) { cur.actions++; bumpAct(cur, a.action); }
-        } else if (a.action === 'click' || a.action === 'clickAt' || a.action === 'dblclickAt' || a.action === 'clickText' || a.action === 'hover' || a.action === 'type' || a.action === 'select' || a.action === 'scroll' || a.action === 'keypress') {
+        } else if (a.action === 'click' || a.action === 'clickAt' || a.action === 'dblclickAt' || a.action === 'gotoCell' || a.action === 'clickText' || a.action === 'hover' || a.action === 'type' || a.action === 'select' || a.action === 'scroll' || a.action === 'keypress') {
           if (cur) { cur.actions++; bumpAct(cur, a.action); }
         }
       } catch (e) {}

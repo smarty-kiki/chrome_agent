@@ -644,6 +644,12 @@
       };
       const it = String(el.type || 'text').toLowerCase();
       if (typeMap[it]) return typeMap[it];
+      // 电子表格通用特征：value 是"格子号"格式（D2 / $A$1 / E5:G8）的输入框 → 单元格名称框
+      // （Excel/Sheets/WPS/腾讯等表格的名称框都是这种值，按格式识别、不认站点）
+      if (el.type === 'text' || el.type === '') {
+        const v = String(el.value || '').trim().toUpperCase();
+        if (/^[$]?[A-Z]{1,3}[$]?[0-9]{1,7}(:[$]?[A-Z]{1,3}[$]?[0-9]{1,7})?$/.test(v)) return '单元格名称框';
+      }
     }
 
     // 拆 id/class/name 的驼峰与分隔符得到候选词，再查中英词典（靠前的优先级高）
@@ -839,6 +845,39 @@
         await sleep(60); // 双击间隔（系统双击判定的时间窗口）
         fire('mousedown', 2); fire('mouseup', 2); fire('click', 2); fire('dblclick', 2);
         return { ok: true, label: elementLabel(target), at: [Math.round(x), Math.round(y)] };
+      }
+
+      case 'gotoCell': { // 电子表格通用能力：按格子引用跳格（D2 / $A$1 / E5:G8），不依赖像素坐标。
+        // 识别"单元格名称框"（value 是格子号格式的输入框——表格通用特征）→ 输格号 + 回车 → 读回验证。
+        const rawRef = String(a.ref || '').trim();
+        const ref = rawRef.toUpperCase();
+        if (!/^[$]?[A-Z]{1,3}[$]?[0-9]{1,7}(:[$]?[A-Z]{1,3}[$]?[0-9]{1,7})?$/.test(ref)) {
+          return { ok: false, message: 'gotoCell 需要格子引用（如 D8、$A$1、E5:G8），收到: ' + (rawRef || '(空)') };
+        }
+        let nameBox = null;
+        try {
+          for (const el of document.querySelectorAll('input')) {
+            const v = String(el.value || '').trim().toUpperCase();
+            if (/^[$]?[A-Z]{1,3}[$]?[0-9]{1,7}(:[$]?[A-Z]{1,3}[$]?[0-9]{1,7})?$/.test(v)) {
+              const r = el.getBoundingClientRect();
+              if (r.width > 0 && r.height > 0) { nameBox = el; break; } // 首个可见匹配即名称框（公式栏里排最前）
+            }
+          }
+        } catch (e) {}
+        if (!nameBox) return { ok: false, message: '没找到单元格名称框（页面没有 value 是格子号格式的输入框，无法跳格），可用 clickAt 坐标点选兜底' };
+        try { nameBox.scrollIntoView({ block: 'center' }); } catch (e) {}
+        nameBox.focus();
+        nameBox.select();
+        setNativeValue(nameBox, ref, false); // 覆盖原格号（走原生 setter + input 事件，受控组件也能收到）
+        await humanClickGap(); // 拟人节奏
+        const k = { bubbles: true, cancelable: true, key: 'Enter', code: 'Enter', keyCode: 13, which: 13, view: window };
+        nameBox.dispatchEvent(new KeyboardEvent('keydown', k));
+        nameBox.dispatchEvent(new KeyboardEvent('keypress', k));
+        nameBox.dispatchEvent(new KeyboardEvent('keyup', k));
+        await sleep(300); // 等跳转 + 表格重画
+        const now = String(nameBox.value || '').trim().toUpperCase();
+        const ok = now === ref;
+        return { ok, message: ok ? '已跳到 ' + ref : '跳转未生效：名称框仍显示 ' + (now || '(空)') + '，可用 clickAt 坐标点选兜底', at: [ref, now] };
       }
 
       case 'clickText': { // 兜底：元素列表解决不了时，大模型对页面文字做语义判断、直接试点"可能可点"的文字
