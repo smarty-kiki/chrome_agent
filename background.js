@@ -25,8 +25,8 @@ const MAX_AGENT_TABS = 20;       // Agent 自开标签上限，防止失控
 const HEARTBEAT_ALARM = 'pageagent-heartbeat';
 const MAX_STEP_LLM_RETRY = 4;    // 单步 LLM 输出解析失败的最大重试次数
 const MAX_SESSIONS = 5;          // 最多并发会话数（顶部会话栏可新建/切换）
-const MAX_CONVERSATION = 80;     // 对话记录最多保留条数
-const MAX_HISTORY = 400;         // LLM 消息历史上限（超出后裁剪保留尾部）
+const MAX_CONVERSATION = 200;    // 对话记录最多保留条数
+const MAX_HISTORY = 800;         // LLM 消息历史上限（超出后裁剪保留尾部）
 const DEFAULT_CONTEXT_WINDOW = 1000000; // DeepSeek V4 上下文窗口（token），设置里可调
 const OUTPUT_RESERVE = 8192;          // 每次调用给 LLM 输出预留的 token
 const COMPRESS_THRESHOLD = 0.7;       // 上下文使用到 70% 触发历史压缩
@@ -106,13 +106,14 @@ async function loadTasks() {
 }
 
 async function saveTasks() {
-  // 长对话防膨胀：每会话保留 system + 最近 350 条
+  // 长对话防膨胀：每会话保留 system + 最近 750 条
   for (const sid of Object.keys(tasks)) {
     const t = tasks[sid];
     if (t.history && t.history.length > MAX_HISTORY) {
       t.history = [t.history[0]].concat(t.history.slice(-(MAX_HISTORY - 50)));
       if (t.ctxBoundary != null) t.ctxBoundary = Math.min(t.ctxBoundary, t.history.length);
     }
+    if (t.llmLogs) delete t.llmLogs; // 迁移：日志已独立存 LLM_LOGS_KEY，旧会话对象里的残留字段不再写回 storage
   }
   await chrome.storage.session.set({ tasks });
   updateBadge(); // 所有状态变更都经 saveTasks，角标随之刷新
@@ -148,7 +149,7 @@ async function createSession(tabId) {
     teachTabId: null,    // 教我模式主教学标签（进入时当前操作标签）
     teachTabIds: [],     // 教我模式监听【任务下所有 tab】的录制挂载清单
     teachEvents: [],     // 教我模式录制缓冲（content 批量上报 TEACH_EVENT 累积）
-    llmLogs: [],         // 大模型往返日志（面板"日志"视图）：每步决策 { t, req, res }
+    // 大模型往返日志不在会话对象里：独立存 LLM_LOGS_KEY（见 logLLMExchange），避免每次 saveTasks 全量重写大日志
     history: [{ role: 'system', content: systemPrompt() }],
     ctxSummary: null,   // 历史压缩摘要（已完成进展 / 踩过的坑 / 用户注意点）
     ctxBoundary: 0,     // 历史下标：该下标之前的消息已并入 ctxSummary，之后逐条发送
@@ -249,8 +250,71 @@ function updateLog(sid, idx, m) {
 
 // ---------------- 大模型往返日志（面板「日志」按钮 → 导出全量文件用） ----------------
 // 每步 LLM 决策记录一条：给大模型发了什么【从简】（消息条数 + 输入量 + 当前页面）、返回了什么【全量原文】。
-// 存进 t.llmLogs（EXPORT_LOG 导出时读取；不再实时广播，面板不做展示）。
-const MAX_LLM_LOG = 150; // 每会话保留的大模型往返日志条数上限
+// 日志为排查"任务为什么执行乱"设计，要全量——所以单独存 LLM_LOGS_KEY，不进 tasks 对象：
+//  1) 不随每次 saveTasks 全量重写（tasks 对象里 history/快照本来就大，再加全量 res 会把每次存储写放大）；
+//  2) 只留"字节预算"兜底防 storage.session 10MB 配额爆（tasks + 日志合计逼近才丢最早，正常会话几乎不触发）。
+// EXPORT_LOG 导出时读取；不再实时广播，面板不做展示。
+const LLM_LOGS_KEY = 'llmLogs';           // 独立存储 key
+const LLM_LOG_MAX_PER_SESSION = 3000;     // 单会话日志条数兜底（正常会话远用不满；纯防御异常大响应无限膨胀）
+const STORAGE_SAFE_TOTAL = 8.5 * 1024 * 1024; // 全存储（tasks 历史 + 日志）字节上限：10MB 配额留 1.5MB 余量，逼近才丢最早日志
+
+let llmLogStore = null;      // sid -> [entry]
+let llmLogStoreLoaded = null; // 惰性加载 promise（首次用到日志时从 storage.session 读一次）
+let llmLogFlushTimer = null;
+
+// 惰性加载日志库：worker 每次冷启动重新求值时首次用到前读一次即可，之后纯内存操作
+async function ensureLlmLogs() {
+  if (!llmLogStoreLoaded) {
+    llmLogStoreLoaded = (async () => {
+      const m = new Map();
+      try {
+        const { [LLM_LOGS_KEY]: saved } = await chrome.storage.session.get(LLM_LOGS_KEY);
+        if (saved && typeof saved === 'object') {
+          for (const [k, v] of Object.entries(saved)) if (Array.isArray(v)) m.set(k, v);
+        }
+      } catch (e) {}
+      llmLogStore = m;
+    })();
+  }
+  await llmLogStoreLoaded;
+}
+
+// 防抖落盘：日志只在写入后 ~400ms 合并写一次，不随每次 saveTasks 全量重写
+function scheduleLlmLogFlush() {
+  if (llmLogFlushTimer) return;
+  llmLogFlushTimer = setTimeout(() => { llmLogFlushTimer = null; flushLlmLogs(); }, 400);
+}
+
+async function flushLlmLogs() {
+  try {
+    if (!llmLogStore || !llmLogStore.size) return;
+    // 字节兜底：tasks（历史/对话）+ 日志 合计逼近 10MB 配额才丢最早的日志（按时间跨会话丢，保住最新）。
+    // 正常会话远达不到，几乎不触发；触发时丢的是最老日志，排查"最新问题"不受影响。
+    const logsBytes = JSON.stringify([...llmLogStore.values()]).length;
+    let tasksBytes = 0;
+    try { tasksBytes = JSON.stringify(tasks).length; } catch (e) {}
+    if (logsBytes + tasksBytes > STORAGE_SAFE_TOTAL) {
+      const over = logsBytes + tasksBytes - STORAGE_SAFE_TOTAL; // 需从日志里释放的字节
+      const all = [];
+      for (const [sid, arr] of llmLogStore) for (let i = 0; i < arr.length; i++) all.push({ sid, i, t: arr[i].t });
+      all.sort((a, b) => a.t - b.t);
+      const drop = Math.min(all.length - 10, Math.ceil(all.length * over / logsBytes));
+      const dead = new Set();
+      for (let i = 0; i < drop; i++) dead.add(all[i].sid + ':' + all[i].i);
+      for (const [sid, arr] of llmLogStore) {
+        const kept = arr.filter((_, i) => !dead.has(sid + ':' + i));
+        if (kept.length) llmLogStore.set(sid, kept); else llmLogStore.delete(sid);
+      }
+    }
+    await chrome.storage.session.set({ [LLM_LOGS_KEY]: Object.fromEntries(llmLogStore) });
+  } catch (e) { /* 日志落盘失败不影响主流程 */ }
+}
+
+function removeLlmLogs(sid) {
+  if (!llmLogStore) return;
+  llmLogStore.delete(sid);
+  flushLlmLogs();
+}
 
 // 发送内容的简况：消息条数 + 输入字符量 + 当前操作页面（取自 history 末条快照里的 URL）
 function llmReqBrief(t, msgs) {
@@ -267,17 +331,20 @@ function llmReqBrief(t, msgs) {
   return '发送 ' + msgs.length + ' 条 · 输入约 ' + size + ' 字符' + (page ? ' · ' + page : '');
 }
 
-function logLLMExchange(t, msgs, raw) {
+async function logLLMExchange(t, msgs, raw) {
   try {
     if (!t || !t.sid) return;
-    if (!t.llmLogs) t.llmLogs = [];
+    await ensureLlmLogs();
     const entry = {
       t: Date.now(),
       req: llmReqBrief(t, msgs),
       res: String(raw || '') // 完整原文，不截断（导出文件不受大小限制）
     };
-    t.llmLogs.push(entry);
-    if (t.llmLogs.length > MAX_LLM_LOG) t.llmLogs.splice(0, t.llmLogs.length - MAX_LLM_LOG);
+    let arr = llmLogStore.get(t.sid);
+    if (!arr) { arr = []; llmLogStore.set(t.sid, arr); }
+    arr.push(entry);
+    if (arr.length > LLM_LOG_MAX_PER_SESSION) arr.splice(0, arr.length - LLM_LOG_MAX_PER_SESSION);
+    scheduleLlmLogFlush();
     console.log('[PageAgent] LLM 往返：' + entry.req);
   } catch (e) { /* 日志失败不影响主流程 */ }
 }
@@ -286,13 +353,14 @@ function logLLMExchange(t, msgs, raw) {
 // 四个部分对应：①发给大模型什么（系统提示 + 网站工具索引 + 压缩摘要 + 原始目标/最新指令 + 完整对话历史，
 // 历史就是每步请求的消息本体）；②大模型返回什么（每步完整原始返回）；③插件在浏览器里操作了什么（动作序列）；
 // ④拿到了什么（动作结果 / 失败原因，与③在操作序列里成对出现）。
-function exportSessionLog(t) {
+async function exportSessionLog(t) {
   if (!t) return '';
   const L = [];
   const push = (s) => L.push(s);
   const ts = (x) => (x ? new Date(x).toLocaleString('zh-CN', { hour12: false }) : '-');
   const hist = t.history || [];
-  const logs = t.llmLogs || [];
+  await ensureLlmLogs();
+  const logs = (llmLogStore && llmLogStore.get(t.sid)) || [];
   const tabs = t.tabs || [];
   push('==================== PageAgent 会话全量日志 ====================');
   push('会话: ' + (t.n != null ? '会话 ' + t.n : t.sid) + ' · SID: ' + t.sid);
@@ -1214,7 +1282,7 @@ async function listAllTabs(t) {
     const [a] = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
     active = a ? a.id : null;
   } catch (e) {}
-  const MAX_TABS_OUT = 30;
+  const MAX_TABS_OUT = 50;
   const lines = [];
   for (const tab of all) {
     const marks = [];
@@ -1477,7 +1545,7 @@ async function readSnapshotWithFrames(tabId, offset = 0) {
     out.push(...list.slice(0, take));
   }
   merged.elements = out;
-  merged.excerpt = String(merged.excerpt || '').slice(0, 3000); // 汇总摘要设上限，防 iframe 海量刷爆
+  merged.excerpt = String(merged.excerpt || '').slice(0, 6000); // 汇总摘要设上限，防 iframe 海量刷爆
   return merged;
 }
 
@@ -1846,8 +1914,6 @@ async function findBookmarks(keyword) {
 
 // ---- 复盘：任务完成后，把新发现的有用网站记入书签 ----
 
-const MAX_REVIEW_PICKS = 5; // 单次复盘最多收藏条数
-
 // 复盘入口：收集本轮访问过的站点 → LLM 筛选 → 写入书签（新网址收藏；已收藏的合并改进标题。尽力而为，失败不影响任务完成）
 async function reviewAndBookmark(t, force, pinnedTurn, reviewSteps) {
   if (!t) return;
@@ -1929,7 +1995,7 @@ async function pickBookmarks(t, sites) {
       content: '本次访问过的网站（每条 = 一个网站/域名，url 是其代表页）：\n' + list + '\n\n只输出 JSON，格式：{"bookmarks":[{"title":"网站名 | 作用 | 使用技巧","url":"https://...","reason":"为什么以后有用（一句话）"}]}。\n' +
         'title 用竖线 | 分成三段：①网站名（如 小红书、Bing 搜索）；②作用类别（两三个词概括【整个网站】实际是干嘛的，如 新闻查询、文档工具、用户内容查询、设计素材、代码参考——以使用者在任务里真正用到的功能为准，别只针对访问到的那个局部页面，也【别照抄网站自己的广告语/营销文案】，像"全球领先""一站式智能平台""引领未来""更好的生活方式"这类自我宣传要过滤掉，概括出它实际能干的事）；③本次总结到的使用技巧（一句话，以使用者实际操作为准，如"直接点击第一条结果打开、别点推荐流更准""需先登录，进创作中心才能看数据"）。\n' +
         'url 填该网站的【根 URL】（协议+域名，如 https://www.example.com/），不要带路径、查询或锚点。\n' +
-        '最多 ' + MAX_REVIEW_PICKS + ' 个；都不值得收藏就输出 {"bookmarks":[]}。'
+        '值得收藏的都挑出来，不限制条数；都不值得收藏就输出 {"bookmarks":[]}。'
     }
   ];
   try {
@@ -2367,7 +2433,7 @@ async function runAction(t, a) {
 
   // ---- 在对话区给使用者说一句话（不打断流程；如"复述"） ----
   if (a.action === 'say') {
-    const text = String(a.text || '').trim().slice(0, 800);
+    const text = String(a.text || '').trim().slice(0, 3000);
     if (text) {
       t.conversation.push({ role: 'agent', text, ok: true, t: Date.now() });
       if (t.conversation.length > MAX_CONVERSATION) t.conversation = t.conversation.slice(-MAX_CONVERSATION);
@@ -2595,7 +2661,7 @@ async function runAction(t, a) {
 
   t.history.push({
     role: 'user',
-    content: '动作结果：' + JSON.stringify(res).slice(0, 800)
+    content: '动作结果：' + JSON.stringify(res).slice(0, 3000)
   });
   t.failStreak = 0;
   // 输入动作卡住（耗时 >10s 或内容没落地）→ 非阻塞提醒使用者介入；Agent 不等待、继续执行。
@@ -2751,9 +2817,9 @@ function nudgeUser(t, text) {
 
 const TIPS_KEY = 'siteTips';         // storage.local 键：{ [host]: string[] }
 // 技巧条数不设硬性上限：每次沉淀合并时都判断"重复/相近"并合并，数量会自然收敛，无需人为截断
-const TIPS_ACTION_THRESHOLD = 4;     // 单站点动作数 ≥ 此值视为"绕了弯路/多点了很多次"
+const TIPS_ACTION_THRESHOLD = 3;     // 单站点动作数 ≥ 此值视为"绕了弯路/多点了很多次"
 const TIPS_FAIL_THRESHOLD = 2;       // 单站点失败数 ≥ 此值视为"反复失败"
-const TIPS_MAX_NEW = 3;              // 每次复盘最多新增的技巧条数
+const TIPS_MAX_NEW = 10;             // 每次复盘最多新增的技巧条数
 
 // 域名 = host（只记录域名，不带协议/路径/查询）；入参可能是完整 URL 也可能是裸域名，都能解析
 function hostOf(url) {
@@ -2919,7 +2985,7 @@ function collectDifficultyReport(t) {
       if (pm) cur = ensure(hostOf(pm[1]));
       if (m.content.indexOf('动作执行失败') !== -1 && cur) {
         cur.fails++;
-        cur.failMsgs.push(m.content.replace(/^动作执行失败：/, '').slice(0, 100));
+        cur.failMsgs.push(m.content.replace(/^动作执行失败：/, '').slice(0, 500));
       }
       // 成功的动作结果带元素 label（"动作结果：{"ok":true,"label":"发布",...}"）：把"最终走通的操作"记进报告，
       // 复盘沉淀技巧时 LLM 能据此提炼"该怎么操作才顺"，而不是只看到失败。
@@ -2931,7 +2997,6 @@ function collectDifficultyReport(t) {
             const lbl = String(r.label).replace(/\s+/g, ' ').trim().slice(0, 16);
             if (lbl) {
               cur.okSeq.push(lastActType + '(' + lbl + ')');
-              if (cur.okSeq.length > 8) cur.okSeq.splice(0, cur.okSeq.length - 8); // 保留最近 8 个成功操作
             }
           }
         } catch (e) { /* 结果非 JSON（如链接后台打开的消息），跳过 */ }
@@ -2946,7 +3011,7 @@ function collectDifficultyReport(t) {
     const h = hostOfSite(s);
     const acts = [...s.actLines.entries()].map(([k, n]) => k + '×' + n).join(' ');
     lines.push('【' + h + '】动作 ' + s.actions + ' 次' + (s.fails ? '，失败 ' + s.fails + ' 次' : '') + (acts ? '；动作分布：' + acts : '') + (s.okSeq.length ? '；成功操作：' + s.okSeq.join('→') : '') + (s.actSeq.length ? '；动作轨迹：' + s.actSeq.join('→') : ''));
-    for (const f of s.failMsgs.slice(0, 3)) lines.push('  - 失败：' + f);
+    for (const f of s.failMsgs) lines.push('  - 失败：' + f);
   }
   return { domains: bad.map(hostOfSite), text: lines.join('\n') };
 }
@@ -2954,7 +3019,6 @@ function collectDifficultyReport(t) {
 function bumpAct(site, action) {
   site.actLines.set(action, (site.actLines.get(action) || 0) + 1);
   site.actSeq.push(action);
-  if (site.actSeq.length > 14) site.actSeq.splice(0, site.actSeq.length - 14); // 保留最近 14 步，供复盘提炼操作规律
 }
 
 // ---------------- 跨页面/跨标签恢复 ----------------
@@ -3501,7 +3565,7 @@ async function clearConversation(sid) {
   t.teachTabId = null;
   t.teachTabIds = [];
   t.teachEvents = [];
-  t.llmLogs = []; // 清空本会话：大模型往返日志一并清零
+  removeLlmLogs(t.sid); // 清空本会话：大模型往返日志一并清零（独立存储）
   t.history = [{ role: 'system', content: systemPrompt() }];
   t.ctxSummary = null;
   t.ctxBoundary = 0;
@@ -3630,7 +3694,7 @@ async function handleMessage(msg, sender) {
     case 'EXPORT_LOG': { // 面板「日志」按钮：导出本会话全量日志（完整消息 + 原始返回 + 动作/结果），下载为文件
       const t = getTask(msg.sid);
       if (!t) return { ok: false, error: '会话不存在或已被删除' };
-      return { ok: true, text: exportSessionLog(t) };
+      return { ok: true, text: await exportSessionLog(t) };
     }
     case 'CREATE_SESSION': { // 顶部会话栏 ＋：新建一个空闲会话
       const t = await createSession();
@@ -3646,6 +3710,7 @@ async function handleMessage(msg, sender) {
       }
       await stopTeachRecording(t);
       await closeAgentTabs(t).catch(() => {}); // 关 Agent 自开标签并删分组（使用者的标签永不关闭）
+      removeLlmLogs(sid); // 删除会话：大模型往返日志一并清除（独立存储）
       delete tasks[sid];
       if (activeId === sid) {
         const rest = Object.keys(tasks).map((k) => tasks[k]).sort((a, b) => b.n - a.n); // 切到剩余编号最大的
@@ -3805,3 +3870,34 @@ chrome.runtime.onInstalled.addListener(async () => {
     await chrome.sidePanel.setPanelBehavior({ openPanelOnActionClick: true });
   } catch (e) {}
 });
+
+// 浏览器启动清理：把上次浏览器会话残留的一次性状态全部清掉。
+// ① storage.session 本就随 Chrome 退出自动清空，这里再显式清一次 tasks/llmLogs 双保险；
+// ② 关键是清掉崩溃/异常退出后残留的孤儿 PageAgent N 标签分组（会话状态已空，无法走正常删除路径）。
+// 持久层（config、TIPS_KEY）跨重启保留，不动。
+chrome.runtime.onStartup.addListener(() => {
+  cleanupStartup().catch(() => {});
+});
+
+async function cleanupStartup() {
+  push('启动清理：清空会话存储（tasks/llmLogs）并清理孤儿 PageAgent 分组');
+  // 1) 会话级存储显式清空（tasks / llmLogs；config、TIPS_KEY 等持久层保留）
+  try {
+    await chrome.storage.session.remove(['tasks', LLM_LOGS_KEY]);
+  } catch (e) {}
+  tasks = {};
+  llmLogStore = null;
+  llmLogStoreLoaded = null;
+  activeId = null;
+  // 2) 孤儿 PageAgent N 分组：启动时会话状态必为空，标题符合的分组只可能是上次残留。
+  //    只解组不关标签 —— 重启后无法区分组内标签归属（组内可能有使用者自己拖进来的标签，
+  //    记忆：永不关用户标签），解组保住所有标签，仅去掉残留分组结构。
+  try {
+    const groups = await chrome.tabGroups.query({});
+    for (const g of groups || []) {
+      if (/^PageAgent \d+$/.test(g.title || '')) {
+        try { await chrome.tabGroups.ungroup(g.id); } catch (e) {}
+      }
+    }
+  } catch (e) {}
+}

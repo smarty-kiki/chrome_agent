@@ -18,7 +18,7 @@
   const IS_TOP_FRAME = (() => { try { return window.top === window; } catch (_) { return false; } })();
 
   const MAX_ELEMENTS = 100;  // 每批快照的可交互元素数量上限（每批一个窗口；普通页面远用不满、零成本，密集/长页面按 offset 翻页逐批取；与 background REF_WINDOW_SIZE 保持一致，合并上限 MAX_MERGED_ELEMENTS ≥ 它）
-  const TEXT_LIMIT = 1500;   // 正文摘要长度上限
+  const TEXT_LIMIT = 6000;   // 正文摘要长度上限
   const READ_LIMIT = 6000;   // read 动作单次返回文本上限
 
   const INTERACTIVE = [
@@ -44,7 +44,7 @@
       for (const e of d.pa_ct) {
         if (e && typeof e.t === 'string' && e.t) canvasTextBuffer.push(e);
       }
-      if (canvasTextBuffer.length > 1500) canvasTextBuffer.splice(0, canvasTextBuffer.length - 1500);
+      if (canvasTextBuffer.length > 6000) canvasTextBuffer.splice(0, canvasTextBuffer.length - 6000);
     }
   });
 
