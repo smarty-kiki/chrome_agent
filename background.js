@@ -606,9 +606,13 @@ async function callLLM(messages, opts, t) {
     throw new Error('LLM 返回空白内容（可能是输入过长或服务端异常）');
   }
   // 累计本会话 token 用量并广播（供面板显示总消耗与各会话用量；无会话上下文时跳过）
+  // DeepSeek 自动上下文缓存在 usage 里带 prompt_cache_hit_tokens / prompt_cache_miss_tokens，
+  // 面板据此显示"缓存命中率"；第三方中转可能不透传，拿不到就当 0（命中率不显示，不影响其余）。
   if (t && data.usage) {
     t.tokens = (t.tokens || 0) + (data.usage.total_tokens || 0);
-    broadcast({ type: 'AGENT_TOKENS', tokens: t.tokens }, t.sid);
+    t.cacheHit = (t.cacheHit || 0) + (data.usage.prompt_cache_hit_tokens || 0);
+    t.cacheMiss = (t.cacheMiss || 0) + (data.usage.prompt_cache_miss_tokens || 0);
+    broadcast({ type: 'AGENT_TOKENS', tokens: t.tokens, cacheHit: t.cacheHit, cacheMiss: t.cacheMiss }, t.sid);
   }
   return content;
 }
@@ -3410,6 +3414,7 @@ async function clearConversation(sid) {
   t.ctxSummary = null;
   t.ctxBoundary = 0;
   t.tokens = 0; // 清空本会话 = 重新开始，token 用量一并清零
+  t.cacheHit = 0; t.cacheMiss = 0; // 缓存命中统计一并清零
   t.turnHistoryStart = 0;
   t.conversation = [];
   t.result = null;
@@ -3503,6 +3508,8 @@ function serializeSession(t) {
     startedAt: t.startedAt,
     finishedAt: t.finishedAt,
     tokens: t.tokens || 0,
+    cacheHit: t.cacheHit || 0,
+    cacheMiss: t.cacheMiss || 0,
     timer: t.timer || null
   };
 }

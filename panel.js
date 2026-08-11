@@ -35,6 +35,8 @@ function ensureCache(sid, n) {
       askMode: 'page',
       teachSteps: 0,
       tokens: 0,
+      cacheHit: 0,
+      cacheMiss: 0,
       logs: [] // 大模型往返日志（每步 { t, req, res }）
     };
   }
@@ -136,6 +138,11 @@ function statusText(cache, label) {
   const parts = [];
   const toks = cache.tokens || 0;
   if (toks > 0) parts.push(fmtTokens(toks));
+  // 缓存命中率：本会话累计 prompt 缓存命中 / (命中+未命中)。DeepSeek 透传 cache 字段才有，
+  // 第三方中转拿不到时 hit+miss=0，不显示。
+  const hit = cache.cacheHit || 0;
+  const miss = cache.cacheMiss || 0;
+  if (hit + miss > 0) parts.push('缓存命中 ' + Math.round((hit / (hit + miss)) * 100) + '%');
   const tms = cacheTimerMs(cache);
   if (tms != null) parts.push('用时 ' + fmtTimer(tms));
   return parts.length ? l + ' · ' + parts.join(' · ') : l;
@@ -550,6 +557,7 @@ function resetSessionUI(sid) {
   c.askMode = 'page';
   c.teachSteps = 0;
   c.tokens = 0; // 清空本会话：token 用量一并清零
+  c.cacheHit = 0; c.cacheMiss = 0; // 缓存命中统计一并清零
   c.timer = null; // 任务计时一并清空
   c.logs = []; // 大模型往返日志一并清空
   renderSessionBar();
@@ -857,6 +865,8 @@ function hydrateCache(s) {
   cache.askMode = s.askMode || 'page';
   cache.teachSteps = (s.teachEvents || []).length;
   cache.tokens = s.tokens || 0;
+  cache.cacheHit = s.cacheHit || 0;
+  cache.cacheMiss = s.cacheMiss || 0;
   cache.timer = s.timer || null; // 任务计时器（面板本地按秒刷新显示）
   cache.logs = s.llmLogs || []; // 恢复大模型往返日志（切走/重开面板不丢）
   cache.status = (s.state === 'working' || s.state === 'awaiting_nav') ? 'working'
@@ -968,6 +978,8 @@ async function init() {
       }
       case 'AGENT_TOKENS': // 某会话 token 用量更新：刷新总消耗；若正是当前会话，状态栏一并更新
         cache.tokens = msg.tokens || 0;
+        cache.cacheHit = msg.cacheHit || 0;
+        cache.cacheMiss = msg.cacheMiss || 0;
         renderHeaderTokens();
         if (sid === activeSid) setSessionStatus(cache);
         break;
