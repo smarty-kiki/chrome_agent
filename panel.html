@@ -66,14 +66,13 @@
 
   <section id="statusBar">
     <span id="statusText">就绪</span>
-    <button id="logToggle" class="ghost" title="切换：会话消息 / 大模型原始往返日志（本会话，每步发了什么、返回了什么）">日志</button>
+    <button id="logToggle" class="ghost" title="导出本会话全量日志：发给大模型的完整消息、大模型原始返回、浏览器动作与结果（下载为文件）">日志</button>
   </section>
 
   <main id="chat">
     <div id="messages">
       <div class="chat-hint">持续对话模式：下达指令，完成后可继续追问。</div>
     </div>
-    <div id="logList" hidden></div>
   </main>
 
   <footer id="inputBar">

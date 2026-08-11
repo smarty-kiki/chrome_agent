@@ -247,11 +247,10 @@ function updateLog(sid, idx, m) {
   broadcast({ type: 'AGENT_ACTIVITY_UPDATE', text: String(m) }, sid);
 }
 
-// ---------------- 大模型往返日志（面板"日志"视图用） ----------------
-// 每步 LLM 决策记录一条：给大模型发了什么【从简】（消息条数 + 输入量 + 当前页面）、返回了什么【全量】。
-// 存进 t.llmLogs（GET_STATE 带出，面板切走/重开仍在），同时广播 AGENT_LLM_LOG 实时推送。
+// ---------------- 大模型往返日志（面板「日志」按钮 → 导出全量文件用） ----------------
+// 每步 LLM 决策记录一条：给大模型发了什么【从简】（消息条数 + 输入量 + 当前页面）、返回了什么【全量原文】。
+// 存进 t.llmLogs（EXPORT_LOG 导出时读取；不再实时广播，面板不做展示）。
 const MAX_LLM_LOG = 150; // 每会话保留的大模型往返日志条数上限
-const MAX_LLM_LOG_RES = 6000; // 单条日志里原始返回的最大字符数（防止长 finish 结果把面板撑爆）
 
 // 发送内容的简况：消息条数 + 输入字符量 + 当前操作页面（取自 history 末条快照里的 URL）
 function llmReqBrief(t, msgs) {
@@ -275,13 +274,88 @@ function logLLMExchange(t, msgs, raw) {
     const entry = {
       t: Date.now(),
       req: llmReqBrief(t, msgs),
-      res: String(raw || '').slice(0, MAX_LLM_LOG_RES)
+      res: String(raw || '') // 完整原文，不截断（导出文件不受大小限制）
     };
     t.llmLogs.push(entry);
     if (t.llmLogs.length > MAX_LLM_LOG) t.llmLogs.splice(0, t.llmLogs.length - MAX_LLM_LOG);
     console.log('[PageAgent] LLM 往返：' + entry.req);
-    broadcast({ type: 'AGENT_LLM_LOG', req: entry.req, res: entry.res, t: entry.t }, t.sid);
   } catch (e) { /* 日志失败不影响主流程 */ }
+}
+
+// 导出本会话全量日志（面板「日志」按钮 → 下载文件）：排查"任务为什么执行乱"用，内容完整、不截断。
+// 四个部分对应：①发给大模型什么（系统提示 + 网站工具索引 + 压缩摘要 + 原始目标/最新指令 + 完整对话历史，
+// 历史就是每步请求的消息本体）；②大模型返回什么（每步完整原始返回）；③插件在浏览器里操作了什么（动作序列）；
+// ④拿到了什么（动作结果 / 失败原因，与③在操作序列里成对出现）。
+function exportSessionLog(t) {
+  if (!t) return '';
+  const L = [];
+  const push = (s) => L.push(s);
+  const ts = (x) => (x ? new Date(x).toLocaleString('zh-CN', { hour12: false }) : '-');
+  const hist = t.history || [];
+  const logs = t.llmLogs || [];
+  const tabs = t.tabs || [];
+  push('==================== PageAgent 会话全量日志 ====================');
+  push('会话: ' + (t.n != null ? '会话 ' + t.n : t.sid) + ' · SID: ' + t.sid);
+  push('标签组: ' + (t.groupTitle || '-') + (t.groupId ? '（groupId=' + t.groupId + '）' : ''));
+  push('创建: ' + ts(t.startedAt) + ' · 状态: ' + t.state);
+  push('步数: ' + t.steps + ' · 本回合步数: ' + t.turnSteps + ' · 连续失败: ' + t.failStreak + ' · 卡住计数: ' + (t.stuck || 0));
+  push('Token: ' + (t.tokens || 0) + '（缓存命中 ' + (t.cacheHit || 0) + ' / 未命中 ' + (t.cacheMiss || 0) + '）');
+  push('目标: ' + (t.goal || '-'));
+  push('最新指令: ' + (t.lastInstruction || '-'));
+  if (t.result) push('结果: ' + String(t.result));
+  if (t.error) push('错误: ' + t.error);
+  if (tabs.length) {
+    push('标签:');
+    for (const e of tabs) push('  @' + e.ref + ' [role=' + e.role + '] ' + (e.title || '') + ' ' + (e.url || ''));
+  }
+  push('');
+  push('==================== ① 发给大模型什么 —— 系统提示 ====================');
+  push((hist[0] && hist[0].content) || systemPrompt());
+  push('');
+  if (bookmarkIndexCache) {
+    push('---------------------- 网站工具索引（当前书签） ----------------------');
+    push(bookmarkIndexCache);
+    push('');
+  }
+  if (t.ctxSummary) {
+    push('---------------------- 已压缩的历史进展 ----------------------');
+    push(t.ctxSummary);
+    push('');
+  }
+  push('---------------------- 完整对话历史（共 ' + hist.length + ' 条：页面快照/动作/动作结果/失败原因，即请求消息本体） ----------------------');
+  for (let i = 0; i < hist.length; i++) {
+    const m = hist[i];
+    push('[' + i + '] ' + m.role + (m.kind ? ' | kind=' + m.kind : ''));
+    push(String(m.content || ''));
+    push('');
+  }
+  push('==================== ③④ 插件在浏览器里操作了什么 / 拿到了什么 —— 操作序列（动作 → 结果/失败） ====================');
+  const seq = [];
+  for (const m of hist) {
+    const c = String(m.content || '');
+    if (m.role === 'assistant') {
+      try {
+        const a = JSON.parse(c);
+        const acts = Array.isArray(a) ? a : [a];
+        for (const x of acts) seq.push('动作: ' + JSON.stringify(x));
+      } catch (e) { seq.push('动作(解析失败): ' + c.slice(0, 300)); }
+    } else if (c.indexOf('动作结果：') === 0) {
+      seq.push('结果: ' + c.slice(0, 600));
+    } else if (c.indexOf('动作执行失败：') === 0) {
+      seq.push('失败: ' + c.slice(0, 300));
+    }
+  }
+  push(seq.length ? seq.join('\n') : '（无动作记录）');
+  push('');
+  push('==================== ② 大模型返回了什么 —— 每步完整原始返回（共 ' + logs.length + ' 次） ====================');
+  for (let i = 0; i < logs.length; i++) {
+    const e = logs[i];
+    push('----- 往返 #' + (i + 1) + ' · ' + ts(e.t) + ' · ' + (e.req || '') + ' -----');
+    push('大模型返回：');
+    push(String(e.res || '（空）'));
+    push('');
+  }
+  return L.join('\n');
 }
 
 // 防"页面动作触发的 window.open 抢前台焦点"（target=_blank 链接已在 content.js 截获，这里是 JS 新开的兜底）：
@@ -2737,7 +2811,7 @@ async function reviewAndLearnTips(t, force, pinnedTurn) {
   const msgs = [
     {
       role: 'system',
-      content: '你是 PageAgent 的"网站操作技巧沉淀"助手。使用者一次任务里在某些网站反复失败、或绕了弯路多点了很多次。请为这些网站总结出【下次该怎么操作才更顺】的简短技巧。技巧要提炼成该网站**可复用的操作/交互规律**（比如：搜索框输入关键词后必须从下拉候选里点选、不能直接回车；这个页面要先点开下拉框再选择；登录入口在页面右下角）。要求：① 一句话一条、具体可执行；② 只讲该网站的通用操作习惯，**禁止照搬本轮一次性内容**——不要出现具体搜索词、地点名、用户名、页面元素文本（如"点击『湖南郴州裕后街』"这种），要抽象成"输入框/下拉/按钮/列表"这类功能操作的规律；③ 忽略纯网络/服务端问题（页面打不开、超时、接口报错）；④ 已有技巧里讲过的别重复。'
+      content: '你是 PageAgent 的"网站操作技巧沉淀"助手。使用者一次任务里在某些网站反复失败、或绕了弯路多点了很多次。请为这些网站总结出【下次该怎么操作才更顺】的简短技巧。报告里既有失败原因、也有最终走通的成功操作轨迹（如 click(发布)→type(关键词)），两者结合提炼——成功轨迹通常是"正确做法"的线索。技巧要提炼成该网站**可复用的操作/交互规律**（比如：搜索框输入关键词后必须从下拉候选里点选、不能直接回车；这个页面要先点开下拉框再选择；登录入口在页面右下角）。要求：① 一句话一条、具体可执行；② 只讲该网站的通用操作习惯，**禁止照搬本轮一次性内容**——不要出现具体搜索词、地点名、用户名、页面元素文本（如"点击『湖南郴州裕后街』"这种），要抽象成"输入框/下拉/按钮/列表"这类功能操作的规律；③ 忽略纯网络/服务端问题（页面打不开、超时、接口报错）；④ 已有技巧里讲过的别重复。'
     },
     {
       role: 'user',
@@ -2819,21 +2893,24 @@ async function mergeSiteTips(host, newTips, oldTipsText, sid) {
 // 困难信号：失败 ≥ TIPS_FAIL_THRESHOLD，或动作 ≥ TIPS_ACTION_THRESHOLD（绕弯路/多点了很多次）。
 function collectDifficultyReport(t) {
   const slice = (t.history || []).slice(t.turnHistoryStart || 0);
-  const sites = new Map(); // host -> { actions, fails, actLines: Map<actionType,count>, actSeq: [], failMsgs: [] }
+  const sites = new Map(); // host -> { actions, fails, actLines: Map<actionType,count>, actSeq: [], failMsgs: [], okSeq: [] }
   const ensure = (h) => {
     if (!h) return null;
-    if (!sites.has(h)) sites.set(h, { actions: 0, fails: 0, actLines: new Map(), actSeq: [], failMsgs: [] });
+    if (!sites.has(h)) sites.set(h, { actions: 0, fails: 0, actLines: new Map(), actSeq: [], failMsgs: [], okSeq: [] });
     return sites.get(h);
   };
   let cur = null; // 当前操作站点
+  let lastActType = null; // 最近一个"可点类"动作类型，供配对成功的"动作结果"label（尽力配对，label 本身才是关键）
+  const CLICKLIKE = new Set(['click', 'clickAt', 'dblclickAt', 'gotoCell', 'clickText', 'hover', 'type', 'select', 'keypress']);
   for (const m of slice) {
     if (m.role === 'assistant' && typeof m.content === 'string') {
       for (const a of histActionList(m.content)) { // 兼容单动作与批量数组
         if (!a || typeof a !== 'object' || !a.action) continue;
+        if (CLICKLIKE.has(a.action)) lastActType = a.action; // 成功结果带元素 label，供复盘提炼"走通的操作"
         if (a.action === 'open_tab' || a.action === 'navigate' || a.action === 'search') {
           cur = ensure(hostOf(a.url));
           if (cur) { cur.actions++; bumpAct(cur, a.action); }
-        } else if (a.action === 'click' || a.action === 'clickAt' || a.action === 'dblclickAt' || a.action === 'gotoCell' || a.action === 'clickText' || a.action === 'hover' || a.action === 'type' || a.action === 'select' || a.action === 'scroll' || a.action === 'keypress') {
+        } else if (CLICKLIKE.has(a.action) || a.action === 'scroll') {
           if (cur) { cur.actions++; bumpAct(cur, a.action); }
         }
       }
@@ -2844,6 +2921,21 @@ function collectDifficultyReport(t) {
         cur.fails++;
         cur.failMsgs.push(m.content.replace(/^动作执行失败：/, '').slice(0, 100));
       }
+      // 成功的动作结果带元素 label（"动作结果：{"ok":true,"label":"发布",...}"）：把"最终走通的操作"记进报告，
+      // 复盘沉淀技巧时 LLM 能据此提炼"该怎么操作才顺"，而不是只看到失败。
+      const rm = m.content.match(/^动作结果：(.*)/);
+      if (rm && cur && lastActType) {
+        try {
+          const r = JSON.parse(rm[1]);
+          if (r && r.ok && r.label) {
+            const lbl = String(r.label).replace(/\s+/g, ' ').trim().slice(0, 16);
+            if (lbl) {
+              cur.okSeq.push(lastActType + '(' + lbl + ')');
+              if (cur.okSeq.length > 8) cur.okSeq.splice(0, cur.okSeq.length - 8); // 保留最近 8 个成功操作
+            }
+          }
+        } catch (e) { /* 结果非 JSON（如链接后台打开的消息），跳过 */ }
+      }
     }
   }
   const bad = [...sites.values()].filter((s) => s.fails >= TIPS_FAIL_THRESHOLD || s.actions >= TIPS_ACTION_THRESHOLD);
@@ -2853,7 +2945,7 @@ function collectDifficultyReport(t) {
   for (const s of bad) {
     const h = hostOfSite(s);
     const acts = [...s.actLines.entries()].map(([k, n]) => k + '×' + n).join(' ');
-    lines.push('【' + h + '】动作 ' + s.actions + ' 次' + (s.fails ? '，失败 ' + s.fails + ' 次' : '') + (acts ? '；动作分布：' + acts : '') + (s.actSeq.length ? '；动作轨迹：' + s.actSeq.join('→') : ''));
+    lines.push('【' + h + '】动作 ' + s.actions + ' 次' + (s.fails ? '，失败 ' + s.fails + ' 次' : '') + (acts ? '；动作分布：' + acts : '') + (s.okSeq.length ? '；成功操作：' + s.okSeq.join('→') : '') + (s.actSeq.length ? '；动作轨迹：' + s.actSeq.join('→') : ''));
     for (const f of s.failMsgs.slice(0, 3)) lines.push('  - 失败：' + f);
   }
   return { domains: bad.map(hostOfSite), text: lines.join('\n') };
@@ -3501,7 +3593,6 @@ function serializeSession(t) {
     teachTabId: t.teachTabId || null,
     teachTabIds: t.teachTabIds || [],
     teachEvents: t.teachEvents || [],
-    llmLogs: t.llmLogs || [], // 大模型往返日志（面板"日志"视图，切走/重开面板不丢）
     navWaitIdx: t.navWaitIdx || null,
     result: t.result,
     error: t.error,
@@ -3536,6 +3627,11 @@ async function handleMessage(msg, sender) {
         .map((sid) => serializeSession(tasks[sid]))
         .sort((a, b) => a.n - b.n);
       return { activeId, sessions, config: await getConfig() };
+    case 'EXPORT_LOG': { // 面板「日志」按钮：导出本会话全量日志（完整消息 + 原始返回 + 动作/结果），下载为文件
+      const t = getTask(msg.sid);
+      if (!t) return { ok: false, error: '会话不存在或已被删除' };
+      return { ok: true, text: exportSessionLog(t) };
+    }
     case 'CREATE_SESSION': { // 顶部会话栏 ＋：新建一个空闲会话
       const t = await createSession();
       if (!t) return { ok: false, error: '最多 ' + MAX_SESSIONS + ' 个会话' };

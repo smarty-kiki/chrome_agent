@@ -898,6 +898,20 @@
     return executeActionInner(a);
   }
 
+  // 安全点击：.click() 只在 HTMLElement 上定义，SVG/MathML 等外来元素（快照会收录的裸图标）
+  // 没有，直接调会抛 "el.click is not a function"。外来元素退化用 dispatchEvent 派发可冒泡的
+  // click 事件，同样能触发元素自身及祖先上的点击处理（React/原生 onclick 都在冒泡路径上）。
+  function fireClick(el) {
+    if (!el) return;
+    if (typeof el.click === 'function') { try { el.click(); return; } catch (e) {} }
+    try { el.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window })); } catch (e) {}
+  }
+  // 安全聚焦：focus() 同样只在 HTMLElement 上可靠，外来元素拿不到就跳过（不抛错打断动作）。
+  function focusEl(el) {
+    if (!el) return;
+    try { if (typeof el.focus === 'function') el.focus(); } catch (e) {}
+  }
+
   async function executeActionInner(a) {
     switch (a.action) {
       case 'click': {
@@ -918,8 +932,8 @@
 
         await humanClickGap(); // 拟人：随机 0.5s~2s，避免快速连点
         try { el.scrollIntoView({ block: 'center' }); } catch (e) {}
-        el.click();
-        el.focus();
+        fireClick(el);
+        focusEl(el);
         return { ok: true, label: elementLabel(el) };
       }
 
@@ -1067,8 +1081,8 @@
         }
         await humanClickGap(); // 拟人：随机 0.5s~2s，避免快速连点
         try { target.scrollIntoView({ block: 'center' }); } catch (e) {}
-        target.click();
-        target.focus();
+        fireClick(target);
+        focusEl(target);
         return { ok: true, label: elementLabel(el), byText: true };
       }
 

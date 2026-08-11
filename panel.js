@@ -10,12 +10,10 @@
 
 const $ = (s) => document.querySelector(s);
 const MAX_SESSIONS = 5;
-const MAX_LLM_LOG = 150; // 日志视图每会话保留的大模型往返条数上限（与后台一致）
 
 let currentTabId = null;
 let activeSid = null; // 当前查看的会话
 let teachStepEl = null; // 教我模式卡里实时步数元素（AGENT_TEACH_STEPS 更新）
-let logView = false; // 日志视图是否开启（状态栏"日志"切换：会话消息 / 大模型往返日志）
 
 // 每会话缓存：sid -> { sid, n, msgs: [], tabs: [], status, statusLabel, statusClass, askMode, teachSteps }
 const sessionCache = {};
@@ -30,14 +28,13 @@ function ensureCache(sid, n) {
       msgs: [],
       tabs: [],
       status: 'idle',
-      statusLabel: '就绪（等待指令）',
+      statusLabel: '等待指令',
       statusClass: '',
       askMode: 'page',
       teachSteps: 0,
       tokens: 0,
       cacheHit: 0,
-      cacheMiss: 0,
-      logs: [] // 大模型往返日志（每步 { t, req, res }）
+      cacheMiss: 0
     };
   }
   return sessionCache[sid];
@@ -513,7 +510,6 @@ function switchSession(sid) {
   const cache = ensureCache(sid);
   renderSessionMsgs(sid);
   renderTabs(cache.tabs);
-  if (logView) renderLogList(); // 日志视图开着时切会话也要跟着换
   setSessionStatus(cache);
   chrome.runtime.sendMessage({ type: 'SET_ACTIVE', sid }).catch(() => {});
 }
@@ -529,14 +525,15 @@ async function onCreateSession() {
 async function onDeleteSession(sid) {
   const c = sessionCache[sid];
   if (!c) return;
+  // × 关闭会话时再确认一次：会关闭该会话标签组下的全部 Agent 自开标签（你的 @MAIN/@U 标签永不关闭）
+  const agentCount = (c.tabs || []).filter((x) => x.role === 'agent').length;
+  const note = agentCount ? '将关闭其标签组下 ' + agentCount + ' 个 Agent 标签（你的标签保留）。' : '';
   const busy = c.status === 'working' || c.status === 'waiting_user';
-  if (busy) {
-    if (!confirm('会话' + c.n + ' 正在运行，删除会停止它并关闭其 Agent 自开标签（你的标签保留），确定吗？')) return;
-  } else if (c.msgs.length) {
-    if (!confirm('删除会话' + c.n + '？其聊天记录将丢失，Agent 自开标签会被关闭（你的标签保留）。')) return;
-  } else {
-    if (!confirm('删除空会话' + c.n + '？')) return;
-  }
+  let q;
+  if (busy) q = '会话' + c.n + ' 正在运行，删除会停止它。' + note + '确定吗？';
+  else if (c.msgs.length) q = '删除会话' + c.n + '？其聊天记录将丢失。' + note + '确定吗？';
+  else q = '删除空会话' + c.n + '？' + note + '确定吗？';
+  if (!confirm(q)) return;
   const { activeId: newActive } = await chrome.runtime.sendMessage({ type: 'DELETE_SESSION', sid });
   delete sessionCache[sid];
   if (activeSid === sid) activeSid = newActive;
@@ -552,14 +549,13 @@ function resetSessionUI(sid) {
   c.msgs = [];
   c.tabs = [];
   c.status = 'idle';
-  c.statusLabel = '就绪（等待指令）';
+  c.statusLabel = '等待指令';
   c.statusClass = '';
   c.askMode = 'page';
   c.teachSteps = 0;
   c.tokens = 0; // 清空本会话：token 用量一并清零
   c.cacheHit = 0; c.cacheMiss = 0; // 缓存命中统计一并清零
   c.timer = null; // 任务计时一并清空
-  c.logs = []; // 大模型往返日志一并清空
   renderSessionBar();
   renderHeaderTokens();
   if (sid === activeSid) {
@@ -609,7 +605,7 @@ async function onStop() {
   } catch (e) {}
   // 后台 stopCurrent 会广播 AGENT_STATUS: idle，这里同步置位避免闪烁
   cache.status = 'idle';
-  cache.statusLabel = '就绪（等待指令）';
+  cache.statusLabel = '等待指令';
   cache.statusClass = '';
   renderSessionBar();
   setSessionStatus(cache, '已停止，可继续对话', '');
@@ -659,61 +655,28 @@ async function copyText(text) {
   try { document.execCommand('copy'); } finally { ta.remove(); }
 }
 
-// ---------------- 大模型往返日志视图 ----------------
-// 状态栏「日志」切换：把消息区从会话对话切到本会话的大模型往返日志（每步发了什么、返回了什么）。
-// 数据来自后台 AGENT_LLM_LOG 广播 + GET_STATE 恢复（llmLogs），按会话缓存。
-function setLogView(on) {
-  logView = on;
-  $('#messages').hidden = on;
-  $('#logList').hidden = !on;
-  const btn = $('#logToggle');
-  btn.textContent = on ? '对话' : '日志';
-  btn.classList.toggle('log-active', on);
-  if (on) renderLogList();
-}
-
-function fmtLogTime(ts) {
-  const d = new Date(ts || Date.now());
-  const p = (n) => String(n).padStart(2, '0');
-  return p(d.getHours()) + ':' + p(d.getMinutes()) + ':' + p(d.getSeconds());
-}
-
-function logEl(entry) {
-  const el = document.createElement('div');
-  el.className = 'llm-log';
-  const head = document.createElement('div');
-  head.className = 'llm-log-head';
-  const time = document.createElement('span');
-  time.className = 'llm-log-time';
-  time.textContent = fmtLogTime(entry.t);
-  const req = document.createElement('span');
-  req.className = 'llm-log-req';
-  req.textContent = entry.req || '';
-  req.title = entry.req || '';
-  head.appendChild(time);
-  head.appendChild(req);
-  const res = document.createElement('pre');
-  res.className = 'llm-log-res';
-  res.textContent = entry.res || '（空）';
-  el.appendChild(head);
-  el.appendChild(res);
-  return el;
-}
-
-function renderLogList() {
-  const box = $('#logList');
-  box.innerHTML = '';
-  const cache = activeCache();
-  const logs = (cache && cache.logs) || [];
-  if (!logs.length) {
-    const hint = document.createElement('div');
-    hint.className = 'chat-hint';
-    hint.textContent = '暂无大模型往返日志（本会话还没调用过模型）';
-    box.appendChild(hint);
-  } else {
-    for (const e of logs) box.appendChild(logEl(e));
+// ---------------- 全量日志导出 ----------------
+// 状态栏「日志」按钮：把本会话的全量信息下载成文件（发给大模型的完整消息、大模型完整原始返回、
+// 浏览器动作与结果、会话状态等），供人工排查"任务为什么执行乱"。内容由后台 EXPORT_LOG 组装、不截断。
+async function onLogExport() {
+  const sid = activeSid;
+  if (!sid) return;
+  const c = sessionCache[sid];
+  try {
+    const res = await chrome.runtime.sendMessage({ type: 'EXPORT_LOG', sid });
+    if (!res || !res.ok) throw new Error((res && res.error) || '导出失败');
+    const text = res.text || '';
+    if (!text) throw new Error('该会话没有可导出的日志');
+    const now = new Date();
+    const p = (n) => String(n).padStart(2, '0');
+    const stamp = now.getFullYear() + p(now.getMonth() + 1) + p(now.getDate()) + '-' + p(now.getHours()) + p(now.getMinutes()) + p(now.getSeconds());
+    const filename = 'PageAgent-会话' + (c && c.n != null ? c.n : sid) + '-' + stamp + '.txt';
+    const dataUrl = 'data:text/plain;charset=utf-8,' + encodeURIComponent(text);
+    await chrome.downloads.download({ url: dataUrl, filename, saveAs: false });
+    setStatus('已下载会话' + (c && c.n != null ? c.n : '') + ' 全量日志（' + (text.length / 1024).toFixed(0) + 'KB）', 'ok');
+  } catch (e) {
+    setStatus('导出日志失败：' + (e.message || e), 'fail');
   }
-  box.scrollTop = box.scrollHeight;
 }
 
 // ---------------- 网站操作技巧管理 ----------------
@@ -765,8 +728,7 @@ function renderTips(store) {
     delDomain.addEventListener('click', async () => {
       if (!confirm('删除站点 ' + d + ' 的全部技巧？')) return;
       await chrome.runtime.sendMessage({ type: 'SAVE_TIPS', domain: d, tips: [] });
-      openTipsPanel();
-      setStatus('已删除站点 ' + d, 'done');
+      openTipsPanel(); // 重渲染即反馈（站点从列表消失），不再顶掉会话顶部状态栏
     });
     head.appendChild(name);
     head.appendChild(delDomain);
@@ -839,8 +801,7 @@ function buildTipItem(domain, index, text) {
     const list = (tips && tips[domain]) ? tips[domain].slice() : [];
     if (index != null && index < list.length) list[index] = v;
     await chrome.runtime.sendMessage({ type: 'SAVE_TIPS', domain, tips: list });
-    setStatus('已保存 ' + domain + ' 的技巧', 'done');
-    openTipsPanel();
+    openTipsPanel(); // 重渲染即反馈（保存后的文本展示在列表里），不顶掉会话顶部状态栏
   });
   delBtn.addEventListener('click', async () => {
     if (!confirm('删除这条技巧？')) return;
@@ -848,8 +809,7 @@ function buildTipItem(domain, index, text) {
     const list = (tips && tips[domain]) ? tips[domain].slice() : [];
     if (index != null && index < list.length) list.splice(index, 1);
     await chrome.runtime.sendMessage({ type: 'SAVE_TIPS', domain, tips: list });
-    setStatus('已删除一条技巧', 'done');
-    openTipsPanel();
+    openTipsPanel(); // 重渲染即反馈（该条从列表消失），不再顶掉会话顶部状态栏
   });
   return item;
 }
@@ -868,12 +828,11 @@ function hydrateCache(s) {
   cache.cacheHit = s.cacheHit || 0;
   cache.cacheMiss = s.cacheMiss || 0;
   cache.timer = s.timer || null; // 任务计时器（面板本地按秒刷新显示）
-  cache.logs = s.llmLogs || []; // 恢复大模型往返日志（切走/重开面板不丢）
   cache.status = (s.state === 'working' || s.state === 'awaiting_nav') ? 'working'
     : s.state === 'waiting_user' ? 'waiting_user' : 'idle';
   cache.statusLabel = cache.status === 'working' ? '运行中…'
     : cache.status === 'waiting_user' ? askStatusLabel(cache.askMode)
-    : '就绪（等待指令）';
+    : '等待指令';
   cache.statusClass = cache.status === 'working' ? 'running'
     : cache.status === 'waiting_user' ? askStatusClass(cache.askMode)
     : '';
@@ -916,7 +875,7 @@ async function init() {
   });
   $('#stopBtn').addEventListener('click', onStop);
   $('#diagBtn').addEventListener('click', onDiag);
-  $('#logToggle').addEventListener('click', () => setLogView(!logView));
+  $('#logToggle').addEventListener('click', onLogExport);
   // 技巧按钮可切换：开着再点收起，关着点开（重开时刷新列表）
   $('#tipsBtn').addEventListener('click', () => {
     const p = $('#tipsPanel');
@@ -962,7 +921,7 @@ async function init() {
         break;
       case 'AGENT_STATUS': {
         if (msg.status === 'idle') {
-          cache.status = 'idle'; cache.statusLabel = '就绪（等待指令）'; cache.statusClass = '';
+          cache.status = 'idle'; cache.statusLabel = '等待指令'; cache.statusClass = '';
         } else if (msg.status === 'waiting_user') {
           cache.status = 'waiting_user';
           cache.askMode = msg.askMode || cache.askMode || 'page';
@@ -996,11 +955,6 @@ async function init() {
         break;
       case 'AGENT_CLEARED': // 后台清空某会话（CLEAR）
         resetSessionUI(sid);
-        break;
-      case 'AGENT_LLM_LOG': // 大模型往返日志：更新缓存；日志视图开着时实时补一条并滚到底
-        cache.logs.push({ t: msg.t, req: msg.req, res: msg.res });
-        if (cache.logs.length > MAX_LLM_LOG) cache.logs.splice(0, cache.logs.length - MAX_LLM_LOG);
-        if (sid === activeSid && logView) renderLogList();
         break;
       case 'TIPS_CHANGED': // 后台复盘/教我沉淀了新技巧：刷新技巧按钮数字；面板开着时顺带刷新列表
         updateTipsBtn();
