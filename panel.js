@@ -53,6 +53,8 @@ async function loadConfig() {
   $('#searchTemplate').value = config.searchTemplate || 'https://www.bing.com/search?q=';
   $('#contextWindow').value = config.contextWindow || 1000000;
   $('#compressThreshold').value = config.compressThreshold ?? 70;
+  $('#batchEnabled').checked = config.batchEnabled !== false;
+  $('#batchMark').checked = config.batchMark === true;
 }
 
 function wireSettings() {
@@ -67,11 +69,13 @@ function wireSettings() {
         maxSteps: parseInt($('#maxSteps').value, 10) || 25,
         searchTemplate: $('#searchTemplate').value.trim(),
         contextWindow: parseInt($('#contextWindow').value, 10) || 1000000,
-        compressThreshold: parseInt($('#compressThreshold').value, 10) || 70
+        compressThreshold: parseInt($('#compressThreshold').value, 10) || 70,
+        batchEnabled: $('#batchEnabled').checked,
+        batchMark: $('#batchMark').checked
       }
     });
   };
-  ['apiKey', 'baseUrl', 'model', 'temperature', 'maxSteps', 'searchTemplate', 'contextWindow', 'compressThreshold'].forEach((id) => {
+  ['apiKey', 'baseUrl', 'model', 'temperature', 'maxSteps', 'searchTemplate', 'contextWindow', 'compressThreshold', 'batchEnabled', 'batchMark'].forEach((id) => {
     $('#' + id).addEventListener('change', save);
   });
   $('#toggleSettings').addEventListener('click', () => {

@@ -31,6 +31,11 @@ const DEFAULT_CONTEXT_WINDOW = 1000000; // DeepSeek V4 上下文窗口（token�
 const OUTPUT_RESERVE = 8192;          // 每次调用给 LLM 输出预留的 token
 const COMPRESS_THRESHOLD = 0.7;       // 上下文使用到 70% 触发历史压缩
 const TAIL_KEEP_STEPS = 2;            // 压缩时保留最近几步原文（快照+动作+结果）
+const MAX_SNAPSHOT_KEEP = 3;          // 每次请求最多发给 LLM 的页面快照数（旧快照元素已过期，只留最近几次）
+const MAX_BATCH = 10;                 // 单批动作数硬上限（LLM 按动作颗粒度自行决定批量多少，最多此值）
+const BATCH_FAMILIAR_THRESHOLD = 2;   // 同一页面成功快照 ≥ 此值 → 判定"熟悉"，允许批量输出
+const BATCH_TERMINALS = new Set(['open_tab', 'search', 'navigate', 'switch_tab', 'close_tab', 'use_tab', 'finish', 'ask_user']); // 遇此类动作本批收尾（它们会切页/改变会话状态）
+const LLM_TIMEOUT_MS = 240000; // LLM 单次请求超时：网络/服务端挂起时不再无限等（超时按解析失败重试），避免循环整体干等
 const SUMMARY_CHUNK_TOKENS = 150000;  // 摘要单次输入的 token 上限（超出分块链式合并）
 const SUMMARY_MAX_CHARS = 1500;       // 压缩摘要长度上限（字符）
 
@@ -157,7 +162,8 @@ async function createSession(tabId) {
     consecWaits: 0,   // 连续 wait 次数（无真实动作插入时累计，防"假装人类"空转）
     lastActSig: '',   // 最近一次执行（成功或失败）的页面动作签名，识别"反复执行同一个动作"的无进展循环
     stuck: 0,         // 无进展计数：连续失败/重复同一动作/空等累计，换新动作清零，>=STUCK_TEACH_LIMIT 转教我
-    lastTipsHost: ''  // 本会话已显示"加载 x 个相关技巧"的站点（同一站点只提示一次，避免刷屏）
+    lastTipsHost: '',  // 本会话已显示"加载 x 个相关技巧"的站点（同一站点只提示一次，避免刷屏）
+    pageSnapCounts: {} // 页面熟悉度：pageKey(host+pathname) → 成功快照次数；动作失败会清零该页计数（恢复谨慎模式）
   };
   tasks[sid] = t;
   await saveTasks();
@@ -193,6 +199,8 @@ async function getConfig() {
       searchTemplate: 'https://www.bing.com/search?q=',
       contextWindow: DEFAULT_CONTEXT_WINDOW,
       compressThreshold: Math.round(COMPRESS_THRESHOLD * 100),
+      batchEnabled: true, // 批量动作总开关：允许在熟悉页面一次执行多个动作（false=每步读页、一次一个动作，稳妥但慢）
+      batchMark: false, // 调试：活动日志标出批量边界（"批 N 步"/批内每步"批1/4"前缀/批完·失败收尾），验证批量策略时打开，日常可关
       apiKey: ''
     },
     config || {}
@@ -419,9 +427,11 @@ chrome.alarms.onAlarm.addListener(async (al) => {
         tryResume(sid, t.waitTabId); // 尝试提前恢复，失败会再次进入 awaiting_nav
       }
     } else if (t.state === 'working') {
-      // MV3 worker 可能被回收导致循环中断：检测到长期无进展则从持久化状态恢复
+      // MV3 worker 可能被回收导致循环中断：检测到长期无进展则从持久化状态恢复。
+      // 但若有 agentStep（含链式续步）正在跑——慢 LLM / 慢快照——绝不并发拉起新的，
+      // 否则会跑出双份 LLM 请求、双份动作执行
       const stale = Date.now() - (t.lastActiveAt || 0) > 60000;
-      if (stale) {
+      if (stale && !agentStepDepth[sid]) {
         addLog(sid, '检测到任务停滞，尝试恢复…', true);
         agentStep(t).catch((e) => fail(t, '运行异常：' + e.message));
       }
@@ -445,7 +455,11 @@ function systemPrompt() {
 你通过"页面快照"感知当前操作标签的网页：包括标签页列表、URL、标题、可交互元素列表（[ref] 类型 文本 值 选择器）和正文摘要。页面可能包含内嵌 iframe 子窗口（如某些网站的弹窗/新建流程），子窗口里的可交互元素也会并进快照、用【子窗口 N】分组标出，正文摘要里附有子窗口内容，你同样可以点击/读取它们。若快照提示有未读取成功的内嵌窗口（可能仍在加载），先 wait 等它加载完再重新观察，目标往往会出现，不要因为一时看不到就转去别处乱点。若你刚点击了一个按钮/链接，下一次快照里出现了新的【子窗口 N】分组或元素变多，说明弹窗/面板已经打开，接下来的目标应该在这个新窗口里找——**不要重复点击刚才那个按钮**（可能把弹窗又关掉），直接在弹窗里继续操作。
 快照开头（元素列表之前）的【本站操作技巧】是该网站历史沉淀下来的操作经验（比如"搜索要直接点第一条结果""要先点开下拉再选择"）。它放在元素列表**之前**：**每次选元素、定动作前先对照它**，与技巧描述不符的做法多半在绕弯路，优先按技巧来。当反复失败、找不到元素、或准备执行的动作与技巧不一致时，先回头对照本站技巧调整，而不是硬试同一招；若某条技巧与当前页面明显冲突（页面已改版），说明它已过期，跳过它、以当前页面为准。
 
-每收到一个快照，你必须输出唯一的 JSON 动作对象。可用动作：
+每收到一个快照，你必须输出 JSON 动作。**默认输出单个动作对象** {"action":"...",...}；当快照提示【批量模式】已开启时，可以输出**批量动作** {"actions":[{...},{...},...]}，系统会一次连续执行全部（最多 10 个，大幅减少往返、更快）。批量规则：
+- **批内顺序依赖要弱**：某个动作执行后才出现的元素，后续动作**不能用它的 ref**（ref 来自旧快照，执行时会失效），要用 clickText 按文字 / clickAt·dblclickAt 按坐标 / gotoCell 按格号来定位；
+- 会改变页面结构或跳转的动作（open_tab / search / navigate / switch_tab / close_tab / use_tab / finish / ask_user）**放在批尾**，执行到它们本批就收尾，之后系统重新观察页面；
+- 每批尽量以 read 或读回校验结尾，确认动作生效；一个动作最多 10 个，拿不准就输出单个动作。
+可用动作：
 
 0. 标签操作（ref 用 @MAIN / @T1 / @U1 ...；tabId 用 list_tabs 返回的编号）：
    {"action":"open_tab","url":"https://..."}   新开后台标签（不抢焦点、自动加入分组）
@@ -549,14 +563,32 @@ async function callLLM(messages, opts, t) {
     stream: false
   };
   if (!opts || opts.json !== false) body.response_format = { type: 'json_object' };
-  const res = await fetch(url, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      Authorization: 'Bearer ' + cfg.apiKey
-    },
-    body: JSON.stringify(body)
-  });
+  if (t) t.lastActiveAt = Date.now(); // 长 LLM 调用期间保持"活跃"标记，防止心跳把慢请求误判成停滞并发起并发 agentStep
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), LLM_TIMEOUT_MS);
+  // 心跳看的是 t.lastActiveAt 是否超过 60s；LLM 请求可能远超过 60s，每 30s 刷新一次，
+  // 这样整个请求期间"活跃"都不会过期，心跳不会重复发起并发 agentStep
+  const keepAlive = t ? setInterval(() => { if (t) t.lastActiveAt = Date.now(); }, 30000) : null;
+  let res;
+  try {
+    res = await fetch(url, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: 'Bearer ' + cfg.apiKey
+      },
+      body: JSON.stringify(body),
+      signal: ctrl.signal
+    });
+  } catch (e) {
+    clearTimeout(timer);
+    if (keepAlive) clearInterval(keepAlive);
+    if (e && e.name === 'AbortError') throw new Error('LLM 请求超时（' + (LLM_TIMEOUT_MS / 1000) + 's，输入过长或服务端繁忙）');
+    throw e;
+  }
+  clearTimeout(timer);
+  if (keepAlive) clearInterval(keepAlive);
+  if (t) t.lastActiveAt = Date.now();
   if (!res.ok) {
     let detail = '';
     try { detail = (await res.text()).slice(0, 300); } catch (e) {}
@@ -576,15 +608,31 @@ async function callLLM(messages, opts, t) {
   return content;
 }
 
+// 解析 LLM 输出为动作列表。兼容三种形态：
+//   单个对象 {"action":"..."}                       → [obj]
+//   {"actions":[{...},{...}]}                       → 数组
+//   顶层数组 [{...},{...}]                           → 数组
+// 一律返回数组；任一无合法 action 都抛错（整批重来）。批内动作会在 agentStep 里校验上限与终止规则。
 function parseAction(text) {
   let t = String(text || '').trim();
   t = t.replace(/^```(?:json)?/i, '').replace(/```$/i, '').trim();
   const obj = JSON.parse(t);
   const ALLOWED = new Set(['open_tab', 'switch_tab', 'use_tab', 'list_tabs', 'close_tab', 'search', 'save_file', 'bookmarks_read', 'bookmarks_write', 'bookmark_find', 'ask_user', 'say', 'click', 'clickAt', 'dblclickAt', 'gotoCell', 'clickText', 'hover', 'type', 'select', 'scroll', 'read', 'wait', 'keypress', 'navigate', 'finish']);
-  if (!obj || typeof obj !== 'object' || !ALLOWED.has(obj.action)) {
-    throw new Error('非法动作：' + (obj && obj.action));
+  let list = [];
+  if (Array.isArray(obj)) {
+    list = obj;
+  } else if (obj && Array.isArray(obj.actions)) {
+    list = obj.actions;
+  } else {
+    list = [obj];
   }
-  return obj;
+  if (!list.length) throw new Error('动作列表为空');
+  for (const a of list) {
+    if (!a || typeof a !== 'object' || !ALLOWED.has(a.action)) {
+      throw new Error('非法动作：' + (a && a.action));
+    }
+  }
+  return list;
 }
 
 // 组装发给 LLM 的消息：
@@ -610,15 +658,23 @@ async function buildMessages(t) {
       content: '【已压缩的历史进展】（此前的详细操作不再逐条列出，以下摘要涵盖已完成的事、踩过的坑与使用者补充的注意点，越靠后越新，继续执行时参考它）\n' + t.ctxSummary
     });
   }
-  // 尾部历史窗口：从最新往前收集，直到放不下（充分用满上下文窗口；边界以下已由摘要覆盖）
+  // 尾部历史窗口：从最新往前收集，直到放不下（充分用满上下文窗口；边界以下已由摘要覆盖）。
+  // 页面快照只保留最近 MAX_SNAPSHOT_KEEP 次：旧快照里的元素 ref / 摘要早已过期（页面已重渲染），
+  // 整页元素列表又是最占上下文的，全部重发纯属浪费——跳过更老的快照，其余消息（动作结果、失败提示等）仍按预算照常装。
   const B = Math.max(1, Math.min(t.ctxBoundary == null ? 0 : t.ctxBoundary, hist.length - 1));
   const body = [];
   let used = messagesTokens(msgs);
   const budget = ctxWin - OUTPUT_RESERVE;
+  let snapKept = 0;
   for (let i = hist.length - 1; i >= B; i--) {
-    const cost = estimateTokens(hist[i].content);
+    const m = hist[i];
+    if (m.kind === 'snapshot') {
+      if (snapKept >= MAX_SNAPSHOT_KEEP) continue; // 更老的快照不再发（最新快照永远在，循环从最新往前数）
+      snapKept++;
+    }
+    const cost = estimateTokens(m.content);
     if (used + cost > budget) break;
-    body.unshift(hist[i]);
+    body.unshift(m);
     used += cost;
   }
   // 目标与最新指令分开注入（都独立保存、不会被裁剪）：
@@ -656,13 +712,24 @@ function firstUserIdx(t) {
   return -1;
 }
 
-// 判断历史里的 assistant 消息是否为 read 动作调用（压缩时用于成对删除 read 调用+结果）
+// 判断历史里的 assistant 消息是否为 read 动作调用（压缩时用于成对删除 read 调用+结果）。
+// 只认"单动作对象"：批量数组里的 read 不参与成对删除（数组与它的一串结果无法准确配对，宁可不删、留着天然被尾部窗口裁剪）。
 function isReadAction(content) {
   try {
     const a = JSON.parse(String(content || ''));
-    return !!(a && a.action === 'read');
+    return !!(a && !Array.isArray(a) && a.action === 'read');
   } catch (e) {
     return false;
+  }
+}
+
+// 把历史里的 assistant 动作消息展开成动作列表（兼容单对象与批量数组），供复盘统计遍历
+function histActionList(content) {
+  try {
+    const a = JSON.parse(String(content || ''));
+    return Array.isArray(a) ? a : [a];
+  } catch (e) {
+    return [];
   }
 }
 
@@ -1007,7 +1074,7 @@ function refreshTabEntry(tabId, info, t) {
 // ---------------- 快照消息构建 ----------------
 // tipsBlock（可选）：本站操作技巧块。放在 URL/标题与受限页提示之后、元素列表【之前】——
 // LLM 要先读到历史经验再扫元素，避免技巧沉在快照末尾被 90 个元素淹没（否则"加载了但没怎么用"）。
-function buildSnapshotMessage(snap, tipsBlock, t) {
+function buildSnapshotMessage(snap, tipsBlock, t, batchHint) {
   const lines = [];
   lines.push('【任务标签页】共 ' + t.tabs.length + ' 个');
   for (const e of t.tabs) {
@@ -1021,6 +1088,7 @@ function buildSnapshotMessage(snap, tipsBlock, t) {
     lines.push('当前页是【受限页面】（chrome://、about:、扩展管理页、新标签页等），无法注入内容脚本，你无法在此页观察或操作。任务需要在网页上完成时，请直接用 open_tab 打开对应网址（如腾讯文档用 https://docs.qq.com），或用 search 搜索；不要在受限页上反复尝试，也不要用 navigate 跳到受限地址。');
   }
   if (tipsBlock) lines.push(tipsBlock);
+  if (batchHint) lines.push(batchHint);
   if (!snap.elements || snap.elements.length === 0) {
     lines.push('（未发现可见的可交互元素）');
   } else {
@@ -1082,7 +1150,9 @@ async function frameList(tabId) {
 async function readSnapshotWithFrames(tabId) {
   // 1) 先读主窗口——它 DOM 里的直接 iframe 清单是"弹层 iframe 确实存在"的硬证据，
   //    用来交叉校验 getAllFrames 枚举是否完整（弹层/卡片 iframe 常被读漏，导致"窗口数 1↔2 跳动"）。
-  const mainSnap = await chrome.tabs.sendMessage(tabId, { type: 'GET_SNAPSHOT' }, { frameId: 0 });
+  //    主窗口可能因页面主线程繁忙而迟迟不回（sendMessage 会一直 pending），带 8s 超时兜底，
+  //    超时按失败走上层重试 → awaitNav → waitTabReady 轮询恢复，避免"整轮干等无超时"。
+  const mainSnap = await sendTab(tabId, { type: 'GET_SNAPSHOT' }, 8000);
   if (!mainSnap || !Array.isArray(mainSnap.elements)) throw new Error('主窗口快照为空');
   const domIframes = Array.isArray(mainSnap.iframes) ? mainSnap.iframes.length : 0; // 主窗口 DOM 里的直接 iframe 数
 
@@ -1117,7 +1187,7 @@ async function readSnapshotWithFrames(tabId) {
     if (f.frameId === 0) continue;
     let snap;
     try {
-      snap = await chrome.tabs.sendMessage(tabId, { type: 'GET_SNAPSHOT' }, { frameId: f.frameId });
+      snap = await sendTab(tabId, { type: 'GET_SNAPSHOT' }, 3000, { frameId: f.frameId }); // 3s 超时：子窗口繁忙跳过，不影响主窗口
     } catch (e) {
       continue;
     }
@@ -1171,7 +1241,27 @@ async function readSnapshotWithFrames(tabId) {
 }
 
 // ---------------- Agent 循环 ----------------
+// 正在执行 agentStep（含批后/单动作后的链式续步）的会话深度计数。心跳的"停滞恢复"先看它：
+// 只要还有 step 在跑（慢快照 / 慢 LLM / 批完再读页的续步），就绝不并发拉起新的 agentStep，
+// 否则心跳会误判停滞、跑出双份 LLM 请求和双份动作执行。深度计数而非 bool：外层 agentStep
+// 里会链式再调 agentStep（nextStepOrBatch 续步 / runActionBatch 批完重读页），两者是同一逻辑链。
+const agentStepDepth = {}; // sid → 栈深度（外层 step + 链式续步）
+
 async function agentStep(t) {
+  if (!t || t.state !== 'working') return;
+  const myTurn = t.turnId;
+  if (!stillCurrent(t, myTurn)) return;
+  const sid = t.sid;
+  agentStepDepth[sid] = (agentStepDepth[sid] || 0) + 1;
+  try {
+    return await agentStepInner(t); // 异常原样上抛，沿用调用方各自的 .catch(fail) 处理
+  } finally {
+    agentStepDepth[sid]--;
+    if (!agentStepDepth[sid]) delete agentStepDepth[sid];
+  }
+}
+
+async function agentStepInner(t) {
   if (!t || t.state !== 'working') return;
   const myTurn = t.turnId;
   if (!stillCurrent(t, myTurn)) return;
@@ -1219,6 +1309,7 @@ async function agentStep(t) {
       const tab = await getTab(tabId);
       addLog(t.sid, '快照失败（3 次）：' + (lastSnapErr ? lastSnapErr.message : '未知原因') + (tab ? ' · ' + tab.url : ' · 标签已不存在'), true);
       awaitNav(t, tabId);
+      waitTabReady(t, tabId, myTurn); // 兜底：快照失败前 AGENT_READY/onUpdated 可能已广播被挡，轮询补上恢复信号
       return;
     }
   }
@@ -1226,6 +1317,12 @@ async function agentStep(t) {
 
   t.snapFrames = (snap && Array.isArray(snap.frames)) ? snap.frames : []; // 供动作路由把全局 ref 拆回 (frameId, 局部 ref)
   t.curPageSig = pageSigOf(snap); // 记录当前页面状态指纹，供"无进展计数"判断重复动作时页面是否真的变了
+  // 页面熟悉度：本次快照成功后计数 +1，达到阈值且未失败过 → 本步允许批量动作。
+  // 失败（pushFailure 清零该页计数）后恢复谨慎模式：单动作 + 每步读页，连续成功几步再放开。
+  const pageKey = pageKeyOf(snap.url);
+  t.pageSnapCounts = t.pageSnapCounts || {};
+  t.pageSnapCounts[pageKey] = (t.pageSnapCounts[pageKey] || 0) + 1;
+  const batchReady = cfg.batchEnabled !== false && t.pageSnapCounts[pageKey] >= BATCH_FAMILIAR_THRESHOLD;
   // 本站操作技巧：每次操作某网站相关的动作前，先加载该网站沉淀过的技巧。
   // 以 tipsBlock 传入 buildSnapshotMessage，插在元素列表【之前】，让 LLM 先读到历史经验再扫元素，
   // 避免技巧沉在快照末尾被元素列表淹没（"加载了但没怎么用"的主因）。
@@ -1245,8 +1342,12 @@ async function agentStep(t) {
     }
   }
   addLog(t.sid, '正在浏览 ' + midTruncate(snap.title || shortUrl(snap.url), 16) + ' · ' + Math.round(performance.now() - t0) + 'ms');
-  let snapMsg = buildSnapshotMessage(snap, tipsBlock, t);
-  t.history.push({ role: 'user', content: snapMsg });
+  // 批量模式提示：熟悉页面明确告知 LLM 可一次输出多个动作（且给出批内定位约束），减少 LLM 往返
+  const batchHint = batchReady
+    ? '【批量模式】本页你已经熟悉（历史操作稳定成功）。为减少往返、提升效率，本步可一次输出最多 ' + MAX_BATCH + ' 个连续动作（{"actions":[{...},{...},...]}；也可以继续输出单个对象）。批内约束：动作执行后才出现的元素不能用 ref 引用（ref 来自当前快照、执行时可能已失效），要用 clickText 按文字 / clickAt·dblclickAt 按坐标 / gotoCell 按格号定位；open_tab、search、navigate、switch_tab、close_tab、use_tab、finish、ask_user 放在批尾（执行到它们本批收尾）；每批尽量以 read 或读回校验结尾确认生效。'
+    : '【谨慎模式】本页你还不熟悉（首次进入或刚出过错），一次只输出一个动作，系统会重新观察页面后再继续。';
+  let snapMsg = buildSnapshotMessage(snap, tipsBlock, t, batchHint);
+  t.history.push({ role: 'user', content: snapMsg, kind: 'snapshot' }); // kind 标记快照，buildMessages 只发最近 MAX_SNAPSHOT_KEEP 次
   await saveTasks();
   if (!stillCurrent(t, myTurn)) return;
 
@@ -1254,17 +1355,21 @@ async function agentStep(t) {
   await maybeCompress(t);
   if (!stillCurrent(t, myTurn)) return;
 
-  // 2) LLM 决策（JSON 解析失败可重试）
-  let action = null;
+  // 2) LLM 决策（JSON 解析失败可重试）；单动作对象与批量 {actions:[...]} 都接受，解析结果一律为动作数组
+  addLog(t.sid, '思考中…'); // 可见进度：LLM 决策期间不再"无声"——看到这行后停顿说明在等 LLM（最多 LLM_TIMEOUT_MS 超时兜底）；这行都没出现说明卡在快照读取
+  let actions = null;
   let lastErr = null;
-  for (let i = 0; i < MAX_STEP_LLM_RETRY && !action; i++) {
+  for (let i = 0; i < MAX_STEP_LLM_RETRY && !actions; i++) {
     let raw = null;
     try {
       const msgs = await buildMessages(t);
       raw = await callLLM(msgs, undefined, t);
       logLLMExchange(t, msgs, raw); // 记录大模型往返（发送简况 + 原始返回），供面板"日志"视图排查
       console.log('[PageAgent] LLM 原始输出：' + String(raw).slice(0, 800));
-      action = parseAction(raw);
+      actions = parseAction(raw);
+      if (actions.length > MAX_BATCH) { // 超出上限的批直接作废重试，逼 LLM 收敛（批超长通常是复读/跑飞）
+        throw new Error('批量动作超过上限 ' + MAX_BATCH + ' 个（' + actions.length + '）');
+      }
     } catch (e) {
       lastErr = e;
       addLog(t.sid, 'LLM 输出解析失败（' + (i + 1) + '/' + MAX_STEP_LLM_RETRY + '）：' + e.message + (raw ? ' 原文=' + String(raw).slice(0, 100) : ''), true);
@@ -1272,20 +1377,22 @@ async function agentStep(t) {
       await sleep(800 * (i + 1)); // 退避：0.8s / 1.6s / 2.4s / 3.2s，应对偶发空白/限流
     }
   }
-  if (!action) {
+  if (!actions || !actions.length) {
     fail(t, 'LLM 连续返回无效动作：' + (lastErr && lastErr.message));
     return;
   }
   if (!stillCurrent(t, myTurn)) return;
 
-  t.history.push({ role: 'assistant', content: JSON.stringify(action) });
+  // 单动作存对象（兼容 isReadAction 的历史配对压缩），批量存数组
+  const stored = actions.length === 1 ? actions[0] : actions;
+  t.history.push({ role: 'assistant', content: JSON.stringify(stored) });
   t.lastActiveAt = Date.now();
-  addLog(t.sid, '决策：' + JSON.stringify(action), true); // 原始动作保留在诊断日志，面板不显示
+  addLog(t.sid, '决策：' + JSON.stringify(stored), true); // 原始动作保留在诊断日志，面板不显示
   await saveTasks();
   if (!stillCurrent(t, myTurn)) return;
 
-  // 3) 执行动作
-  await runAction(t, action);
+  // 3) 执行动作（单动作走 runAction；多个走 runActionBatch 连续执行，批内失败即整体收尾重规划）
+  await runActionBatch(t, actions);
 }
 
 // ---------------- 文件下载 ----------------
@@ -1542,12 +1649,11 @@ function collectVisitedSites(t) {
   const slice = (t.history || []).slice(t.turnHistoryStart || 0);
   for (const m of slice) {
     if (m.role === 'assistant' && typeof m.content === 'string') {
-      try {
-        const a = JSON.parse(m.content);
+      for (const a of histActionList(m.content)) { // 兼容单动作与批量数组
         if (a && typeof a === 'object' && a.url && (a.action === 'open_tab' || a.action === 'navigate' || a.action === 'search')) {
           add(String(a.url));
         }
-      } catch (e) {}
+      }
     } else if (m.role === 'user' && typeof m.content === 'string') {
       // 只取快照的【当前页面】URL（+标题）：这才是 Agent 实际查看/操作过的页面
       const pm = m.content.match(/【当前页面】URL:\s*(\S+)(?:\s*\n标题:\s*([^\n]*))?/);
@@ -1718,6 +1824,91 @@ function pageSigOf(snap) {
   return (snap.url || '') + '|' + (snap.title || '') + '|' + els + '|' + String(snap.excerpt || '').length + '|' + frameSig;
 }
 
+// 页面熟悉度键：host+pathname（不含 query/hash——筛选、翻页这类"同一页不同参数"算同一页，熟练度可延续）
+function pageKeyOf(url) {
+  try {
+    const u = new URL(String(url || ''));
+    return (u.hostname || '') + (u.pathname || '/');
+  } catch (e) {
+    return String(url || '');
+  }
+}
+
+// 单步执行完后的下一步：批量模式（_inBatch）下由批循环继续执行本批剩余动作，不再重新读页；
+// 非批量模式回到 agentStep 重读页面再决策。runAction 内部一律经它收尾，不再直接调 agentStep。
+function nextStepOrBatch(t, myTurn) {
+  if (!t || !stillCurrent(t, myTurn)) return;
+  if (t._inBatch) return; // 批内：不打断，runActionBatch 的循环拿到控制权继续下一动作
+  agentStep(t).catch((e) => fail(t, '运行异常：' + e.message));
+}
+
+// 批量执行：一次 LLM 决策产出的多个动作连续执行，中间不重新读页（熟悉页面才允许进入）。
+// 批内逐动作调 runAction，runAction 收尾的 nextStepOrBatch 因 _inBatch=true 直接返回，批循环据此接管。
+// 批内失败（_batchFailed）/ 遇终止动作 / 会话状态改变 → 本批结束；整批成功 → 重读页再决策。
+// 动作失败的兜底：ref 来自旧快照、批内执行时可能已失效，元素定位会失败——失败即收尾，由 pushFailure
+// 把原因写回历史、清零本页熟悉度，下一次 agentStep 重快照后 LLM 用新 ref 重试，不会批内硬续。
+async function runActionBatch(t, actions) {
+  if (!t || t.state !== 'working') return;
+  const myTurn = t.turnId;
+  const rawList = (Array.isArray(actions) ? actions : [actions]).filter(Boolean);
+  const list = rawList.slice(0, MAX_BATCH);
+  // 单动作走原路径：不设 _inBatch，判重启发式 / 每步读页等单动作逻辑照常生效。
+  // _inBatch 只在真正多动作批量时才开——否则单动作也会被当成"批内"而跳过重复识别（回归）。
+  if (list.length === 1) {
+    await runAction(t, list[0]);
+    return;
+  }
+  const cfg = await getConfig();
+  const mark = cfg.batchMark === true; // 调试开关：活动日志标出批量边界
+  const truncated = rawList.length > MAX_BATCH;
+  let lastSig = '';
+  if (mark) addLog(t.sid, '【批 ' + list.length + ' 步】' + (truncated ? '（超过上限已截断）' : ''));
+  for (let i = 0; i < list.length; i++) {
+    if (!stillCurrent(t, myTurn)) return;
+    const a = list[i];
+    // 终止动作：切页 / 改会话状态 / 结束。批到此收尾，按单动作流程执行（runAction 自行处理 awaitNav / askUser / finish）
+    if (BATCH_TERMINALS.has(a.action)) {
+      if (mark) addLog(t.sid, '【批在 ' + a.action + ' 收尾】');
+      if (i > 0) {
+        t.history.push({ role: 'user', content: '（本批在动作 ' + a.action + ' 处收尾，其后 ' + (list.length - i - 1) + ' 个动作未执行，下一步会重新观察页面）' });
+        await saveTasks();
+      }
+      t._inBatch = false;
+      await runAction(t, a);
+      return;
+    }
+    lastSig = sigOf(a);
+    t._inBatch = true;
+    t._batchFailed = false;
+    if (mark) { t._batchPos = i + 1; t._batchLen = list.length; }
+    try {
+      await runAction(t, a);
+    } finally {
+      t._inBatch = false;
+      if (mark) { t._batchPos = null; t._batchLen = null; }
+    }
+    if (!stillCurrent(t, myTurn)) return;
+    if (t._batchFailed) {
+      if (mark) addLog(t.sid, '【批内动作失败，本批收尾、重读页重规划】');
+      return; // 批内动作失败：pushFailure 已写回历史并触发重读页重规划，本批结束
+    }
+    if (t.state !== 'working') {
+      if (mark) addLog(t.sid, '【批因会话状态变化收尾】');
+      return; // 会话状态变了（如点击新开页 → awaitNav / 求助人工），批结束
+    }
+  }
+  // 整批成功跑完：按"批"整体记录最近动作与页面状态，供下一批首个动作判重
+  if (lastSig) t.lastActSig = lastSig;
+  if (t.curPageSig) t.actionPageSig = t.curPageSig;
+  if (truncated) {
+    t.history.push({ role: 'user', content: '（本批动作数超过单批上限 ' + MAX_BATCH + '，已截断，剩余动作请在下一步继续）' });
+    await saveTasks();
+  }
+  if (mark) addLog(t.sid, '【批完 ' + list.length + ' 步，重新读页再决策】');
+  if (!stillCurrent(t, myTurn)) return;
+  agentStep(t).catch((e) => fail(t, '运行异常：' + e.message));
+}
+
 async function runAction(t, a) {
   if (!t || t.state !== 'working') return;
   const myTurn = t.turnId;
@@ -1780,7 +1971,7 @@ async function runAction(t, a) {
     addLog(t.sid, '切换标签 · ' + ms + 'ms');
     await saveTasks();
     if (!stillCurrent(t, myTurn)) return;
-    agentStep(t).catch((e) => fail(t, '运行异常：' + e.message));
+    nextStepOrBatch(t, myTurn);
     return;
   }
 
@@ -1797,7 +1988,7 @@ async function runAction(t, a) {
       return;
     }
     if (!stillCurrent(t, myTurn)) return;
-    agentStep(t).catch((e) => fail(t, '运行异常：' + e.message));
+    nextStepOrBatch(t, myTurn);
     return;
   }
 
@@ -1828,7 +2019,7 @@ async function runAction(t, a) {
     await saveTasks();
     broadcastTabs(t);
     if (!stillCurrent(t, myTurn)) return;
-    agentStep(t).catch((e) => fail(t, '运行异常：' + e.message));
+    nextStepOrBatch(t, myTurn);
     return;
   }
 
@@ -1840,7 +2031,7 @@ async function runAction(t, a) {
       return;
     }
     if (!stillCurrent(t, myTurn)) return;
-    agentStep(t).catch((e) => fail(t, '运行异常：' + e.message));
+    nextStepOrBatch(t, myTurn);
     return;
   }
 
@@ -1856,7 +2047,7 @@ async function runAction(t, a) {
       return;
     }
     if (!stillCurrent(t, myTurn)) return;
-    agentStep(t).catch((e) => fail(t, '运行异常：' + e.message));
+    nextStepOrBatch(t, myTurn);
     return;
   }
 
@@ -1872,7 +2063,7 @@ async function runAction(t, a) {
       return;
     }
     if (!stillCurrent(t, myTurn)) return;
-    agentStep(t).catch((e) => fail(t, '运行异常：' + e.message));
+    nextStepOrBatch(t, myTurn);
     return;
   }
 
@@ -1887,7 +2078,7 @@ async function runAction(t, a) {
       return;
     }
     if (!stillCurrent(t, myTurn)) return;
-    agentStep(t).catch((e) => fail(t, '运行异常：' + e.message));
+    nextStepOrBatch(t, myTurn);
     return;
   }
 
@@ -1902,7 +2093,7 @@ async function runAction(t, a) {
       return;
     }
     if (!stillCurrent(t, myTurn)) return;
-    agentStep(t).catch((e) => fail(t, '运行异常：' + e.message));
+    nextStepOrBatch(t, myTurn);
     return;
   }
 
@@ -1918,7 +2109,7 @@ async function runAction(t, a) {
     t.lastActiveAt = Date.now();
     await saveTasks();
     if (!stillCurrent(t, myTurn)) return;
-    agentStep(t).catch((e) => fail(t, '运行异常：' + e.message));
+    nextStepOrBatch(t, myTurn);
     return;
   }
 
@@ -1975,6 +2166,16 @@ async function runAction(t, a) {
 
   // ---- 等待 ----
   if (a.action === 'wait') {
+    // 批量模式：wait 是 LLM 规划好批内的衔接步骤（如等动画/渲染），短停后继续批内下一动作即可，
+    // 不做"连续空转"判断——那套是给"一步步决策"的单动作模式防发呆用的，批内会由整批成败来验证。
+    if (t._inBatch) {
+      const ms = Math.round(120 + Math.random() * 280);
+      await sleep(ms);
+      await saveTasks();
+      if (!stillCurrent(t, myTurn)) return;
+      nextStepOrBatch(t, myTurn);
+      return;
+    }
     // 拟人停顿：随机 0.2s~0.8s，模拟真人阅读/思考节奏，避免动作太快被风控判定为机器
     // 但连续 wait 而没有任何真实动作、页面也没变化，就是纯空转浪费时间——第二次起不再停顿，
     // 直接提醒 LLM 停止空等、去做实际动作或 finish。
@@ -1997,14 +2198,14 @@ async function runAction(t, a) {
       }
       await saveTasks();
       if (!stillCurrent(t, myTurn)) return;
-      agentStep(t).catch((e) => fail(t, '运行异常：' + e.message));
+      nextStepOrBatch(t, myTurn);
       return;
     }
     const ms = Math.round(200 + Math.random() * 600);
     addLog(t.sid, '假装人类 ' + ms + 'ms');
     await sleep(ms);
     if (!stillCurrent(t, myTurn)) return;
-    agentStep(t).catch((e) => fail(t, '运行异常：' + e.message));
+    nextStepOrBatch(t, myTurn);
     return;
   }
 
@@ -2015,31 +2216,35 @@ async function runAction(t, a) {
   // 与 failStreak 不同：stuck 在【换新动作】时才清零，所以"同一个动作反复成功却毫无进展"的静默循环也会累计，
   // 累计到 STUCK_TEACH_LIMIT 就主动请使用者手把手演示（ask_user mode=teach），不再无限重试。
   const sig = sigOf(a);
-  const p = a.ref || a.selector || a.target || a.url || a.key || ''; // 动作的"目标身份"：scroll/read 等无具体目标的动作不算重复
-  // 页面状态闸门：自上次动作以来页面真的变了（翻页/加载出新内容）→ 说明是有效进展，不算重复；页面纹丝不动才累计
-  const pageChanged = !!(t.curPageSig && t.actionPageSig && t.curPageSig !== t.actionPageSig);
-  const isRepeat = !!(p && t.lastActSig && sig && sig === t.lastActSig && !pageChanged);
-  if (isRepeat) {
-    if (prevWaits > 0) {
-      // "等待后又重复同一个动作"：上个真实动作后只隔了 wait、页面没变化，现在又要执行一模一样的动作 → 提醒 LLM 换别的
-      t.history.push({
-        role: 'user',
-        content: '注意：你要执行的动作和上一步刚做完的完全一样（' + sig + '），而中间只有 wait、页面没有变化，重复执行不会有新结果。请改做别的动作（先 read 看页面、scroll 看更多、点别的元素），或对照快照里的【本站操作技巧】看看是否该按技巧来，或 finish 结束本轮。'
-      });
-    } else if (t.stuck === 0) {
-      // 第一次发现连续重复（中间没有 wait）：先轻提示一次让它自己换招；仍无进展会继续累计到阈值请使用者演示
-      t.history.push({
-        role: 'user',
-        content: '注意：动作（' + sig + '）你刚刚已经执行过，如果它没能推进任务，重复执行不会有新结果。请先 read 看看当前页面状态，或对照快照里的【本站操作技巧】调整做法，或换别的动作 / 滚动查看更多 / 点击别的元素；实在不知道怎么继续，可以用 ask_user（mode=teach）请使用者手把手演示。'
-      });
+  if (!t._inBatch) {
+    // 批量模式不逐动作判重：批是 LLM 规划好的连续序列，批内动作本就连贯执行、不算"原地打转"，
+    // 且 lastActSig 不更新，启发式会误判。判重/无进展计数由 runActionBatch 在整批结束后整体记录，下一批判重。
+    const p = a.ref || a.selector || a.target || a.url || a.key || ''; // 动作的"目标身份"：scroll/read 等无具体目标的动作不算重复
+    // 页面状态闸门：自上次动作以来页面真的变了（翻页/加载出新内容）→ 说明是有效进展，不算重复；页面纹丝不动才累计
+    const pageChanged = !!(t.curPageSig && t.actionPageSig && t.curPageSig !== t.actionPageSig);
+    const isRepeat = !!(p && t.lastActSig && sig && sig === t.lastActSig && !pageChanged);
+    if (isRepeat) {
+      if (prevWaits > 0) {
+        // "等待后又重复同一个动作"：上个真实动作后只隔了 wait、页面没变化，现在又要执行一模一样的动作 → 提醒 LLM 换别的
+        t.history.push({
+          role: 'user',
+          content: '注意：你要执行的动作和上一步刚做完的完全一样（' + sig + '），而中间只有 wait、页面没有变化，重复执行不会有新结果。请改做别的动作（先 read 看页面、scroll 看更多、点别的元素），或对照快照里的【本站操作技巧】看看是否该按技巧来，或 finish 结束本轮。'
+        });
+      } else if (t.stuck === 0) {
+        // 第一次发现连续重复（中间没有 wait）：先轻提示一次让它自己换招；仍无进展会继续累计到阈值请使用者演示
+        t.history.push({
+          role: 'user',
+          content: '注意：动作（' + sig + '）你刚刚已经执行过，如果它没能推进任务，重复执行不会有新结果。请先 read 看看当前页面状态，或对照快照里的【本站操作技巧】调整做法，或换别的动作 / 滚动查看更多 / 点击别的元素；实在不知道怎么继续，可以用 ask_user（mode=teach）请使用者手把手演示。'
+        });
+      }
+      t.stuck = (t.stuck || 0) + 1;
+    } else {
+      t.stuck = 0; // 换了个新动作 = 在尝试新路径，无进展计数清零
     }
-    t.stuck = (t.stuck || 0) + 1;
-  } else {
-    t.stuck = 0; // 换了个新动作 = 在尝试新路径，无进展计数清零
-  }
-  if (t.stuck >= STUCK_TEACH_LIMIT) {
-    await askUser(t, '我反复尝试了 ' + t.stuck + ' 次同样的操作仍然没有进展，不知道怎么继续了。请你在当前页面上手把手演示一遍正确操作，我会记录学习后照着做。', 'teach');
-    return;
+    if (t.stuck >= STUCK_TEACH_LIMIT) {
+      await askUser(t, '我反复尝试了 ' + t.stuck + ' 次同样的操作仍然没有进展，不知道怎么继续了。请你在当前页面上手把手演示一遍正确操作，我会记录学习后照着做。', 'teach');
+      return;
+    }
   }
   await saveTasks();
   if (!stillCurrent(t, myTurn)) return;
@@ -2123,12 +2328,14 @@ async function runAction(t, a) {
   } else if (a.action === 'type') {
     t.inputNudged = false;
   }
-  t.lastActSig = sig; // 记录本次动作，供"反复执行同一个动作"识别
-  t.actionPageSig = t.curPageSig; // 记录执行动作时的页面状态，供下次重复判断"页面是否真的变了"
-  addLog(t.sid, friendlyAction(a, res, ms)); // 面板显示极简动作 + 耗时，如"点击 · 50ms"
+  if (!t._inBatch) {
+    t.lastActSig = sig; // 记录本次动作，供"反复执行同一个动作"识别（批内不逐动作记录，批末由 runActionBatch 整体记录）
+    t.actionPageSig = t.curPageSig; // 记录执行动作时的页面状态，供下次重复判断"页面是否真的变了"
+  }
+  addLog(t.sid, (t._batchPos != null ? '批' + t._batchPos + '/' + t._batchLen + ' ' : '') + friendlyAction(a, res, ms)); // 面板显示极简动作 + 耗时，如"点击 · 50ms"；批量标注开关打开时加"批N/M"前缀
   await saveTasks();
   if (!stillCurrent(t, myTurn)) return;
-  agentStep(t).catch((e) => fail(t, '运行异常：' + e.message));
+  nextStepOrBatch(t, myTurn);
 }
 
 // 当前操作页面的标识（转人工/提醒时告诉使用者"哪个页面"）：
@@ -2163,10 +2370,17 @@ function humanizeWhy(why) {
 // 动作失败：把失败原因写回 history 并继续循环，让 LLM 修正；连续失败则转人工
 async function pushFailure(t, why, quiet, sig) {
   if (!t || t.state !== 'working') return;
+  if (t._inBatch) t._batchFailed = true; // 批量执行中失败：runActionBatch 据此结束本批，走重读页重规划，不在批内硬续
   t.failStreak = (t.failStreak || 0) + 1;
   t.stuck = (t.stuck || 0) + 1; // 失败也是"无进展"，计入 stuck（配合 runAction 的重复识别，累计到阈值转教我）
   if (sig) t.lastActSig = sig; // 失败的动作也算"最近尝试"，这样反复重试同一个失败动作也会被识别为重复
   if (t.curPageSig) t.actionPageSig = t.curPageSig; // 失败也算一次"动作"，记录其时的页面状态
+  // 失败清零"当前页"熟悉度：该页从批量模式退回谨慎模式（每步读页、一次一个动作），连续成功几步后再放开
+  const cur = currentEntry(t);
+  if (cur) {
+    t.pageSnapCounts = t.pageSnapCounts || {};
+    t.pageSnapCounts[pageKeyOf(cur.url)] = 0;
+  }
   if (t.stuck >= STUCK_TEACH_LIMIT) {
     await askUser(t, '我反复尝试了 ' + t.stuck + ' 次仍然没有进展。请你在当前页面上手把手演示一遍正确操作，我会记录学习后照着做。', 'teach');
     return;
@@ -2405,8 +2619,7 @@ function collectDifficultyReport(t) {
   let cur = null; // 当前操作站点
   for (const m of slice) {
     if (m.role === 'assistant' && typeof m.content === 'string') {
-      try {
-        const a = JSON.parse(m.content);
+      for (const a of histActionList(m.content)) { // 兼容单动作与批量数组
         if (!a || typeof a !== 'object' || !a.action) continue;
         if (a.action === 'open_tab' || a.action === 'navigate' || a.action === 'search') {
           cur = ensure(hostOf(a.url));
@@ -2414,7 +2627,7 @@ function collectDifficultyReport(t) {
         } else if (a.action === 'click' || a.action === 'clickAt' || a.action === 'dblclickAt' || a.action === 'gotoCell' || a.action === 'clickText' || a.action === 'hover' || a.action === 'type' || a.action === 'select' || a.action === 'scroll' || a.action === 'keypress') {
           if (cur) { cur.actions++; bumpAct(cur, a.action); }
         }
-      } catch (e) {}
+      }
     } else if (m.role === 'user' && typeof m.content === 'string') {
       const pm = m.content.match(/【当前页面】URL:\s*(\S+)/);
       if (pm) cur = ensure(hostOf(pm[1]));
@@ -2458,6 +2671,41 @@ function awaitNav(t, tabId) {
   t.navWaitIdx = true; // 标记"正在打开页面"行已显示，就绪后合并成一行
   addLog(t.sid, '正在打开页面，等待就绪…');
   saveTasks();
+}
+
+// 带超时的 sendMessage：接收端存在但主线程繁忙时 sendMessage 可能一直 pending，必须超时兜底（超时返回 null）。
+// opts 透传给 chrome.tabs.sendMessage（如 { frameId }），与不带超时的裸调用行为一致。
+function sendTab(tabId, msg, timeoutMs, opts) {
+  return new Promise((resolve) => {
+    let done = false;
+    const timer = setTimeout(() => { if (!done) { done = true; resolve(null); } }, timeoutMs || 1500);
+    chrome.tabs.sendMessage(tabId, msg, opts).then(
+      (r) => { if (!done) { done = true; clearTimeout(timer); resolve(r); } },
+      () => { if (!done) { done = true; clearTimeout(timer); resolve(null); } }
+    );
+  });
+}
+
+// 快照失败进入等待后，AGENT_READY / onUpdated 可能在 state 置位前就已广播（被 tryResume 的
+// state==='awaiting_nav' 门槛挡掉），造成恢复信号丢失、只能干等心跳最多 1 分钟。waitTabReady
+// 在等待期间轮询该标签：页面就绪（PING 有响应且 tab 状态 complete）就立刻 tryResume，几秒内补上漏掉的恢复。
+async function waitTabReady(t, tabId, myTurn) {
+  const sid = t && t.sid;
+  if (!sid) return;
+  for (let i = 0; i < 12; i++) { // 最多 ~10s（每次 PING 1.5s 超时兜底），超时交给心跳 / AGENT_READY / onUpdated 接管
+    const cur = getTask(sid);
+    if (!cur || cur.turnId !== myTurn) return;                       // 会话已被打断 / 切换
+    if (cur.state !== 'awaiting_nav' || cur.waitTabId !== tabId) return; // 已恢复或换了等待目标
+    if (Date.now() - (cur.awaitingNavAt || 0) > NAV_TIMEOUT_MS) return;  // 交给心跳报加载超时
+    const pong = await sendTab(tabId, { type: 'PING' }, 1500);
+    if (!pong) { await sleep(250); continue; }                       // 还没就绪，继续等
+    const tab = await getTab(tabId);
+    if (tab && tab.status === 'complete') {
+      tryResume(sid, tabId);
+      return;
+    }
+    await sleep(250);
+  }
 }
 
 function tryResume(sid, tabId) {

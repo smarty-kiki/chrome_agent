@@ -44,6 +44,8 @@
     <label>搜索模板（任务与当前页无关时用）
       <input id="searchTemplate" placeholder="https://www.bing.com/search?q=">
     </label>
+    <label class="check"><input id="batchEnabled" type="checkbox"> 熟悉页面批量执行动作（一次多个动作，更快；出错自动退回逐步执行）</label>
+    <label class="check"><input id="batchMark" type="checkbox"> 日志标注批量执行动作（调试：活动日志里标出「批 N 步」与每步序号，验证批量策略时用）</label>
     <label>诊断（调试）
       <button id="diagBtn" class="ghost" title="把当前标签页 Agent 浏览侧看到的页面快照（可交互元素清单 + 正文摘要 + 子窗口）提取为 JSON 复制到剪贴板">诊断</button>
     </label>

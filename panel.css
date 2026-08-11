@@ -83,6 +83,21 @@ input:focus { outline: none; border-color: var(--accent); }
 .row { display: flex; gap: 8px; }
 .row label { flex: 1; }
 
+/* 勾选框：横向排布（默认 label 是纵向 flex），对齐输入框左缘 */
+label.check {
+  flex-direction: row;
+  align-items: center;
+  gap: 8px;
+  margin-top: 6px;
+  line-height: 1.5;
+}
+label.check input[type="checkbox"] {
+  width: auto;
+  flex: none;
+  margin: 0;
+  accent-color: var(--accent);
+}
+
 .hint { color: var(--muted); font-size: 11px; }
 
 #statusBar {
