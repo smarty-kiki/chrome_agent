@@ -1356,6 +1356,7 @@ async function agentStepInner(t) {
   if (!stillCurrent(t, myTurn)) return;
 
   // 2) LLM 决策（JSON 解析失败可重试）；单动作对象与批量 {actions:[...]} 都接受，解析结果一律为动作数组
+  const thinkT0 = performance.now(); // 思考耗时起点：决策完成后给"思考中…"那行补 XXms
   addLog(t.sid, '思考中…'); // 可见进度：LLM 决策期间不再"无声"——看到这行后停顿说明在等 LLM（最多 LLM_TIMEOUT_MS 超时兜底）；这行都没出现说明卡在快照读取
   let actions = null;
   let lastErr = null;
@@ -1382,6 +1383,9 @@ async function agentStepInner(t) {
     return;
   }
   if (!stillCurrent(t, myTurn)) return;
+
+  // 决策完成：给"思考中…"那行补上耗时（面板改写最后一条 activity 行；决策期间无其他 activity 插入，安全）
+  updateLog(t.sid, null, '思考中… ' + Math.round(performance.now() - thinkT0) + 'ms');
 
   // 单动作存对象（兼容 isReadAction 的历史配对压缩），批量存数组
   const stored = actions.length === 1 ? actions[0] : actions;
@@ -1598,16 +1602,19 @@ async function findBookmarks(keyword) {
 const MAX_REVIEW_PICKS = 5; // 单次复盘最多收藏条数
 
 // 复盘入口：收集本轮访问过的站点 → LLM 筛选 → 写入书签（新网址收藏；已收藏的合并改进标题。尽力而为，失败不影响任务完成）
-async function reviewAndBookmark(t, force, pinnedTurn) {
+async function reviewAndBookmark(t, force, pinnedTurn, reviewSteps) {
   if (!t) return;
   // force：停止后复盘用（state 已回 idle，仍要跑复盘）；正常 finish 复盘时 force 为空，保持"仅 working 时复盘"
   if (!force && t.state !== 'working') return;
   const myTurn = (pinnedTurn != null) ? pinnedTurn : t.turnId; // 钉住停止那一刻的回合号，中途新指令会打断复盘
   const sites = collectVisitedSites(t);
   if (!sites.length) return;
-  addLog(t.sid, '复盘：梳理本次任务访问过的 ' + sites.length + ' 个网站，筛选有用站点…');
+  // 进度行：只是"正在复盘"的动作提示（非成果），用「本次…复盘中…」与结果行的「复盘：」前缀区分开
+  addLog(t.sid, '本次访问过 ' + sites.length + ' 个网站，完成 ' + (reviewSteps || 0) + ' 步动作，复盘中…');
   const picks = await pickBookmarks(t, sites);
+  if (!stillCurrent(t, myTurn, force)) return; // 筛选期间被新指令打断
   if (!picks.length) return;
+  addLog(t.sid, '复盘：筛选出 ' + picks.length + ' 个有用站点'); // 成果：LLM 从访问过的网站里筛出值得收藏的
   let added = 0, updated = 0;
   for (const p of picks) {
     if (!stillCurrent(t, myTurn, force)) break; // 复盘期间被新指令打断
@@ -1619,12 +1626,8 @@ async function reviewAndBookmark(t, force, pinnedTurn) {
       addLog(t.sid, '复盘收藏失败：' + ((p && p.title) || '') + ' → ' + (e.message || e), true);
     }
   }
-  if (added > 0 || updated > 0) {
-    const parts = [];
-    if (added > 0) parts.push('新增 ' + added + ' 个');
-    if (updated > 0) parts.push('改进 ' + updated + ' 个既有书签的使用技巧');
-    addLog(t.sid, '复盘完成：' + parts.join('、'));
-  }
+  if (added > 0) addLog(t.sid, '复盘：收藏了 ' + added + ' 个网站');
+  if (updated > 0) addLog(t.sid, '复盘：改进了 ' + updated + ' 个书签的使用技巧');
 }
 
 // 收集本轮任务中实际访问过的站点（按域名归并）：
@@ -1748,7 +1751,7 @@ async function reviewCollectBookmark(t, p) {
     // 不传 parentId → Chrome 默认放到书签根（其他书签），标题按"网站名 | 作用 | 使用技巧"三段式
     await chrome.bookmarks.create({ title, url });
     await refreshBookmarkIndex();
-    addLog(t.sid, '复盘：收藏 ' + title);
+    addLog(t.sid, '复盘：收藏 ' + title, true); // 明细留 console，活动日志只报"收藏了 N 个网站"总数
     return 'added';
   }
   const oldTitle = String(existing.title || '').replace(/\s+/g, ' ').trim();
@@ -1759,7 +1762,7 @@ async function reviewCollectBookmark(t, p) {
   if (!Object.keys(update).length) { addLog(t.sid, '复盘：已收藏过且无新技巧，跳过 ' + url, true); return 'skipped'; }
   await chrome.bookmarks.update(existing.id, update);
   await refreshBookmarkIndex();
-  addLog(t.sid, '复盘：' + (update.title ? '改进既有书签的使用技巧：' + merged : '规整书签 URL 为根：' + url));
+  addLog(t.sid, '复盘：' + (update.title ? '改进既有书签的使用技巧：' + merged : '规整书签 URL 为根：' + url), true); // 明细留 console，活动日志只报"改进了 N 个"总数
   return 'updated';
 }
 
@@ -2130,10 +2133,14 @@ async function runAction(t, a) {
   // ---- 结束本轮 ----
   if (a.action === 'finish') {
     const result = typeof a.result === 'string' ? a.result : JSON.stringify(a.result || '');
-    try { await reviewAndBookmark(t); } catch (e) { /* 复盘失败不影响任务完成 */ }
-    try { await reviewAndLearnTips(t); } catch (e) { /* 技巧沉淀失败不影响任务完成 */ }
+    const myTurn = t.turnId; // 钉住本回合号：先落答案、再后台复盘，期间新指令会打断复盘
+    const reviewSteps = t.turnSteps; // 复盘进度行要报"本次完成 N 步动作"，complete 会清零 turnSteps，先留住
     if (!stillCurrent(t, myTurn)) return;
-    complete(t, result);
+    await complete(t, result); // 先显示答案：立即广播给面板、状态回 idle，使用者不用等复盘跑完
+    // 复盘挪到答案之后、以 force 模式照常执行（复用"停止后复盘"的机制）：complete 已把 state 置回 idle，
+    // 不 force 的话两个复盘函数会因"非 working"静默跳过（答案一显示就以为任务完成、不复盘）。
+    // 钉住回合号：新指令（turnId 变化）一到，复盘自动退出、不误动新回合。复盘失败不影响本轮完成。
+    await reviewAfterTurnEnd(t, myTurn, reviewSteps);
     return;
   }
 
@@ -2524,7 +2531,6 @@ async function reviewAndLearnTips(t, force, pinnedTurn) {
   const cfg = await getConfig();
   if (!cfg.apiKey) return;
   if (!stillCurrent(t, myTurn, force)) return;
-  addLog(t.sid, '复盘：' + report.domains.length + ' 个站点操作有困难，沉淀操作技巧…');
   const store = await getTipStore();
   const oldByHost = {};
   for (const h of report.domains) oldByHost[h] = (store[h] || []).join('\n');
@@ -2560,17 +2566,20 @@ async function reviewAndLearnTips(t, force, pinnedTurn) {
     if (tip) { if (!byHost.has(h)) byHost.set(h, []); byHost.get(h).push(tip); }
   }
   if (!byHost.size) return;
+  let savedTips = 0; // 本轮实际沉淀的新技巧条数（按各域名的 newTips 计）
   for (const [h, newTips] of byHost) {
     if (!stillCurrent(t, myTurn, force)) break;
     try {
       const merged = await mergeSiteTips(h, newTips, oldByHost[h], t.sid);
       if (!merged || !merged.length) continue;
       await saveSiteTips(h, merged, t.sid);
-      addLog(t.sid, '复盘：沉淀 ' + h + ' 的操作技巧（共 ' + merged.length + ' 条）');
+      savedTips += newTips.length;
+      addLog(t.sid, '复盘：沉淀 ' + h + ' 的操作技巧（共 ' + merged.length + ' 条）', true); // 明细留 console，活动日志只报总数
     } catch (e) {
       addLog(t.sid, '复盘技巧保存失败：' + h + ' → ' + e.message, true);
     }
   }
+  if (savedTips > 0) addLog(t.sid, '复盘：总结了 ' + savedTips + ' 个操作技巧'); // 成果：本轮沉淀的新技巧总数
 }
 
 // 合并某域名的既有技巧与新技巧：同站同操作的冲突技巧合并处理、有价值的旧技巧保留、限制条数。返回最终列表。
@@ -2992,6 +3001,7 @@ async function stopCurrent(sid) {
   clearAlarm();
   if (t.state === 'working' || t.state === 'awaiting_nav' || t.state === 'waiting_user') {
     const myTurn = t.turnId; // 钉住被停止回合的号，供停止后复盘判定是否被打断
+    const reviewSteps = t.turnSteps; // 复盘进度行要报"本次完成 N 步动作"，下面会清零 turnSteps，先留住
     await stopTeachRecording(t); // 教我模式停止时一并停止录制
     t.state = 'idle';
     t.waitTabId = null;
@@ -3002,14 +3012,15 @@ async function stopCurrent(sid) {
     broadcast({ type: 'AGENT_STATUS', status: 'idle' }, t.sid);
     // 停止后仍做复盘：本轮实际访问过的网站 / 走过的弯路，照常沉淀成书签与操作技巧。
     // 后台执行不阻塞停止按钮的响应；期间若来了新指令（turnId 变化）复盘自动退出。
-    reviewAfterStop(t, myTurn);
+    reviewAfterTurnEnd(t, myTurn, reviewSteps);
   }
 }
 
-// 停止后的复盘：任务已回 idle，用 force 让复盘在后台照常执行（LLM 判断本轮访问的网站是否有用、操作是否有困难）。
-async function reviewAfterStop(t, myTurn) {
-  try { await reviewAndBookmark(t, true, myTurn); } catch (e) { /* 复盘失败不影响停止 */ }
-  try { await reviewAndLearnTips(t, true, myTurn); } catch (e) { /* 技巧沉淀失败不影响停止 */ }
+// 回合收尾后的复盘（停止 / finish 完成都走这里）：任务已回 idle，用 force 让复盘在后台照常执行
+// （LLM 判断本轮访问的网站是否有用、操作是否有困难）。钉住回合号：新指令（turnId 变化）自动退出。
+async function reviewAfterTurnEnd(t, myTurn, reviewSteps) {
+  try { await reviewAndBookmark(t, true, myTurn, reviewSteps); } catch (e) { /* 复盘失败不影响收尾 */ }
+  try { await reviewAndLearnTips(t, true, myTurn); } catch (e) { /* 技巧沉淀失败不影响收尾 */ }
 }
 
 // 事件是否录自 iframe 子窗口（frameId 非 0 或缺失时视为主窗口）
