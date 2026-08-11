@@ -34,7 +34,7 @@ const TAIL_KEEP_STEPS = 2;            // 压缩时保留最近几步原文（快
 const MAX_SNAPSHOT_KEEP = 3;          // 每次请求最多发给 LLM 的页面快照数（旧快照元素已过期，只留最近几次）
 const MAX_BATCH = 10;                 // 单批动作数硬上限（LLM 按动作颗粒度自行决定批量多少，最多此值）
 const BATCH_FAMILIAR_THRESHOLD = 2;   // 同一页面成功快照 ≥ 此值 → 判定"熟悉"，允许批量输出
-const BATCH_TERMINALS = new Set(['open_tab', 'search', 'navigate', 'switch_tab', 'close_tab', 'use_tab', 'finish', 'ask_user']); // 遇此类动作本批收尾（它们会切页/改变会话状态）
+const BATCH_TERMINALS = new Set(['open_tab', 'search', 'navigate', 'switch_tab', 'close_tab', 'use_tab', 'snapshot', 'finish', 'ask_user']); // 遇此类动作本批收尾（它们会切页/改变会话状态；snapshot 会切换元素窗口，翻页后需重新观察）
 const LLM_TIMEOUT_MS = 240000; // LLM 单次请求超时：网络/服务端挂起时不再无限等（超时按解析失败重试），避免循环整体干等
 const SUMMARY_CHUNK_TOKENS = 150000;  // 摘要单次输入的 token 上限（超出分块链式合并）
 const SUMMARY_MAX_CHARS = 1500;       // 压缩摘要长度上限（字符）
@@ -164,6 +164,8 @@ async function createSession(tabId) {
     stuck: 0,         // 无进展计数：连续失败/重复同一动作/空等累计，换新动作清零，>=STUCK_TEACH_LIMIT 转教我
     lastTipsHost: '',  // 本会话已显示"加载 x 个相关技巧"的站点（同一站点只提示一次，避免刷屏）
     pageSnapCounts: {}, // 页面熟悉度：pageKey(host+pathname) → 成功快照次数；动作失败会清零该页计数（恢复谨慎模式）
+    snapOffset: 0,      // 元素窗口翻页偏移（每批 REF_WINDOW_SIZE 个）；snapshot 动作改写，URL 变化自动回第一批
+    snapOffsetUrl: '',  // snapOffset 所属页面 URL：换页/导航/切标签后 offset 失效重置为 0
     timer: null, // 任务计时器：{ running, startAt, acc }；从任务发出开始计时、等你操作时暂停、finish 答案落定时停止（复盘不算）
   };
   tasks[sid] = t;
@@ -458,7 +460,7 @@ function systemPrompt() {
 
 每收到一个快照，你必须输出 JSON 动作。**默认输出单个动作对象** {"action":"...",...}；当快照提示【批量模式】已开启时，可以输出**批量动作** {"actions":[{...},{...},...]}，系统会一次连续执行全部（最多 10 个，大幅减少往返、更快）。批量规则：
 - **批内顺序依赖要弱**：某个动作执行后才出现的元素，后续动作**不能用它的 ref**（ref 来自旧快照，执行时会失效），要用 clickText 按文字 / clickAt·dblclickAt 按坐标 / gotoCell 按格号来定位；
-- 会改变页面结构或跳转的动作（open_tab / search / navigate / switch_tab / close_tab / use_tab / finish / ask_user）**放在批尾**，执行到它们本批就收尾，之后系统重新观察页面；
+- 会改变页面结构或跳转的动作（open_tab / search / navigate / switch_tab / close_tab / use_tab / snapshot / finish / ask_user）**放在批尾**，执行到它们本批就收尾，之后系统重新观察页面；
 - 每批尽量以 read 或读回校验结尾，确认动作生效；一个动作最多 10 个，拿不准就输出单个动作。
 可用动作：
 
@@ -480,6 +482,7 @@ function systemPrompt() {
    {"action":"type","target":<ref>,"text":"..."}           输入文本（覆盖原有内容）
    {"action":"select","target":<ref>,"value":"..."}        下拉框选择
    {"action":"scroll","direction":"down|up","amount":<像素,可选>}  滚动页面
+   {"action":"snapshot","offset":<100 的倍数>}             翻到下一批元素窗口：快照标注"还有下一批"且目标不在列表时用（offset 取快照提示里的值；回第一批用 0）
    {"action":"read","target":<ref 或 "page">}              读取某元素或整页文本（用于总结）
    {"action":"wait","ms":<毫秒>}                           等待页面/动画/网络
    {"action":"keypress","keys":"Enter|Escape|Tab|Backspace|ArrowDown|..."}  向当前焦点发送按键
@@ -619,7 +622,7 @@ function parseAction(text) {
   let t = String(text || '').trim();
   t = t.replace(/^```(?:json)?/i, '').replace(/```$/i, '').trim();
   const obj = JSON.parse(t);
-  const ALLOWED = new Set(['open_tab', 'switch_tab', 'use_tab', 'list_tabs', 'close_tab', 'search', 'save_file', 'bookmarks_read', 'bookmarks_write', 'bookmark_find', 'ask_user', 'say', 'click', 'clickAt', 'dblclickAt', 'gotoCell', 'clickText', 'hover', 'type', 'select', 'scroll', 'read', 'wait', 'keypress', 'navigate', 'finish']);
+  const ALLOWED = new Set(['open_tab', 'switch_tab', 'use_tab', 'list_tabs', 'close_tab', 'search', 'save_file', 'bookmarks_read', 'bookmarks_write', 'bookmark_find', 'ask_user', 'say', 'click', 'clickAt', 'dblclickAt', 'gotoCell', 'clickText', 'hover', 'type', 'select', 'scroll', 'read', 'wait', 'keypress', 'navigate', 'snapshot', 'finish']);
   let list = [];
   if (Array.isArray(obj)) {
     list = obj;
@@ -1260,6 +1263,14 @@ function buildSnapshotMessage(snap, tipsBlock, t, batchHint) {
       );
     }
   }
+  // 元素窗口翻页提示：每批 REF_WINDOW_SIZE 个 ref。more=true（本批收满、页面还有更多）时教模型翻下一页；
+  // 已在后续批且是最后一页时提示可回第一批。普通页面（元素不满一批）不触发、零成本。
+  const off = snap.offset || 0;
+  if (snap.more) {
+    lines.push('（元素窗口：第 ' + (Math.floor(off / REF_WINDOW_SIZE) + 1) + ' 批 · offset=' + off + '，每批最多 ' + REF_WINDOW_SIZE + ' 个。目标不在列表中时，用 {"action":"snapshot","offset":' + (off + REF_WINDOW_SIZE) + '} 翻下一批看更多元素）');
+  } else if (off > 0) {
+    lines.push('（元素窗口：第 ' + (Math.floor(off / REF_WINDOW_SIZE) + 1) + ' 批 · offset=' + off + '，已是最后一页；要找第一批的元素用 {"action":"snapshot","offset":0}）');
+  }
   if (snap.canvas && Array.isArray(snap.canvas.text) && snap.canvas.text.length) {
     lines.push('【画布文字】（画布渲染的可见内容：正文画在 canvas 上、DOM 里读不到，坐标是视口坐标。表格类页面优先用 gotoCell 按格号定位（如 gotoCell D8）再 F2 编辑，比坐标稳；坐标也可直接 clickAt/dblclickAt 点选。操作后页面会重画，重新快照可读到新位置/新值）');
     for (const it of snap.canvas.text) {
@@ -1275,7 +1286,9 @@ function buildSnapshotMessage(snap, tipsBlock, t, batchHint) {
 // 可交互元素，动作才能定位到 iframe 里的东西（如腾讯文档新建弹窗就是跨域 iframe）。
 // 子窗口元素的 ref 用「frameIndex*1000 + 局部 ref」偏移成全局唯一编号，动作路由时拆回。
 const MAX_SNAP_FRAMES = 16;       // 快照合并的子窗口数量上限（含主窗口）。弹层/卡片常是动态后插的 iframe，上限太小会把它们整窗切掉
-const MAX_MERGED_ELEMENTS = 90;   // 合并后元素总数上限，防刷爆上下文
+const MAX_MERGED_ELEMENTS = 120;  // 合并后元素总数上限，防刷爆上下文（≥ 主窗口 MAX_ELEMENTS，避免单帧页面被 90 截断）
+const REF_WINDOW_SIZE = 100;      // 每批元素窗口大小（= content.js MAX_ELEMENTS）：翻页每批最多这么多 ref
+const MAX_SNAPSHOT_OFFSET = 9900; // snapshot 翻页 offset 上限，防模型无限翻页死循环
 const SUBFRAME_MIN = 6;           // 每个子窗口在合并快照里至少保留的元素数：保证 iframe 里的关键目标不被主窗口海量元素挤掉
 const FRAME_REF_BASE = 1000;      // 子窗口元素 ref 偏移基数：全局 ref = frameIndex*FRAME_REF_BASE + 局部 ref
 
@@ -1293,13 +1306,14 @@ async function frameList(tabId) {
 }
 
 // 读取合并快照：主窗口 + 各子窗口，ref 全局唯一偏移，元素带 frameId/frameIndex。
+// offset：主窗口翻页窗口偏移（每批 REF_WINDOW_SIZE 个，见 content.js buildSnapshot）；子窗口始终从第一批读。
 // 子窗口读取失败容忍（跨域受限 / 还在加载）；主窗口失败抛错，让上层按原逻辑重试。
-async function readSnapshotWithFrames(tabId) {
+async function readSnapshotWithFrames(tabId, offset = 0) {
   // 1) 先读主窗口——它 DOM 里的直接 iframe 清单是"弹层 iframe 确实存在"的硬证据，
   //    用来交叉校验 getAllFrames 枚举是否完整（弹层/卡片 iframe 常被读漏，导致"窗口数 1↔2 跳动"）。
   //    主窗口可能因页面主线程繁忙而迟迟不回（sendMessage 会一直 pending），带 8s 超时兜底，
   //    超时按失败走上层重试 → awaitNav → waitTabReady 轮询恢复，避免"整轮干等无超时"。
-  const mainSnap = await sendTab(tabId, { type: 'GET_SNAPSHOT' }, 8000);
+  const mainSnap = await sendTab(tabId, { type: 'GET_SNAPSHOT', offset }, 8000); // offset：翻页窗口起始
   if (!mainSnap || !Array.isArray(mainSnap.elements)) throw new Error('主窗口快照为空');
   const domIframes = Array.isArray(mainSnap.iframes) ? mainSnap.iframes.length : 0; // 主窗口 DOM 里的直接 iframe 数
 
@@ -1319,6 +1333,8 @@ async function readSnapshotWithFrames(tabId) {
   const frameElements = []; // 每个成功读取窗口的原始元素列表（截断前），供下面分帧保留
   let merged = { url: mainSnap.url, title: mainSnap.title, excerpt: mainSnap.excerpt, elements: [], frames: frameMeta };
   merged.canvas = mainSnap.canvas; // 画布文字（画布渲染页面的可见内容）——只取主窗口的画布文字，子窗口的暂不合并
+  merged.offset = offset;         // 翻页：本次窗口起始偏移（0 = 第一批），供快照提示用
+  merged.more = !!mainSnap.more;  // 主窗口元素超过窗口上限 = 还有下一批可翻，供快照提示用
   // 主窗口（frameId 0）固定是第 0 帧
   frameMeta.push({ frameId: 0, index: 0, url: mainSnap.url || '', title: mainSnap.title || '' });
   const mainList = [];
@@ -1437,6 +1453,10 @@ async function agentStepInner(t) {
   const t0 = performance.now(); // 计时：快照读取耗时，用于"正在浏览 xxx · Nms"
   let snap = null;
   let lastSnapErr = null;
+  // 元素窗口翻页偏移：只对同一 URL 生效（换页/导航/切标签后 URL 变了，自动回第一批）。
+  let wantOffset = 0;
+  if (curTab && t.snapOffsetUrl === curTab.url) wantOffset = t.snapOffset || 0;
+  else t.snapOffset = 0;
   if (curTab && isRestrictedUrl(curTab.url)) {
     addLog(t.sid, '受限页面，自动打开相关网页', true);
     snap = { url: curTab.url, title: curTab.title || '', elements: [], excerpt: '', restricted: true };
@@ -1444,7 +1464,7 @@ async function agentStepInner(t) {
     for (let i = 0; i < 3 && !snap; i++) {
       try {
         await ensureContentScript(tabId);
-        snap = await readSnapshotWithFrames(tabId); // 合并主窗口 + iframe 子窗口
+        snap = await readSnapshotWithFrames(tabId, wantOffset); // 合并主窗口 + iframe 子窗口；wantOffset 翻页看下一批
       } catch (e) {
         lastSnapErr = e;
         const tab = await getTab(tabId);
@@ -1462,6 +1482,8 @@ async function agentStepInner(t) {
   }
   if (!stillCurrent(t, myTurn)) return;
 
+  t.snapOffset = wantOffset;           // 记住本次实际生效的窗口偏移
+  t.snapOffsetUrl = snap.url || '';    // offset 所属页面 URL（以 content 读到的为准，可能比 chrome tab.url 新）
   t.snapFrames = (snap && Array.isArray(snap.frames)) ? snap.frames : []; // 供动作路由把全局 ref 拆回 (frameId, 局部 ref)
   t.curPageSig = pageSigOf(snap); // 记录当前页面状态指纹，供"无进展计数"判断重复动作时页面是否真的变了
   // 页面熟悉度：本次快照成功后计数 +1，达到阈值且未失败过 → 本步允许批量动作。
@@ -1491,7 +1513,7 @@ async function agentStepInner(t) {
   addLog(t.sid, '正在浏览 ' + midTruncate(snap.title || shortUrl(snap.url), 16) + ' · ' + Math.round(performance.now() - t0) + 'ms');
   // 批量模式提示：熟悉页面明确告知 LLM 可一次输出多个动作（且给出批内定位约束），减少 LLM 往返
   const batchHint = batchReady
-    ? '【批量模式】本页你已经熟悉（历史操作稳定成功）。为减少往返、提升效率，本步可一次输出最多 ' + MAX_BATCH + ' 个连续动作（{"actions":[{...},{...},...]}；也可以继续输出单个对象）。批内约束：动作执行后才出现的元素不能用 ref 引用（ref 来自当前快照、执行时可能已失效），要用 clickText 按文字 / clickAt·dblclickAt 按坐标 / gotoCell 按格号定位；open_tab、search、navigate、switch_tab、close_tab、use_tab、finish、ask_user 放在批尾（执行到它们本批收尾）；每批尽量以 read 或读回校验结尾确认生效。'
+    ? '【批量模式】本页你已经熟悉（历史操作稳定成功）。为减少往返、提升效率，本步可一次输出最多 ' + MAX_BATCH + ' 个连续动作（{"actions":[{...},{...},...]}；也可以继续输出单个对象）。批内约束：动作执行后才出现的元素不能用 ref 引用（ref 来自当前快照、执行时可能已失效），要用 clickText 按文字 / clickAt·dblclickAt 按坐标 / gotoCell 按格号定位；open_tab、search、navigate、switch_tab、close_tab、use_tab、snapshot、finish、ask_user 放在批尾（执行到它们本批收尾）；每批尽量以 read 或读回校验结尾确认生效。'
     : '【谨慎模式】本页你还不熟悉（首次进入或刚出过错），一次只输出一个动作，系统会重新观察页面后再继续。';
   let snapMsg = buildSnapshotMessage(snap, tipsBlock, t, batchHint);
   t.history.push({ role: 'user', content: snapMsg, kind: 'snapshot' }); // kind 标记快照，buildMessages 只发最近 MAX_SNAPSHOT_KEEP 次
@@ -1938,6 +1960,7 @@ function friendlyAction(a, res, ms) {
       return base;
     }
     case 'read': return T('读取页面');
+    case 'snapshot': return T('翻元素窗口到第 ' + (Math.floor((Number(a.offset) || 0) / REF_WINDOW_SIZE) + 1) + ' 批');
     case 'keypress': {
       const keys = String(a.keys || '').trim();
       return T('按键' + (keys ? ' ' + keys : (label ? '「' + label + '」' : '')));
@@ -1960,9 +1983,10 @@ const STUCK_TEACH_LIMIT = 5;
 
 // 页面动作签名：用于识别"假装人类停顿后又重复执行同一个动作"的无进展循环（如连续两次 click 同一 ref）
 function sigOf(a) {
-  const p = a.ref || a.selector || a.target || a.url || a.key || a.text || '';
+  const p = a.ref || a.selector || a.target || a.url || a.key || a.text || a.offset || '';
   return a.action + ':' + String(p);
 }
+// a.offset 纳入签名：翻页每翻一页算新动作，不会被"反复执行同一动作"误判为无进展
 
 // 页面状态指纹：判断"两次动作之间页面是否真的变了"（变了=有进展，没变=原地打转）。
 // 用 url+标题+可交互元素数+正文长度做轻量指纹：翻页/加载出新内容时元素数与正文都会变；卡死循环则完全一致。
@@ -2066,6 +2090,15 @@ async function runAction(t, a) {
   // 记录"这次真实动作之前攒了几次 wait"（供"等待后又重复同一个动作"识别），并清零连续等待计数
   const prevWaits = (a.action !== 'wait') ? (t.consecWaits || 0) : 0;
   if (a.action !== 'wait') t.consecWaits = 0;
+
+  // ---- 元素窗口翻页（snapshot）----
+  if (a.action === 'snapshot') {
+    const off = Math.max(0, Math.min(Number(a.offset) || 0, MAX_SNAPSHOT_OFFSET));
+    t.snapOffset = off; // 只改窗口偏移；下一步 agentStep 会按新 offset 重读快照（URL 变了自动回第一批）
+    addLog(t.sid, '翻元素窗口到第 ' + (Math.floor(off / REF_WINDOW_SIZE) + 1) + ' 批');
+    nextStepOrBatch(t, myTurn);
+    return;
+  }
 
   // ---- 标签操作 ----
   if (a.action === 'open_tab') {

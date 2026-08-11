@@ -927,6 +927,7 @@ async function init() {
         pushMsg(sid, { kind: 'agent', text: msg.text, ok: msg.ok });
         break;
       case 'AGENT_ASK':
+        if ((msg.mode || 'page') === 'teach') cache.teachSteps = 0; // 每次新教卡都是新录制，上一轮残留的步数不带到新卡（教卡的实时步数由 AGENT_TEACH_STEPS 续接）
         pushMsg(sid, { kind: 'ask', text: msg.text, mode: msg.mode || 'page' });
         break;
       case 'AGENT_ACTIVITY':

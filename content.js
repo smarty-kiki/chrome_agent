@@ -17,7 +17,7 @@
   // 不广播 AGENT_READY、不抢主循环（避免 iframe 刷屏/重复续跑）。
   const IS_TOP_FRAME = (() => { try { return window.top === window; } catch (_) { return false; } })();
 
-  const MAX_ELEMENTS = 60;   // 快照中可交互元素数量上限
+  const MAX_ELEMENTS = 100;  // 每批快照的可交互元素数量上限（每批一个窗口；普通页面远用不满、零成本，密集/长页面按 offset 翻页逐批取；与 background REF_WINDOW_SIZE 保持一致，合并上限 MAX_MERGED_ELEMENTS ≥ 它）
   const TEXT_LIMIT = 1500;   // 正文摘要长度上限
   const READ_LIMIT = 6000;   // read 动作单次返回文本上限
 
@@ -378,8 +378,11 @@
     return 'A|' + text + '|' + href;
   }
 
-  function buildSnapshot(canvasEntries) {
+  function buildSnapshot(canvasEntries, offset = 0) {
+    // 翻页窗口：本轮收集绝对位置 offset+1..offset+MAX_ELEMENTS 的元素，收集完统一重排回 1..N
+    const limit = offset + MAX_ELEMENTS;
     const map = refMap;
+    map.clear(); // refMap 每次快照全量重建，避免旧页残留 ref 命中已不存在/已复用的元素（stale ref）
     const items = [];
     const seen = new Set();
     const seenKey = new Set(); // 重复链接（页脚/导航镜像）只收一次
@@ -388,7 +391,7 @@
     // 浮层优先：弹层里的可交互元素先拿 ref（遮罩/面板经 elementsFromPoint 采样识别），
     // 避免正文元素先把名额占满、弹层按钮（关闭 × 等）永远进不了快照。
     const overlayPush = (el) => {
-      if (ref >= MAX_ELEMENTS) return false;
+      if (ref >= limit) return false;
       if (seen.has(el) || !isVisible(el)) return true;
       if (el.tagName === 'A') {
         const k = dupKeyOf(el);
@@ -403,7 +406,7 @@
       return true;
     };
     for (const root of overlayRoots()) {
-      if (ref >= MAX_ELEMENTS) break;
+      if (ref >= limit) break;
       // ① 语义可点后代（button/a/[aria-label]…）
       for (const el of root.querySelectorAll(INTERACTIVE)) {
         if (!overlayPush(el)) break;
@@ -413,7 +416,7 @@
       let scanned = 0;
       const tw2 = document.createTreeWalker(root, NodeFilter.SHOW_ELEMENT);
       let n2 = tw2.currentNode;
-      while ((n2 = tw2.nextNode()) && ref < MAX_ELEMENTS && scanned < 300) {
+      while ((n2 = tw2.nextNode()) && ref < limit && scanned < 300) {
         scanned++;
         if (n2 === root || seen.has(n2) || n2.matches(INTERACTIVE)) continue;
         // 图标字形/图片不是独立按钮（cursor:pointer 常从父按钮继承来），跳过以免拿一堆 svg 当按钮填满 ref
@@ -427,7 +430,7 @@
         const st = getComputedStyle(n2);
         if (st.display === 'none' || st.visibility === 'hidden' || st.opacity === '0') continue;
         if (!hasClickHandler(n2) && st.cursor !== 'pointer') continue;
-        if (ref >= MAX_ELEMENTS) break;
+        if (ref >= limit) break;
         seen.add(n2);
         const item = describe(n2, ++ref);
         item.overlay = true;
@@ -460,7 +463,7 @@
       }
       if (nested && el.tagName !== 'TEXTAREA' && !el.isContentEditable) continue;
 
-      if (ref >= MAX_ELEMENTS) break;
+      if (ref >= limit) break;
 
       // 隐藏输入捕获编辑器识别（腾讯文档等）：真实可编辑的是角落里又小又透明的 contenteditable
       // （实测 5×1 的 div#melo-hidden-editor[role=textbox]，且 opacity:0——正常可见性检查会把
@@ -549,12 +552,12 @@
     // 主列表没填满时补扫，让 agent 在纯 JS 动态 app（如腾讯文档）里也能看到并点击这类元素。
     // 判定"可点"看是否绑了点击处理器（见 hasClickHandler：内联 onclick / React props），
     // cursor:pointer 样式只作兜底候选（纯 addEventListener 的旧页面无法从外部探测处理器）。
-    if (ref < MAX_ELEMENTS) {
+    if (ref < limit) {
       let checked = 0;
       const maxCheck = 1500;
       // 收录判定：可见 + 自带文字/aria + 父级未收录（避免整块容器重复收进来）
       const tryAdd = (el) => {
-        if (ref >= MAX_ELEMENTS || checked >= maxCheck) return false;
+        if (ref >= limit || checked >= maxCheck) return false;
         checked++;
         if (seen.has(el) || !isVisible(el)) return true;
         if (!(el.textContent || '').trim() && !el.getAttribute('aria-label') && !el.getAttribute('title') && !el.alt) return true;
@@ -575,7 +578,7 @@
       let walked = 0;
       const tw = document.createTreeWalker(document.body, NodeFilter.SHOW_ELEMENT);
       let n = tw.currentNode;
-      while ((n = tw.nextNode()) && ref < MAX_ELEMENTS && checked < maxCheck && walked < maxCheck) {
+      while ((n = tw.nextNode()) && ref < limit && checked < maxCheck && walked < maxCheck) {
         walked++;
         if (!hasClickHandler(n)) continue;
         if (!tryAdd(n)) break;
@@ -585,7 +588,7 @@
       const dynSel = pointerSelectors().concat('[style*="cursor"]').join(',');
       if (dynSel) {
         for (const el of document.querySelectorAll(dynSel)) {
-          if (ref >= MAX_ELEMENTS || checked >= maxCheck) break;
+          if (ref >= limit || checked >= maxCheck) break;
           if (seen.has(el)) continue;
           if (!tryAdd(el)) break;
         }
@@ -593,11 +596,11 @@
       // 候选 3：样式表跨域读不到（CDN 托管无 CORS）时的兜底——直接按运行时手型找，不依赖样式表。
       // 只收确凿的静止手型 pointer（不收 auto），避免重演 hover-only 才出手型的误判；有界扫描防止大页卡顿。
       // cursor 至此是最后一层信号：前有语义元素、真实处理器、样式表声明三层优先。
-      if (ref < MAX_ELEMENTS) {
+      if (ref < limit) {
         let c3 = 0;
         const tw3 = document.createTreeWalker(document.body, NodeFilter.SHOW_ELEMENT);
         let n3 = tw3.currentNode;
-        while ((n3 = tw3.nextNode()) && ref < MAX_ELEMENTS && c3 < 800 && checked < maxCheck) {
+        while ((n3 = tw3.nextNode()) && ref < limit && c3 < 800 && checked < maxCheck) {
           c3++;
           if (seen.has(n3)) continue;
           const t3 = n3.tagName;
@@ -657,13 +660,25 @@
           : null;
       } catch (e) { return null; }
     })();
+    // 翻页窗口重排：本轮编号是绝对位置 offset+1..offset+N，统一重排回 1..N 并重建 refMap，
+    // 让 ref 永远指"本次快照窗口里的第几个"，与单窗口语义一致（子窗口合并、click 定位都不受影响）。
+    if (offset > 0 && items.length) {
+      const entries = items.map((it, i) => [i + 1, map.get(offset + i + 1)]);
+      map.clear();
+      for (const [k, v] of entries) {
+        items[k - 1].ref = k;
+        if (v) map.set(k, v);
+      }
+    }
     return {
       url: location.href,
       title: document.title,
       elements: items,
       excerpt: bodyText,
       iframes: iframeSrcs,
-      canvas: canvasBlock || undefined
+      canvas: canvasBlock || undefined,
+      offset,            // 本次窗口起始偏移（0 = 第一批）
+      more: ref >= limit // 收集被截断 = 页面还有元素没进本窗口，可 snapshot offset 翻下一批
     };
   }
 
@@ -1532,7 +1547,7 @@
           return { pong: true };
         case 'GET_SNAPSHOT': {
           const canvasEntries = await collectCanvasText(); // 画布文字：收最新一批并重置钩子，供 buildSnapshot 带出
-          return buildSnapshot(canvasEntries);
+          return buildSnapshot(canvasEntries, Number(msg.offset) || 0); // offset：翻页窗口起始偏移
         }
         case 'EXECUTE_ACTION':
           return executeAction(msg.action || {});
