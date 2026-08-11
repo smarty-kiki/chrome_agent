@@ -333,11 +333,117 @@
   }
 
   // ---------------- 构建页面快照 ----------------
+  // 浮层识别：弹层/遮罩通常是"盖住大半视口的 fixed/absolute 容器"，且 DOM 里排在正文之后——
+  // 纯文档顺序会把 ref 名额先分给正文元素，弹层里的按钮（如关闭 ×）永远轮不到。这里用
+  // elementsFromPoint 采样视口几个点、向上找大容器，得到"浮层根"，供 buildSnapshot 优先分配 ref。
+  function overlayRoots() {
+    const roots = new Set();
+    const vw = window.innerWidth, vh = window.innerHeight;
+    const isRootish = (el) => {
+      try {
+        const st = getComputedStyle(el);
+        if (st.position !== 'fixed' && st.position !== 'absolute') return false;
+        if (st.display === 'none' || st.visibility === 'hidden' || st.opacity === '0') return false;
+        const r = el.getBoundingClientRect();
+        return r.width > vw * 0.35 && r.height > vh * 0.35;
+      } catch (e) { return false; }
+    };
+    const sample = (x, y) => {
+      let els;
+      try { els = document.elementsFromPoint(x, y); } catch (e) { return; }
+      for (const el of els) {
+        if (!el || el === document.body || el === document.documentElement) break;
+        let cur = el;
+        while (cur && cur.nodeType === 1 && cur !== document.body) {
+          if (isRootish(cur)) roots.add(cur);
+          cur = cur.parentElement;
+        }
+      }
+    };
+    sample(vw / 2, vh / 2);       // 中心：居中弹层/遮罩
+    sample(vw * 0.15, vh * 0.15); // 四角内缩采样：角落/偏置弹层
+    sample(vw * 0.85, vh * 0.15);
+    sample(vw * 0.15, vh * 0.85);
+    sample(vw * 0.85, vh * 0.85);
+    return roots;
+  }
+
+  // 重复链接去重键：同 tag+文本+href 视为导航/页脚镜像（同一目标），只收第一处，省 ref 名额。
+  // 只对有文字的链接去重；空 A 多为图标按钮（如关闭 × 是包着 svg 的空链接），每个都可能有独立
+  // 动作，不能按 'A||' 全折叠成一个。
+  function dupKeyOf(el) {
+    const text = (el.innerText || el.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 40);
+    if (!text) return '';
+    const href = (el.getAttribute && el.getAttribute('href')) || '';
+    return 'A|' + text + '|' + href;
+  }
+
   function buildSnapshot(canvasEntries) {
     const map = refMap;
     const items = [];
     const seen = new Set();
+    const seenKey = new Set(); // 重复链接（页脚/导航镜像）只收一次
     let ref = 0;
+
+    // 浮层优先：弹层里的可交互元素先拿 ref（遮罩/面板经 elementsFromPoint 采样识别），
+    // 避免正文元素先把名额占满、弹层按钮（关闭 × 等）永远进不了快照。
+    const overlayPush = (el) => {
+      if (ref >= MAX_ELEMENTS) return false;
+      if (seen.has(el) || !isVisible(el)) return true;
+      if (el.tagName === 'A') {
+        const k = dupKeyOf(el);
+        if (k && seenKey.has(k)) return true; // 空 A（图标按钮）不去重，见 dupKeyOf
+        if (k) seenKey.add(k);
+      }
+      seen.add(el);
+      const item = describe(el, ++ref);
+      item.overlay = true; // 标注：来自浮层，帮助大模型理解这是弹层控件
+      map.set(ref, { el, inputEl: null, selector: item.selector, desc: (item.text || item.hint || item.role || item.tag).slice(0, 30) });
+      items.push(item);
+      return true;
+    };
+    for (const root of overlayRoots()) {
+      if (ref >= MAX_ELEMENTS) break;
+      // ① 语义可点后代（button/a/[aria-label]…）
+      for (const el of root.querySelectorAll(INTERACTIVE)) {
+        if (!overlayPush(el)) break;
+      }
+      // ② 裸图标按钮（div/span/svg…，无 button 标签、无文字/aria，仅 React onClick / 手型）：
+      //    弹层里的图标按钮通常是关闭 × 这类关键控件，不能因"没文字"就漏掉。
+      let scanned = 0;
+      const tw2 = document.createTreeWalker(root, NodeFilter.SHOW_ELEMENT);
+      let n2 = tw2.currentNode;
+      while ((n2 = tw2.nextNode()) && ref < MAX_ELEMENTS && scanned < 300) {
+        scanned++;
+        if (n2 === root || seen.has(n2) || n2.matches(INTERACTIVE)) continue;
+        // 图标字形/图片不是独立按钮（cursor:pointer 常从父按钮继承来），跳过以免拿一堆 svg 当按钮填满 ref
+        if (n2.tagName === 'SVG' || n2.tagName === 'USE' || n2.tagName === 'PATH' || n2.tagName === 'IMG') continue;
+        // 父级已是可点控件（button/链接/图标按钮已收），内部 box/text 不再重复收
+        let hasSeenP = false;
+        for (let p2 = n2.parentElement; p2 && p2 !== root; p2 = p2.parentElement) {
+          if (seen.has(p2)) { hasSeenP = true; break; }
+        }
+        if (hasSeenP) continue;
+        const st = getComputedStyle(n2);
+        if (st.display === 'none' || st.visibility === 'hidden' || st.opacity === '0') continue;
+        if (!hasClickHandler(n2) && st.cursor !== 'pointer') continue;
+        if (ref >= MAX_ELEMENTS) break;
+        seen.add(n2);
+        const item = describe(n2, ++ref);
+        item.overlay = true;
+        if (!item.hint) {
+          // 弹层惯例：顶部角落的小图标按钮多为关闭/收起（左上/右上都有）。有位置信号优先提示，
+          // 没有就退化成"点了看效果"。
+          const ir = n2.getBoundingClientRect();
+          const rr = root.getBoundingClientRect();
+          const topCorner = ir.top < rr.top + 80 && (ir.left < rr.left + 80 || ir.right > rr.right - 80);
+          item.hint = topCorner ? '(浮层顶部角落图标按钮：通常是关闭/收起)' : '(浮层图标按钮：无文字说明，点击看效果)';
+        }
+        map.set(ref, { el: n2, inputEl: null, selector: item.selector, desc: (item.text || item.hint || item.role || item.tag).slice(0, 30) });
+        items.push(item);
+      }
+      if (root.matches(INTERACTIVE)) overlayPush(root); // 遮罩本身可点（点空白处关闭）
+    }
 
     const nodes = document.querySelectorAll(INTERACTIVE);
     for (const el of nodes) {
@@ -428,6 +534,11 @@
       }
 
       if (!isVisible(el)) continue;
+      if (el.tagName === 'A') {
+        const k = dupKeyOf(el);
+        if (k && seenKey.has(k)) continue; // 重复链接（页脚/导航镜像）只收第一处；空 A 不去重
+        if (k) seenKey.add(k);
+      }
       seen.add(el);
       const item = describe(el, ++ref);
       map.set(ref, { el, inputEl, selector: item.selector, desc: (item.text || item.hint || item.role || item.tag).slice(0, 30) });
