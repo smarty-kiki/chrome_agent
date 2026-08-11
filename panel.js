@@ -112,11 +112,33 @@ function fmtTokens(n) {
   return String(n);
 }
 
-// 会话状态栏文案：状态标签 + 该会话 token 用量（有消耗时显示，如 "运行中… · 12.3k"）
+// 任务计时当前值（ms）：后台只存 { running, startAt, acc }，这里按墙钟实时补算；无计时器返回 null
+function cacheTimerMs(cache) {
+  const tm = cache.timer;
+  if (!tm) return null;
+  return (tm.acc || 0) + (tm.running ? Date.now() - (tm.startAt || Date.now()) : 0);
+}
+
+// 计时显示：mm:ss，超过一小时 h:mm:ss（纯文字，不用 emoji）
+function fmtTimer(ms) {
+  const s = Math.floor((ms || 0) / 1000);
+  const m = Math.floor(s / 60);
+  if (m >= 60) {
+    const h = Math.floor(m / 60);
+    return h + ':' + String(m % 60).padStart(2, '0') + ':' + String(s % 60).padStart(2, '0');
+  }
+  return m + ':' + String(s % 60).padStart(2, '0');
+}
+
+// 会话状态栏文案：状态标签 + token 用量（有消耗时）+ 任务用时（计时器存在时，如 "运行中… · 12.3k · 用时 03:45"）
 function statusText(cache, label) {
   const l = label != null ? label : cache.statusLabel;
+  const parts = [];
   const toks = cache.tokens || 0;
-  return toks > 0 ? l + ' · ' + fmtTokens(toks) : l;
+  if (toks > 0) parts.push(fmtTokens(toks));
+  const tms = cacheTimerMs(cache);
+  if (tms != null) parts.push('用时 ' + fmtTimer(tms));
+  return parts.length ? l + ' · ' + parts.join(' · ') : l;
 }
 
 // 统一在显示某会话状态时调用（状态栏 + 会话栏），确保 token 用量随状态一并刷新
@@ -528,6 +550,7 @@ function resetSessionUI(sid) {
   c.askMode = 'page';
   c.teachSteps = 0;
   c.tokens = 0; // 清空本会话：token 用量一并清零
+  c.timer = null; // 任务计时一并清空
   c.logs = []; // 大模型往返日志一并清空
   renderSessionBar();
   renderHeaderTokens();
@@ -834,6 +857,7 @@ function hydrateCache(s) {
   cache.askMode = s.askMode || 'page';
   cache.teachSteps = (s.teachEvents || []).length;
   cache.tokens = s.tokens || 0;
+  cache.timer = s.timer || null; // 任务计时器（面板本地按秒刷新显示）
   cache.logs = s.llmLogs || []; // 恢复大模型往返日志（切走/重开面板不丢）
   cache.status = (s.state === 'working' || s.state === 'awaiting_nav') ? 'working'
     : s.state === 'waiting_user' ? 'waiting_user' : 'idle';
@@ -946,6 +970,10 @@ async function init() {
         renderHeaderTokens();
         if (sid === activeSid) setSessionStatus(cache);
         break;
+      case 'TIMER': // 任务计时器状态变化（开始/暂停/恢复/停止/清空）
+        cache.timer = msg.timer || null;
+        if (sid === activeSid) setSessionStatus(cache);
+        break;
       case 'AGENT_TABS':
         cache.tabs = msg.tabs || [];
         if (sid === activeSid) renderTabs(cache.tabs);
@@ -975,6 +1003,12 @@ async function init() {
   chrome.tabs.onUpdated.addListener((_id, _info, tab) => {
     if (tab.active) refreshTab();
   });
+
+  // 任务计时本地秒级刷新：仅当前会话计时器运行时每秒重绘状态栏（开始/暂停/停止等变化靠后台 TIMER/AGENT_STATUS 广播驱动）
+  setInterval(() => {
+    const cache = sessionCache[activeSid];
+    if (cache && cache.timer && cache.timer.running) setSessionStatus(cache);
+  }, 1000);
 
   $('#input').focus();
 }

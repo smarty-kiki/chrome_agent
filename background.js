@@ -21,7 +21,7 @@ const DEFAULT_MODEL = 'deepseek-v4-flash'; // DeepSeek V4 Flash（deepseek-chat/
 const DEFAULT_TEMPERATURE = 0.2;
 const DEFAULT_MAX_STEPS = 25;
 const NAV_TIMEOUT_MS = 120000;   // 页面加载/跳转等待上限
-const MAX_AGENT_TABS = 8;        // Agent 自开标签上限，防止失控
+const MAX_AGENT_TABS = 20;       // Agent 自开标签上限，防止失控
 const HEARTBEAT_ALARM = 'pageagent-heartbeat';
 const MAX_STEP_LLM_RETRY = 4;    // 单步 LLM 输出解析失败的最大重试次数
 const MAX_SESSIONS = 5;          // 最多并发会话数（顶部会话栏可新建/切换）
@@ -163,7 +163,8 @@ async function createSession(tabId) {
     lastActSig: '',   // 最近一次执行（成功或失败）的页面动作签名，识别"反复执行同一个动作"的无进展循环
     stuck: 0,         // 无进展计数：连续失败/重复同一动作/空等累计，换新动作清零，>=STUCK_TEACH_LIMIT 转教我
     lastTipsHost: '',  // 本会话已显示"加载 x 个相关技巧"的站点（同一站点只提示一次，避免刷屏）
-    pageSnapCounts: {} // 页面熟悉度：pageKey(host+pathname) → 成功快照次数；动作失败会清零该页计数（恢复谨慎模式）
+    pageSnapCounts: {}, // 页面熟悉度：pageKey(host+pathname) → 成功快照次数；动作失败会清零该页计数（恢复谨慎模式）
+    timer: null, // 任务计时器：{ running, startAt, acc }；从任务发出开始计时、等你操作时暂停、finish 答案落定时停止（复盘不算）
   };
   tasks[sid] = t;
   await saveTasks();
@@ -519,8 +520,9 @@ function systemPrompt() {
 - 教我模式的复述确认阶段是个**确认循环**：使用者在对话里回复纠正或问题（如"不对""少了一步""第三步不是这样"）时，你要重新理解他的纠正、修正你对步骤的理解，再用 say 复述修正后的步骤、用 ask_user（mode=confirm）再次请他确认——循环会一直持续，直到他明确说「没问题/确认」放行，或说「不教了/算了」「你先去做吧/你自己来」终止教学（终止后按你当前理解的自行继续完成原始目标），或说「重新演示」要求重开演示。不要未经再次确认就擅自继续执行，也不要自行猜测调整步骤。
 - 教我模式记录到的输入值（账号、密码等）仅用于本轮复现使用者的演示，不要写入技巧库。
 - 需要跨页面或并行处理时，开多个标签分别操作，需要哪个就 switch_tab 过去。
+- 同一网址你已经在任务里打开过（list_tabs 里能看到）时，再次需要它直接 switch_tab 切过去复用，不要重复 open_tab 新开同一个页面——重复打开同一网址系统会直接切到已有标签。
 - 使用者问"我现在正在看哪个页面/我打开了哪些标签/在我已打开的某个标签里做 XX"时，先用 list_tabs 查看浏览器全部标签，再按需 use_tab 纳入并操作，不要新开标签重复打开使用者已有的页面。
-- 某个标签不再需要时 close_tab 关掉它，保持整洁；不要关闭 @MAIN/@U 等使用者的标签。
+- 已用完、确认后续不会再用的标签 close_tab 关掉它，保持整洁（如一次性搜索结果页、只读一次的临时页）；拿不准还会不会用就先留着——同一网址再次需要时能直接切回已开标签，但关掉重开会丢失页面上的状态。不要关闭 @MAIN/@U 等使用者的标签。
 - 目标是"总结/摘要"时：用 read 读取（可跨标签读取多个页面），然后 finish 输出简洁、结构化的中文总结。
 - 目标要求"保存为文件/导出/下载"时：用 save_file 把总结或抓取结果写成文件（文件名带合适的扩展名），保存后再 finish 告知使用者文件路径。
 - 任务涉及"我的书签/收藏"时：查询/盘点用 bookmarks_read（可指定 folder 只看某个文件夹）；要把某网址加入收藏用 bookmarks_write（folder 填目标文件夹名，不填就放"其他书签"）。
@@ -822,22 +824,74 @@ function currentEntry(t) {
   return ((t && t.tabs) || []).find((e) => e.ref === t.currentRef) || null;
 }
 
-// 解析当前操作标签的 tabId；若其已关闭则回退到主标签/第一个存活标签，仍无则返回 null
+// 通过本会话的标签组查真实存活的 Agent 自开标签：组归属即会话归属，比 t.tabs 记录更全、
+// 天然不会跨会话串（组按会话独立命名，查不到别的会话的组）。查不到组返回 []。
+async function findSessionAgentTabs(t) {
+  const gids = new Set();
+  if (t.groupId != null) gids.add(t.groupId);
+  try {
+    const groups = await chrome.tabGroups.query({});
+    for (const g of groups || []) if (g.title === t.groupTitle) gids.add(g.id);
+  } catch (e) {}
+  for (const gid of gids) {
+    try {
+      const tabs = await chrome.tabs.query({ groupId: gid });
+      if (tabs && tabs.length) return tabs;
+    } catch (e) {}
+  }
+  return [];
+}
+
+// 解析当前操作标签的 tabId。优先用当前任务标签；其次按本会话标签组查真实存活的 @T 自开标签
+// （组内查比扫 t.tabs 记录更全、且天然不会串到别的会话），再补 t.tabs 里的 @MAIN/@U 使用者标签；
+// 一个都不剩时自己开新标签接管——绝不报"任务标签页均已关闭"。
 async function resolveCurrentTabId(t) {
-  let entry = currentEntry(t);
+  const entry = currentEntry(t);
   if (entry) {
     const tab = await getTab(entry.tabId);
     if (tab) return entry.tabId;
     addLog(t.sid, '当前标签已关闭，自动切换…', true);
   }
+  // 1) 本会话标签组内的 Agent 自开标签（组归属即会话归属，天然不串；组内仍过一道归属校验作双保险）
+  for (const tab of await findSessionAgentTabs(t)) {
+    if (tab.id == null) continue;
+    if (entry && entry.tabId === tab.id) continue;
+    const owner = sessionOfTab(tab.id);
+    if (owner && owner !== t.sid) continue;
+    let rec = findTabEntryByTabId(tab.id, t);
+    if (!rec) {
+      rec = { ref: 'T' + ++t.tabSeq, tabId: tab.id, role: 'agent', title: tab.title || '', url: tab.url || '' };
+      t.tabs.push(rec); // 记录缺的组内标签补登记（worker 休眠等丢记录时自愈）
+      await saveTasks();
+      broadcastTabs(t);
+    }
+    setCurrentRef(t, rec.ref);
+    addLog(t.sid, '自动切换到其他标签', true);
+    return tab.id;
+  }
+  // 2) t.tabs 里的 @MAIN/@U 使用者标签（使用者标签不分组，只能从记录里找）
   for (const e of t.tabs || []) {
+    if (e.role === 'agent') continue; // 自开标签已由组查询覆盖
     if (e.ref === t.currentRef) continue;
     const tab = await getTab(e.tabId);
-    if (tab) {
-      t.currentRef = e.ref;
-      addLog(t.sid, '自动切换到其他标签', true);
-      return e.tabId;
-    }
+    if (!tab) continue;
+    const owner = sessionOfTab(e.tabId);
+    if (owner && owner !== t.sid) continue;
+    setCurrentRef(t, e.ref);
+    addLog(t.sid, '自动切换到其他标签', true);
+    return e.tabId;
+  }
+  // 3) 一个都不剩 → 自己开新标签接管，让 LLM 在受限页上自行决定打开哪（open_tab/search）。
+  //    先清掉已死的自开标签记录（避免撞 MAX_AGENT_TABS 上限），@MAIN/@U 的使用者记录保留不动。
+  const staleAgents = (t.tabs || []).filter((e) => e.role === 'agent');
+  if (staleAgents.length) {
+    t.tabs = t.tabs.filter((e) => e.role !== 'agent');
+  }
+  try {
+    const fresh = await openAgentTab('chrome://newtab/', '任务标签均已关闭，已自动开新标签', t);
+    return fresh.entry.tabId;
+  } catch (e) {
+    addLog(t.sid, '自动开新标签失败：' + e.message, true);
   }
   return null;
 }
@@ -871,24 +925,116 @@ function midTruncate(s, max) {
   return t.slice(0, keep) + '…' + t.slice(t.length - keep);
 }
 
-// 新开 Agent 后台标签（不抢焦点），并加入分组。display 为给使用者看的友好文案（search 用），缺省显示 url
+// 记录"最近使用"：currentRef 每次切换到一个标签都刷新 lastUseSeq，供撞上限时按"最久未用"淘汰
+// ---------------- 任务计时器 ----------------
+// 语义：从任务发出的那一刻开始计时；中间卡在使用者操作（waiting_user，含教我演示等待）时暂停；
+// 任务结束时停止（从发完完成/失败的文字那一刻冻结，之后跑复盘不算时间）。
+// 结构 { running, startAt, acc }：acc 为已冻结的活跃毫秒，running 时面板按 startAt 实时补算当前值。
+function timerElapsedMs(t) {
+  const tm = t && t.timer;
+  if (!tm) return null;
+  return tm.acc + (tm.running ? Date.now() - (tm.startAt || Date.now()) : 0);
+}
+function timerBegin(t) { // 新任务：清零重计
+  t.timer = { running: true, startAt: Date.now(), acc: 0 };
+  broadcastTimer(t);
+}
+function timerPause(t) { // 暂停：冻结已计部分（等你操作 / 任务到此停止）
+  const tm = t && t.timer;
+  if (!tm || !tm.running) return;
+  tm.acc = timerElapsedMs(t);
+  tm.running = false;
+  broadcastTimer(t);
+}
+function timerResume(t) { // 恢复计时（你操作完、Agent 继续跑）
+  const tm = t && t.timer;
+  if (!tm || tm.running) return;
+  tm.running = true;
+  tm.startAt = Date.now();
+  broadcastTimer(t);
+}
+function timerClear(t) { // 清空会话：计时归零
+  if (t) t.timer = null;
+  broadcastTimer(t);
+}
+function broadcastTimer(t) {
+  const tm = (t && t.timer) || null;
+  broadcast({ type: 'TIMER', timer: tm ? { running: tm.running, startAt: tm.startAt, acc: tm.acc } : null }, t && t.sid);
+}
+
+function setCurrentRef(t, ref) {
+  t.currentRef = ref;
+  const entry = findTabEntry(ref, t);
+  if (entry) {
+    t.useSeq = (t.useSeq || 0) + 1;
+    entry.lastUseSeq = t.useSeq;
+  }
+}
+
+// 撞 MAX_AGENT_TABS 上限时，自动淘汰本会话"最久未用"的 @T 标签腾位置。
+// 跳过当前正在操作的 currentRef 与正在等加载的 waitTabId；没有可淘汰的才抛错，交给模型自己 close_tab。
+async function evictLruAgentTab(t, reason) {
+  const cur = currentEntry(t);
+  const curId = cur ? cur.tabId : null;
+  const waitingId = t.state === 'awaiting_nav' ? t.waitTabId : null;
+  const candidates = (t.tabs || []).filter(
+    (e) => e.role === 'agent' && e.tabId !== curId && e.tabId !== waitingId
+  ).sort((a, b) => (a.lastUseSeq || 0) - (b.lastUseSeq || 0)); // 最久未用排最前
+  const victim = candidates[0];
+  if (!victim) {
+    throw new Error('Agent 自开标签已达上限（' + MAX_AGENT_TABS + '），且没有可自动淘汰的（当前正在使用的除外），请先 close_tab');
+  }
+  const tab = await getTab(victim.tabId);
+  if (tab) chrome.tabs.remove(victim.tabId).catch(() => {});
+  t.tabs = t.tabs.filter((e) => e.ref !== victim.ref);
+  await saveTasks();
+  addLog(t.sid, (reason || '自动淘汰最久未用的标签') + ' @' + victim.ref + '（' + shortUrl(victim.url) + '）');
+  broadcastTabs(t);
+  return victim;
+}
+
+// 同一 URL 已在本会话存活的 @T 标签里打开时返回该标签（否则 null）。只在"精确相同 URL"去重，
+// 避免误并不同页面；Agent 真需要全新实例时可用 navigate（重载）或先 close_tab 再 open_tab。
+async function findReusableAgentTab(url, t) {
+  const want = String(url || '').split('#')[0].replace(/\/+$/, ''); // 去 hash 和结尾斜杠后比较
+  for (const e of t.tabs || []) {
+    if (e.role !== 'agent') continue;
+    const tab = await getTab(e.tabId);
+    if (!tab || !tab.url) continue;
+    const owner = sessionOfTab(e.tabId); // 只在本会话内去重，不跨会话复用
+    if (owner && owner !== t.sid) continue;
+    if (String(tab.url).split('#')[0].replace(/\/+$/, '') === want) return e;
+  }
+  return null;
+}
+
+// 新开 Agent 后台标签（不抢焦点），并加入分组。display 为给使用者看的友好文案（search 用），缺省显示 url。
+// 返回 { entry, reused }：reused=true 表示本会话已有一个 tab 正停在这个 URL 上，直接切过去、没新开标签。
 async function openAgentTab(url, display, t) {
+  const t0 = performance.now();
+  const reused = await findReusableAgentTab(url, t);
+  if (reused) {
+    setCurrentRef(t, reused.ref);
+    await saveTasks();
+    addLog(t.sid, '页面已打开，切换过去 ' + shortUrl(url) + ' · ' + Math.round(performance.now() - t0) + 'ms');
+    broadcastTabs(t);
+    return { entry: reused, reused: true };
+  }
   const agentTabs = (t.tabs || []).filter((e) => e.role === 'agent');
   if (agentTabs.length >= MAX_AGENT_TABS) {
-    throw new Error('Agent 自开标签已达上限（' + MAX_AGENT_TABS + '），请先 close_tab');
+    await evictLruAgentTab(t, '自开标签已达上限，自动淘汰最久未用'); // 腾一个位置再开
   }
-  const t0 = performance.now();
   const tab = await chrome.tabs.create({ url, active: false });
   const ms = Math.round(performance.now() - t0);
   const ref = 'T' + ++t.tabSeq;
   const entry = { ref, tabId: tab.id, role: 'agent', title: tab.title || '', url: tab.url || url };
   t.tabs.push(entry);
-  t.currentRef = ref;
+  setCurrentRef(t, ref);
   await addToGroup(tab.id, t);
   await saveTasks();
   addLog(t.sid, (display || '打开 ' + shortUrl(url)) + ' · ' + ms + 'ms');
   broadcastTabs(t);
-  return entry;
+  return { entry, reused: false };
 }
 
 async function addToGroup(tabId, t) {
@@ -993,6 +1139,7 @@ async function listAllTabs(t) {
     const marks = [];
     if (tab.id === active) marks.push('[当前选中]');
     if (taskIds.has(tab.id)) marks.push('[任务内@' + byRef.get(tab.id) + ']');
+    else if (sessionOfTab(tab.id)) marks.push('[他会话]'); // 其他任务会话的标签：use_tab 会拒绝，标注让模型别去用
     if (isRestrictedUrl(tab.url)) marks.push('[受限，无法操作]');
     const title = (tab.title || '').trim().slice(0, 40);
     const urlTxt = isRestrictedUrl(tab.url) ? String(tab.url).slice(0, 60) : shortUrl(tab.url);
@@ -1926,15 +2073,16 @@ async function runAction(t, a) {
       await pushFailure(t, 'open_tab 地址无效：' + a.url);
       return;
     }
-    let entry;
+    let res;
     try {
-      entry = await openAgentTab(a.url, null, t);
+      res = await openAgentTab(a.url, null, t);
     } catch (e) {
       await pushFailure(t, e.message);
       return;
     }
     if (!stillCurrent(t, myTurn)) return;
-    awaitNav(t, entry.tabId);
+    if (res.reused) nextStepOrBatch(t, myTurn); // 同 URL 已有标签：页面就绪，直接续步
+    else awaitNav(t, res.entry.tabId);
     return;
   }
 
@@ -1949,15 +2097,16 @@ async function runAction(t, a) {
     const url = template.includes('{q}')
       ? template.replace(/\{q\}/g, encodeURIComponent(query))
       : template + encodeURIComponent(query);
-    let entry;
+    let res;
     try {
-      entry = await openAgentTab(url, '搜索「' + query + '」', t);
+      res = await openAgentTab(url, '搜索「' + query + '」', t);
     } catch (e) {
       await pushFailure(t, e.message);
       return;
     }
     if (!stillCurrent(t, myTurn)) return;
-    awaitNav(t, entry.tabId);
+    if (res.reused) nextStepOrBatch(t, myTurn);
+    else awaitNav(t, res.entry.tabId);
     return;
   }
 
@@ -1969,7 +2118,7 @@ async function runAction(t, a) {
       await pushFailure(t, '要切换的标签不存在或已关闭（ref=' + a.ref + '），先用 list_tabs 查看当前可用标签再切换（@MAIN 一直可用）', true);
       return;
     }
-    t.currentRef = entry.ref;
+    setCurrentRef(t, entry.ref);
     const ms = Math.round(performance.now() - t0);
     addLog(t.sid, '切换标签 · ' + ms + 'ms');
     await saveTasks();
@@ -2007,6 +2156,11 @@ async function runAction(t, a) {
       await pushFailure(t, '要纳入的标签不存在或已关闭（tabId=' + tabId + '），先 list_tabs 刷新后再选', true); // 内部纠错，不刷用户面板
       return;
     }
+    const owner = sessionOfTab(tabId);
+    if (owner && owner !== t.sid) {
+      await pushFailure(t, 'use_tab 不能纳入其他会话的标签（避免两个 Agent 同时操作同一页面），请只选标记为「任务内@」的标签', true); // 内部纠错，不刷用户面板
+      return;
+    }
     let adoptedRef;
     const existing = findTabEntryByTabId(tabId, t);
     if (existing) {
@@ -2015,7 +2169,7 @@ async function runAction(t, a) {
       adoptedRef = 'U' + (++t.userTabSeq);
       t.tabs.push({ ref: adoptedRef, tabId, role: 'user', title: tab.title || '', url: tab.url || '' });
     }
-    t.currentRef = adoptedRef;
+    setCurrentRef(t, adoptedRef);
     t.history.push({ role: 'user', content: '已把浏览器标签纳入任务：@' + adoptedRef + ' ' + (tab.title || shortUrl(tab.url)) + '（当前操作标签，未切浏览器前台）' });
     const ms = Math.round(performance.now() - t0);
     addLog(t.sid, '纳入标签（' + (tab.title || shortUrl(tab.url)).slice(0, 30) + '） · ' + ms + 'ms');
@@ -2299,24 +2453,32 @@ async function runAction(t, a) {
   // 点击的链接是 target="_blank"（会新开页面）→ content 已截获，改为后台打开并纳入 @T：
   // 不抢浏览器焦点，且算 Agent 自开标签（本轮结束随分组一起清理）。
   if (res.openTab) {
-    let entry;
+    let resTab;
     const label = (res.label || '').trim();
     const display = label
       ? ('点击「' + label + '」→ 后台打开 ' + shortUrl(res.openTab))
       : ('点击 → 后台打开 ' + shortUrl(res.openTab));
     try {
-      entry = await openAgentTab(res.openTab, display, t);
+      resTab = await openAgentTab(res.openTab, display, t);
     } catch (e) {
       await pushFailure(t, e.message, false, sig);
       return;
     }
     if (!stillCurrent(t, myTurn)) return;
     t.failStreak = 0;
-    t.history.push({
-      role: 'user',
-      content: '点击的链接会新开页面，已在后台打开为 @' + entry.ref + '（' + shortUrl(res.openTab) + '），属 Agent 自开标签，本轮结束自动关闭'
-    });
-    awaitNav(t, entry.tabId);
+    if (resTab.reused) {
+      t.history.push({
+        role: 'user',
+        content: '点击的链接目标已在 @' + resTab.entry.ref + ' 打开，直接切换过去（' + shortUrl(res.openTab) + '）'
+      });
+      nextStepOrBatch(t, myTurn);
+    } else {
+      t.history.push({
+        role: 'user',
+        content: '点击的链接会新开页面，已在后台打开为 @' + resTab.entry.ref + '（' + shortUrl(res.openTab) + '），属 Agent 自开标签，本轮结束自动关闭'
+      });
+      awaitNav(t, resTab.entry.tabId);
+    }
     return;
   }
 
@@ -2419,6 +2581,7 @@ async function askUser(t, msg, mode) {
   let tabId = null;
   if (needForeground) tabId = await resolveCurrentTabId(t);
   if (!t || t.turnId !== myTurn || t.state !== 'working') return; // 已被新指令打断
+  timerPause(t); // 等你操作（含教我演示等待）：计时暂停
   t.state = 'waiting_user';
   t.askText = String(msg);
   t.askMode = isTeach ? 'teach' : (isReply ? 'reply' : (isConfirm ? 'confirm' : 'page'));
@@ -2741,6 +2904,7 @@ function tryResume(sid, tabId) {
 async function complete(t, result) {
   if (!t) return;
   if (t.state === 'idle') return; // 已被新指令打断/停止
+  timerPause(t); // 完成文字落定的这一刻停止计时；之后跑复盘不再计入
   t.state = 'idle';
   await closeAgentTabs(t).catch(() => {}); // 每轮完成自动关闭 Agent 自开标签（使用者的标签永不关闭）
   t.turnSteps = 0;
@@ -2760,6 +2924,7 @@ async function complete(t, result) {
 async function fail(t, msg) {
   if (!t) return;
   if (t.state === 'idle') return; // 已被新指令打断/停止
+  timerPause(t); // 失败文字落定的这一刻停止计时
   t.state = 'idle';
   await closeAgentTabs(t).catch(() => {}); // 每轮失败也清理 Agent 自开标签（使用者的标签永不关闭）
   t.turnSteps = 0;
@@ -2817,6 +2982,7 @@ async function enterTeachMode(t, content, tabId) {
       addLog(t.sid, '教你模式：把当前前台标签纳入任务（@' + ref + '）');
     }
   }
+  if (!midTask) timerBegin(t); // 空闲发起的教我 = 新任务，开始计时（随后 askUser 等待演示时会暂停）
   t.turnId++;
   t.state = 'working'; // 临时置 working（覆盖 idle/done/waiting_user），让 askUser 的校验通过
   t.turnSteps = 0;
@@ -2867,6 +3033,7 @@ async function processUserMessage(sid, text, tabId) {
       t.askText = null;
       t.waitTabId = null;
       t.teachEvents = []; // 未确认的教学步骤不沉淀
+      timerResume(t); // 终止教学、继续原任务：计时恢复
       t.state = 'working';
       t.turnSteps = 0;
       t.failStreak = 0;
@@ -2901,6 +3068,7 @@ async function processUserMessage(sid, text, tabId) {
     t.askMode = null;
     t.askText = null;
     t.waitTabId = null;
+    timerResume(t); // 纠正循环重开：计时恢复
     t.state = 'working';
     t.turnSteps = 0;
     t.failStreak = 0;
@@ -2928,6 +3096,7 @@ async function processUserMessage(sid, text, tabId) {
 
   // 对话回复模式：Agent 正等使用者在对话里回复信息，此消息当作回复继续当前回合（不是新指令）
   if (t.state === 'waiting_user' && t.waitingReply) {
+    timerResume(t); // 你回复完、Agent 继续：计时恢复
     t.state = 'working';
     t.waitingReply = false;
     t.askMode = null;
@@ -2950,6 +3119,8 @@ async function processUserMessage(sid, text, tabId) {
   if (t.state === 'working' || t.state === 'awaiting_nav' || t.state === 'waiting_user') {
     addLog(t.sid, '收到新指令，打断当前操作…');
   }
+  // 任务计时：闲置时收到指令 = 新任务（清零重计）；执行中/等待中的补充指令 = 同一任务续跑（恢复计时）
+  if (t.state === 'idle') timerBegin(t); else timerResume(t);
   t.turnId++;
   t.state = 'working';
   t.turnSteps = 0;
@@ -3003,6 +3174,7 @@ async function stopCurrent(sid) {
     const myTurn = t.turnId; // 钉住被停止回合的号，供停止后复盘判定是否被打断
     const reviewSteps = t.turnSteps; // 复盘进度行要报"本次完成 N 步动作"，下面会清零 turnSteps，先留住
     await stopTeachRecording(t); // 教我模式停止时一并停止录制
+    timerPause(t); // 主动停止：计时冻结在当前值（复盘不追加）
     t.state = 'idle';
     t.waitTabId = null;
     t.askText = null;
@@ -3103,6 +3275,7 @@ async function resumeAfterUser(sid, confirmedText) {
     t.teachEvents = events;
     t.askMode = null;
     t.askText = null;
+    timerResume(t); // 演示录完、Agent 接手复述：计时恢复
     t.state = 'working';
     t.turnSteps = 0;
     t.failStreak = 0;
@@ -3157,6 +3330,7 @@ async function resumeAfterUser(sid, confirmedText) {
   }
 
   t.askMode = null;
+  timerResume(t); // 你操作完/确认完，Agent 继续：计时恢复
   t.state = 'working';
   t.turnSteps = 0;
   t.failStreak = 0;
@@ -3181,6 +3355,7 @@ async function clearConversation(sid) {
   await stopTeachRecording(t); // 清空时停止教我模式的录制
   await closeAgentTabs(t).catch(() => {}); // 关 Agent 自开 @T 标签并删分组（使用者的 @MAIN/@U 永不关闭）
   t.turnId++; // 使旧回合的任何在途异步链自行退出
+  timerClear(t); // 清空会话：计时归零
   t.state = 'idle';
   t.waitTabId = null;
   t.goal = '';
@@ -3294,7 +3469,8 @@ function serializeSession(t) {
     error: t.error,
     startedAt: t.startedAt,
     finishedAt: t.finishedAt,
-    tokens: t.tokens || 0
+    tokens: t.tokens || 0,
+    timer: t.timer || null
   };
 }
 
