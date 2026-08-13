@@ -110,7 +110,7 @@ Agent 自己开后台标签、自己编排：
 | 能力 | 说明 |
 | --- | --- |
 | 页面理解 | 实时 DOM 快照（可交互元素 + 正文摘要），动态渲染 / 随机类名 / 手型 div 按钮全能识别 |
-| 页面操作 | 点击 / 输入 / 下拉选择 / 滚动 / 按键 / 悬浮（显示悬浮才出现的菜单、行内按钮）/ 跳转页面 |
+| 页面操作 | 点击 / 输入 / 下拉选择 / 滚动 / 按键 / 悬浮（显示悬浮才出现的菜单、行内按钮）/ 强制显示（show 隐藏菜单、用后还原）/ 跳转页面 |
 | 画布读取 | 拦截 canvas 绘制，画布文字带坐标进快照，可点选画布位置 |
 | 表格编辑 | 识别单元格名称框、按格号跳格（`gotoCell`）、`F2` / 双击就地编辑、读回验证 |
 | 跨页执行 | 后台开标签、跨标签继续同一任务、上下文跨页保留 |
@@ -182,7 +182,7 @@ canvas-hook.js     画布文字钩子（document_start + MAIN world，拦截 fil
 
 **复盘**：`finish` 时并行做两件事——① 书签复盘：把本轮实际访问过的网站筛出有用的写入书签（新站收藏 / 已收藏合并改进标题，一律存网站根 URL）；② 技巧复盘：统计各站点的动作数 / 失败数，对「反复失败 ≥2 次或绕弯 ≥4 次」的站点总结成技巧，与既有技巧冲突去重合并后存储。
 
-**动作集**：标签 `open_tab` / `search` / `switch_tab` / `list_tabs` / `use_tab` / `close_tab`；页面 `click` / `hover` / `type` / `select` / `scroll` / `read` / `wait` / `keypress` / `navigate` / `dblclickAt` / `gotoCell`；结果 `save_file`；书签 `bookmarks_read` / `bookmarks_write` / `bookmark_find`；求助 `ask_user`（`page` / `reply` / `teach` / `confirm`）；消息 `say`；结束 `finish`。
+**动作集**：标签 `open_tab` / `search` / `switch_tab` / `list_tabs` / `use_tab` / `close_tab`；页面 `click` / `hover` / `show` / `hide` / `type` / `select` / `scroll` / `read` / `wait` / `keypress` / `navigate` / `dblclickAt` / `gotoCell`；结果 `save_file`；书签 `bookmarks_read` / `bookmarks_write` / `bookmark_find`；求助 `ask_user`（`page` / `reply` / `teach` / `confirm`）；消息 `say`；结束 `finish`。
 
 > Agent 会**先判题**：当前页与任务无关时（如「搜索 DeepSeek 资讯并总结」），不会在当前页瞎操作，而是用 `search` 后台开搜索页或 `open_tab` 直接开站；只有任务确实发生在当前页时才在当前页操作。
 

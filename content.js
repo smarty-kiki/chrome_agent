@@ -21,6 +21,46 @@
   const TEXT_LIMIT = 6000;   // 正文摘要长度上限
   const READ_LIMIT = 6000;   // read 动作单次返回文本上限
 
+  // ---- 页脚税过滤 ----
+  // 快照正文摘要 / read 默认去掉"站点恒定导航/页脚/法务备案"这类跨站噪音：它们每张快照都重复出现、
+  // 信息量极低却白白吃掉上下文（如小红书超长 ICP 备案块一次 ~800 字符）。判断信号全通用、不特判站点：
+  // ①结构信号——<footer> 容器；②文案信号——"备案/经营许可/举报/算法备案"类硬特征法务块（几乎不会出现在正文里）。
+  // 页脚并非完全无用：read 动作带 raw:true 可取完整原文（见 read 动作实现）。
+  const FOOTER_LEGAL_RE = /ICP备案|ICP备|公网安备|增值电信业务经营许可证|违法不良信息举报|网上有害信息举报|互联网药品信息服务|网络文化经营许可证|医疗器械网络交易服务第三方平台备案|个性化推荐算法|网信算备/;
+  const FOOTER_LEGAL_MAX = 2000; // 法务块文本上限：超过视为正文（正文偶尔提一句备案/许可，不应整块丢弃）
+
+  // 去掉根元素内的页脚税：删 <footer> 容器 + 叶子级"法务块"。只测叶子（无元素子节点）避免 O(子树) 的重复判读。
+  function stripFooterTax(root) {
+    root.querySelectorAll('footer').forEach((n) => n.remove());
+    const nodes = root.querySelectorAll('*');
+    for (const el of nodes) {
+      if (el.children.length) continue;
+      const t = (el.textContent || '').replace(/\s+/g, '');
+      if (t && t.length < FOOTER_LEGAL_MAX && FOOTER_LEGAL_RE.test(t)) el.remove();
+    }
+  }
+
+  // 剥掉程序性内容（脚本/样式/模板/注释）：innerText 本就不含它们，但 innerText 为空时会回退 textContent，
+  // 把扩展注入的桥接 <script> 源码当正文捞进来（第一张快照拍到 iframe 页时即如此）。脚本源码永远不是要读的正文。
+  function stripNonText(root) {
+    root.querySelectorAll('script, style, noscript, template').forEach((n) => n.remove());
+    return root;
+  }
+
+  // 取元素/页面文本：默认去页脚税+程序性内容（raw=false）；raw=true 返回含页脚的完整原文（同样剥脚本源码）。
+  // 两条路径都从 clone 提取：统一剥脚本后，即使 innerText 为空回退 textContent 也不会捞进脚本。
+  function pageText(el, raw) {
+    if (!el) return '';
+    try {
+      const clone = el.cloneNode(true);
+      stripNonText(clone);
+      if (!raw) stripFooterTax(clone);
+      return (clone.innerText || clone.textContent || '');
+    } catch (e) {
+      return (el.innerText || el.textContent || '');
+    }
+  }
+
   const INTERACTIVE = [
     'a', 'button', 'input', 'select', 'textarea', 'summary',
     '[role="button"]', '[role="link"]', '[role="checkbox"]', '[role="radio"]',
@@ -378,6 +418,43 @@
     return 'A|' + text + '|' + href;
   }
 
+  // 把画布钩子条目换算成"主画布范围内 + 可见"的 {rect,text}（含视口坐标），供快照与 read 共用。
+  // 坐标换算：钩子给的是 canvas 设备坐标（bitmap 像素），先按主画布 bitmap/CSS 缩放比转成 CSS 像素，
+  // 再加画布左上角视口偏移，得到可直接用于 clickAt 的视口坐标。中间渲染层（display:none）画的坐标
+  // 不可信、小画布（滚动条/占位）画的不算正文，都滤掉。
+  function canvasBlockFrom(entries) {
+    if (!Array.isArray(entries) || !entries.length) return null;
+    try {
+      let main = null, mainArea = 0;
+      for (const cv of document.querySelectorAll('canvas')) {
+        const r = cv.getBoundingClientRect();
+        if (r.width > 60 && r.height > 60 && r.width * r.height > mainArea) { main = cv; mainArea = r.width * r.height; }
+      }
+      if (!main) return null;
+      const r = main.getBoundingClientRect();
+      const sx = main.width > 0 ? r.width / main.width : 1;
+      const sy = main.height > 0 ? r.height / main.height : 1;
+      const text = [];
+      for (const e of entries) {
+        if (e.v === 0) continue;
+        if (e.x < 0 || e.y < 0 || e.x > main.width || e.y > main.height) continue;
+        if (text.length >= 400) break;
+        text.push({ t: e.t.slice(0, 120), x: Math.round(r.left + e.x * sx), y: Math.round(r.top + e.y * sy), f: e.f || '' });
+      }
+      return text.length
+        ? { rect: { left: Math.round(r.left), top: Math.round(r.top), width: Math.round(r.width), height: Math.round(r.height) }, text }
+        : null;
+    } catch (e) { return null; }
+  }
+
+  // read 整页时并入画布文字：只读共享缓冲、不消费（不 flush/reset 钩子），下一张快照仍能取到画布文字。
+  function canvasTextForRead() {
+    if (!canvasTextBuffer.length) return '';
+    const block = canvasBlockFrom(canvasTextBuffer);
+    if (!block) return '';
+    return block.text.map((it) => it.t).join('\n');
+  }
+
   function buildSnapshot(canvasEntries, offset = 0) {
     // 翻页窗口：本轮收集绝对位置 offset+1..offset+MAX_ELEMENTS 的元素，收集完统一重排回 1..N
     const limit = offset + MAX_ELEMENTS;
@@ -614,7 +691,7 @@
       }
     }
 
-    const bodyText = (document.body ? document.body.innerText : '')
+    const bodyText = pageText(document.body, false) // 默认去页脚税（导航/页脚/法务备案不污染正文摘要）
       .replace(/\s+/g, ' ')
       .trim()
       .slice(0, TEXT_LIMIT);
@@ -632,34 +709,8 @@
         else if (f.hasAttribute && f.hasAttribute('srcdoc')) iframeSrcs.push('[srcdoc]');
       }
     } catch (e) {}
-    // 画布文字块：把钩子收到的条目换算成视口坐标，只保留"主画布范围内 + 可见画布画的"——
-    // 中间渲染层（display:none）画的坐标不可信、小画布（滚动条/占位）画的不算正文，都滤掉。
-    // 坐标换算：钩子给的是 canvas 设备坐标（bitmap 像素），先按主画布 bitmap/CSS 缩放比转成 CSS 像素，
-    // 再加画布左上角视口偏移，得到可直接用于 clickAt 的视口坐标。
-    const canvasBlock = (() => {
-      if (!Array.isArray(canvasEntries) || !canvasEntries.length) return null;
-      try {
-        let main = null, mainArea = 0;
-        for (const cv of document.querySelectorAll('canvas')) {
-          const r = cv.getBoundingClientRect();
-          if (r.width > 60 && r.height > 60 && r.width * r.height > mainArea) { main = cv; mainArea = r.width * r.height; }
-        }
-        if (!main) return null;
-        const r = main.getBoundingClientRect();
-        const sx = main.width > 0 ? r.width / main.width : 1;
-        const sy = main.height > 0 ? r.height / main.height : 1;
-        const text = [];
-        for (const e of canvasEntries) {
-          if (e.v === 0) continue;
-          if (e.x < 0 || e.y < 0 || e.x > main.width || e.y > main.height) continue;
-          if (text.length >= 400) break;
-          text.push({ t: e.t.slice(0, 120), x: Math.round(r.left + e.x * sx), y: Math.round(r.top + e.y * sy), f: e.f || '' });
-        }
-        return text.length
-          ? { rect: { left: Math.round(r.left), top: Math.round(r.top), width: Math.round(r.width), height: Math.round(r.height) }, text }
-          : null;
-      } catch (e) { return null; }
-    })();
+    // 画布文字块：把钩子收到的条目换算成视口坐标，只保留"主画布范围内 + 可见画布画的"（见 canvasBlockFrom）。
+    const canvasBlock = canvasBlockFrom(canvasEntries);
     // 翻页窗口重排：本轮编号是绝对位置 offset+1..offset+N，统一重排回 1..N 并重建 refMap，
     // 让 ref 永远指"本次快照窗口里的第几个"，与单窗口语义一致（子窗口合并、click 定位都不受影响）。
     if (offset > 0 && items.length) {
@@ -912,6 +963,171 @@
     try { if (typeof el.focus === 'function') el.focus(); } catch (e) {}
   }
 
+  // ---------------- show / hide：强制显示"悬浮/隐藏才出现"的元素 ----------------
+  // 纯 CSS `:hover` 才显示的菜单（display:none → :hover 显示）合成事件触发不了，hover 动作对它无效；
+  // show 用改 inline style 的方式把它焊成常驻可见（inline style 优先级最高，不会被 hover CSS 覆盖），
+  // 操作完用 hide 精确还原。只改样式不执行代码、副作用最小；页面刷新后 inline style 自然失效自动复原。
+  const shownEls = new Map(); // element -> 原始 style 属性（null=原本没有 inline style），hide 据此精确还原
+
+  // display:none 强制改可见时的合理默认值：直接改 block 对表格元素是无效值会破坏布局，按标签给对应值
+  const DISPLAY_DEFAULTS = { TR: 'table-row', TD: 'table-cell', TH: 'table-cell', LI: 'list-item' };
+
+  // 强制显示单个元素：把"挡住显示"的三个属性改成可见值（display:none→对应默认 / visibility→visible / opacity:0→1）。
+  // 首次动到的元素先记下原始 inline style，hide 时整体还原（含页面原有样式）。
+  function forceShowElement(el) {
+    try {
+      if (!el || el.nodeType !== 1) return false;
+      if (!shownEls.has(el)) shownEls.set(el, el.getAttribute('style'));
+      let changed = false;
+      const cs = getComputedStyle(el);
+      if (cs.display === 'none') { el.style.display = DISPLAY_DEFAULTS[el.tagName] || 'block'; changed = true; }
+      if (cs.visibility === 'hidden' || cs.visibility === 'collapse') { el.style.visibility = 'visible'; changed = true; }
+      if (parseFloat(cs.opacity) === 0) { el.style.opacity = '1'; changed = true; }
+      return changed;
+    } catch (e) { return false; }
+  }
+
+  // 强制显示"元素自身 + 隐藏的祖先链"：菜单项常被 display:none 的父容器包着，只改自己仍看不见。
+  // 从最外层往内改（外层不先可见，内层改了也没用）。返回实际动过的元素数（0=本来就是可见的）。
+  function forceShowChain(el) {
+    const chain = [];
+    let cur = el;
+    while (cur && cur !== document.documentElement) {
+      let hidden = false;
+      try {
+        const cs = getComputedStyle(cur);
+        hidden = cs.display === 'none' || cs.visibility === 'hidden' || cs.visibility === 'collapse' || parseFloat(cs.opacity) === 0;
+      } catch (e) { hidden = true; }
+      if (hidden) chain.push(cur);
+      if (cur === document.body) break;
+      cur = cur.parentElement;
+    }
+    let changed = 0;
+    for (const n of chain.reverse()) { if (forceShowElement(n)) changed++; }
+    return changed;
+  }
+
+  function restoreElement(el) {
+    const orig = shownEls.get(el);
+    if (orig == null) el.removeAttribute('style');
+    else el.setAttribute('style', orig);
+    shownEls.delete(el);
+  }
+
+  // 还原单个元素及其被 show 强制显示的祖先链（show 带 target 对应的 hide）
+  function restoreShownChain(el) {
+    let n = 0;
+    const els = [el];
+    let cur = el.parentElement;
+    while (cur && cur !== document.documentElement) {
+      els.push(cur);
+      if (cur === document.body) break;
+      cur = cur.parentElement;
+    }
+    for (const e of els) { if (shownEls.has(e)) { restoreElement(e); n++; } }
+    return n;
+  }
+
+  // 还原本窗口全部被 show 过的元素（hide 不带 target；页面已移除的元素只清记录）
+  function restoreAllShown() {
+    let n = 0;
+    for (const el of Array.from(shownEls.keys())) {
+      if (document.contains(el)) { restoreElement(el); n++; }
+      else shownEls.delete(el);
+    }
+    return n;
+  }
+
+  // 按文字找隐藏元素（show 用）：与 findElementByText 相反，不滤隐藏，专找"悬浮/隐藏才出现"的菜单项。
+  // 纯 CSS :hover 显示的菜单在 DOM 里就是 display:none / visibility:hidden，文字照样能扫到。
+  // 命中优先取"可点 + 当前不可见"者（最像"悬浮才显示"的菜单项），其次任意不可见命中，最后文本最短匹配兜底。
+  function findHiddenElementByText(text) {
+    const target = String(text || '').replace(/\s+/g, ' ').trim();
+    if (!target || !document.body) return null;
+    const cands = [];
+    let checked = 0;
+    const w = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
+    let n;
+    while ((n = w.nextNode()) && checked++ < 4000) {
+      const s = String(n.nodeValue || '').replace(/\s+/g, ' ').trim();
+      if (s.indexOf(target) !== -1) {
+        const p = n.parentElement;
+        if (p) cands.push({ el: p, len: s.length });
+      }
+    }
+    checked = 0;
+    const w2 = document.createTreeWalker(document.body, NodeFilter.SHOW_ELEMENT);
+    let m;
+    while ((m = w2.nextNode()) && checked++ < 4000) {
+      const s = String(m.textContent || '').replace(/\s+/g, ' ').trim();
+      if (s.indexOf(target) !== -1) cands.push({ el: m, len: s.length });
+    }
+    cands.sort((x, y) => x.len - y.len);
+    for (const c of cands) {
+      if (c.len > Math.max(target.length * 4, 30)) break;
+      if (isLikelyClickable(c.el) && !isVisible(c.el)) return c.el;
+    }
+    for (const c of cands) {
+      if (c.len > Math.max(target.length * 3, 20)) break;
+      if (!isVisible(c.el)) return c.el;
+    }
+    return cands.length ? cands[0].el : null; // 兜底：文本最短匹配（可见的也算，强制显示它本身或隐藏祖先）
+  }
+
+  // 动作后的页面稳定等待（事件驱动，非固定延时）：会触发跳转或重渲染的动作——Enter/Tab/Escape/空格这类"提交/
+  // 关闭"键、scroll 滚动触发懒加载、click 触发的 SPA 状态切换——执行后，页面往往异步跳转或重渲染。若不等渲染完
+  // 就返回，background 紧接着拍的快照会拍到动作前的旧页面，模型就基于旧页面乱点（如点击已失效的无名按钮）而失败。
+  // 机制：MutationObserver 监听 DOM 变更，连续 SETTLE_QUIET_MS 无变更（渲染静止）即认为稳定；
+  // URL 变化视为跳转进行中，重置静默计时再等渲染；整页导航（pagehide）立即放行，交给 background 的 awaitNav；
+  // SETTLE_MAX_MS 仅为防挂死上限（页面持续动画/懒加载时兜底），正常路径远到不了它。
+  const SETTLE_QUIET_MS = 300; // DOM 连续静默此毫秒数视为渲染稳定（事件驱动的静默窗口，非总等待时长）
+  const SETTLE_MAX_MS = 2500;  // 兜底上限：防止页面永不静止（无限滚动/动画/懒加载）时本步挂死
+  const KEYPRESS_NAV_KEYS = new Set(['Enter', 'Tab', 'Escape', ' ', 'Space']); // 可能触发跳转/重渲染的按键（仅 keypress 用）
+  function settlePage() {
+    return new Promise((resolve) => {
+      let done = false;
+      let last = Date.now();
+      let lastUrl = location.href;
+      const url0 = location.href; // 进入本动作时的 URL，用于判断本次动作是否触发了跳转
+      let mutated = false;       // 静默窗口内 DOM 是否有过变更
+      let timer = null;
+      let maxTimer = null;
+      const finish = () => {
+        if (done) return;
+        done = true;
+        clearTimeout(timer);
+        clearTimeout(maxTimer);
+        obs.disconnect();
+        window.removeEventListener('pagehide', onPageHide);
+        // changed=本次动作是否产生了可观察变化（URL 跳转或 DOM 重渲染）。click 用它告知模型
+        // "这次点击到底有没有生效"：全 false 说明是死点（点了没反应），模型据此换招，别对死点反复试。
+        resolve({ changed: mutated || location.href !== url0 });
+      };
+      const arm = () => { // DOM 有变更：记下变化、静默计时归零，重新数 QUIET_MS
+        mutated = true;
+        last = Date.now();
+        clearTimeout(timer);
+        timer = setTimeout(check, SETTLE_QUIET_MS);
+      };
+      const check = () => {
+        const now = Date.now();
+        if (location.href !== lastUrl) { // URL 已变 = 跳转进行中，重置计时等跳转后的渲染稳定
+          lastUrl = location.href;
+          last = now;
+        }
+        const remain = SETTLE_QUIET_MS - (now - last);
+        if (remain <= 0) finish();
+        else { clearTimeout(timer); timer = setTimeout(check, remain); }
+      };
+      const onPageHide = () => finish(); // 整页导航：本上下文即将销毁，放行由 background awaitNav 接管
+      const obs = new MutationObserver(arm);
+      obs.observe(document.documentElement, { childList: true, subtree: true, characterData: true, attributes: true });
+      window.addEventListener('pagehide', onPageHide);
+      timer = setTimeout(check, SETTLE_QUIET_MS);
+      maxTimer = setTimeout(finish, SETTLE_MAX_MS);
+    });
+  }
+
   async function executeActionInner(a) {
     switch (a.action) {
       case 'click': {
@@ -934,7 +1150,10 @@
         try { el.scrollIntoView({ block: 'center' }); } catch (e) {}
         fireClick(el);
         focusEl(el);
-        return { ok: true, label: elementLabel(el) };
+        // 点击常触发 SPA 跳转/弹层/状态切换，DOM 会异步重渲染：等页面稳定再返回，避免下个快照拍到点击前的旧页面。
+        // settled.changed=false 说明点击没产生可观察变化（URL 没变、DOM 没动）= 死点，模型据此换招。
+        const settled = await settlePage();
+        return { ok: true, label: elementLabel(el), changed: !!settled.changed };
       }
 
       case 'clickAt': { // 按视口坐标点击：画布文字钩子给出坐标后，点画布上具体位置/单元格（内容不在 DOM，无法用 ref 定位）
@@ -1060,7 +1279,7 @@
         const raw = String(a.text || '').trim();
         if (!raw) return { ok: false, message: 'clickText 缺少要点的文字 text' };
         const el = findElementByText(raw);
-        if (!el) return { ok: false, message: '页面上没找到文字「' + raw.slice(0, 30) + '」' };
+        if (!el) return { ok: false, message: '页面上没找到文字「' + raw.slice(0, 30) + '」——它可能已随列表滚动被回收（虚拟列表只保留视口附近的项），先 scroll 让列表项回到页面再重试 clickText' };
         // 从命中文字向上找最近的"可点"元素（自身或祖先：a/button/[role]/绑了点击处理器/手型），
         // 找不到可点的就点命中元素本身——兜底本就允许赌一把。
         let target = el;
@@ -1092,6 +1311,38 @@
         dispatchHover(el);
         await sleep(600); // 等悬浮展开的菜单/操作项渲染完，background 下一步快照才能看到
         return { ok: true, label: elementLabel(el), hovered: true };
+      }
+
+      case 'show': { // 强制显示"悬浮/隐藏才出现"的元素（hover 触发不了的纯 CSS :hover 菜单用这个兜底）
+        // 定位三选一：text 按文字找（含隐藏元素，最常用）/ selector 用 CSS 选择器 / target 用快照 ref。
+        // 元素隐藏时快照里没有它的 ref，所以按文字定位是主路：菜单项文字在 DOM 里，display:none 也扫得到。
+        let el = null;
+        if (a.target != null) {
+          el = findTarget(a.target);
+          if (!el) return { ok: false, message: notFoundMsg(a.target) };
+        } else if (a.selector) {
+          try { el = document.querySelector(String(a.selector)); } catch (e) { el = null; }
+          if (!el) return { ok: false, message: '没找到选择器「' + a.selector + '」对应的元素（可能不在当前窗口）' };
+        } else if (a.text) {
+          el = findHiddenElementByText(String(a.text));
+          if (!el) return { ok: false, message: '没找到含「' + a.text + '」的元素（隐藏的也没有）' };
+        } else {
+          return { ok: false, message: 'show 需要 target / selector / text 之一' };
+        }
+        const shown = forceShowChain(el);
+        await sleep(200); // 等一瞬让强制显示后的重排/渲染落定，下个快照能拍到（纯 CSS 隐藏此时已可见）
+        return { ok: true, label: elementLabel(el), shown }; // shown=实际动过的元素数，0 说明本来就可见（show 没揭示新东西）
+      }
+
+      case 'hide': { // 还原 show 强制显示的元素：带 target 只还原那个元素及其父容器，不带则还原本窗口全部
+        if (a.target != null) {
+          const el = findTarget(a.target);
+          if (!el) return { ok: false, message: notFoundMsg(a.target) };
+          const restored = restoreShownChain(el);
+          return { ok: true, restored, label: elementLabel(el) };
+        }
+        const restored = restoreAllShown();
+        return { ok: true, restored };
       }
 
       case 'type': {
@@ -1179,16 +1430,19 @@
         const before = window.scrollY;
         window.scrollBy({ top: delta, behavior: 'instant' });
         const moved = Math.abs(window.scrollY - before);
+        let innerMoved = 0;
         if (moved === 0) {
           // window 没动 → 页面滚动容器是内层 div（overflow:auto），找主滚动容器兜底
           const el = findMainScrollable();
           if (el) {
             const eb = el.scrollTop;
             el.scrollBy({ top: delta, behavior: 'instant' });
-            return { ok: true, moved: Math.abs(el.scrollTop - eb) };
+            innerMoved = Math.abs(el.scrollTop - eb);
           }
         }
-        return { ok: true, moved };
+        // 滚动常触发懒加载/重排（无限流补内容），页面会异步加节点：等渲染稳定再返回，避免下个快照与滚动前无差异（白耗一轮往返）
+        await settlePage();
+        return { ok: true, moved: innerMoved || moved };
       }
 
       case 'read': {
@@ -1196,20 +1450,27 @@
         if (a.target === 'page' || a.target == null) el = document.body;
         else el = findTarget(a.target);
         if (!el) return { ok: false, message: notFoundMsg(a.target) };
-        const text = (el.innerText || el.textContent || '')
+        const raw = a.raw === true;
+        // 默认去页脚税；raw:true 只在核对页脚/备案等底部原文时用（会含页脚噪音）
+        const text = pageText(el, raw)
           .replace(/\s+/g, ' ')
           .trim();
+        // 整页读取并入画布文字：canvas 渲染的正文（表格/文档/小红书笔记等）DOM 里读不到、
+        // 只有钩子捕获的画布文字有内容。只读缓冲不消费（不 flush/reset），下一张快照仍能取到。
+        const canvasText = (!raw && el === document.body) ? canvasTextForRead() : '';
+        const merged = canvasText ? (text ? text + '\n' : '') + canvasText : text;
         return {
           ok: true,
-          text: text.slice(0, READ_LIMIT),
-          length: text.length,
-          truncated: text.length > READ_LIMIT
+          text: merged.slice(0, READ_LIMIT),
+          length: merged.length,
+          truncated: merged.length > READ_LIMIT
         };
       }
 
       case 'keypress': {
         const el = document.activeElement || document.body;
-        for (const k of String(a.keys || '').split(',').map((s) => s.trim())) {
+        const keys = String(a.keys || '').split(',').map((s) => s.trim());
+        for (const k of keys) {
           const code = keyCode(k);
           el.dispatchEvent(new KeyboardEvent('keydown', { key: k, keyCode: code, which: code, bubbles: true }));
           el.dispatchEvent(new KeyboardEvent('keypress', { key: k, keyCode: code, which: code, bubbles: true }));
@@ -1218,6 +1479,11 @@
         // 只有真正聚焦了可交互元素时才报元素标签；聚焦 body 则留空，让面板显示按键本身
         const focused = document.activeElement;
         const hasTarget = focused && focused !== document.body && focused !== document.documentElement;
+        // Enter/Tab/Escape/空格 可能触发 SPA 跳转或重渲染：等页面稳定再返回，避免下个快照拍到旧页面。
+        // 纯编辑键（Backspace/方向键/字符）不等待，保持响应。
+        if (keys.some((k) => KEYPRESS_NAV_KEYS.has(k))) {
+          await settlePage();
+        }
         return { ok: true, label: hasTarget ? elementLabel(focused) : '' };
       }
 
