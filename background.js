@@ -158,12 +158,12 @@ async function createSession(tabId) {
     error: null,
     startedAt: Date.now(),
     awaitingNavAt: 0,
-    navWaitIdx: null, // "正在打开页面，等待就绪…"在 logs 里的索引，就绪后合并成一行
+    navWaitIdx: null, // "打开页面…"在 logs 里的索引，就绪后合并成一行
     lastActiveAt: Date.now(),
     consecWaits: 0,   // 连续 wait 次数（无真实动作插入时累计，防"假装人类"空转）
     lastActSig: '',   // 最近一次执行（成功或失败）的页面动作签名，识别"反复执行同一个动作"的无进展循环
     stuck: 0,         // 无进展计数：连续失败/重复同一动作/空等累计，换新动作清零，>=STUCK_TEACH_LIMIT 转教我
-    lastTipsHost: '',  // 本会话已显示"加载 x 个相关技巧"的站点（同一站点只提示一次，避免刷屏）
+    lastTipsHost: '',  // 本会话已显示"加载该网站的技巧 x 条"的站点（同一站点只提示一次，避免刷屏）
     pageSnapCounts: {}, // 页面熟悉度：pageKey(host+pathname) → 成功快照次数；动作失败会清零该页计数（恢复谨慎模式）
     snapOffset: 0,      // 元素窗口翻页偏移（每批 REF_WINDOW_SIZE 个）；snapshot 动作改写，URL 变化自动回第一批
     snapOffsetUrl: '',  // snapOffset 所属页面 URL：换页/导航/切标签后 offset 失效重置为 0
@@ -240,12 +240,12 @@ function broadcast(msg, sid) {
 // （面板只显示给使用者看的动作痕迹，技术细节留在 Service Worker 控制台排查，不再持久化诊断日志）。
 function addLog(sid, m, quiet) {
   console.log('[PageAgent]', m); // 始终进 SW console（chrome://extensions → Service Worker → DevTools Console）
-  if (!quiet) broadcast({ type: 'AGENT_ACTIVITY', text: String(m) }, sid);
+  if (!quiet) broadcast({ type: 'AGENT_ACTIVITY', text: String(m), inBatch: !!getTask(sid)?._inBatch }, sid);
 }
 
-// 改写面板最后一行动作行（如把"正在打开页面，等待就绪…"补上就绪时间）
+// 改写面板最后一行动作行（如把"打开页面…"补上就绪时间）
 function updateLog(sid, idx, m) {
-  broadcast({ type: 'AGENT_ACTIVITY_UPDATE', text: String(m) }, sid);
+  broadcast({ type: 'AGENT_ACTIVITY_UPDATE', text: String(m), inBatch: !!getTask(sid)?._inBatch }, sid);
 }
 
 // ---------------- 大模型往返日志（面板「日志」按钮 → 导出全量文件用） ----------------
@@ -899,12 +899,12 @@ async function maybeCompress(t) {
   const thresholdPct = (cfg.compressThreshold == null ? COMPRESS_THRESHOLD * 100 : cfg.compressThreshold) / 100;
   const used = messagesTokens(await buildMessages(t));
   if (used < ctxWin * thresholdPct) return;
-  addLog(t.sid, '上下文使用已达 ' + Math.round((used / ctxWin) * 100) + '%，自动压缩历史记录…');
+  const c0 = performance.now();
   try {
-    await compressContext(t);
-    addLog(t.sid, '历史已压缩，上下文释放');
+    const folded = await compressContext(t);
+    if (folded > 0) addLog(t.sid, '历史已压缩：' + folded + ' 条中间记录并入摘要，上下文释放 · ' + Math.round(performance.now() - c0) + 'ms');
   } catch (e) {
-    addLog(t.sid, '历史压缩失败：' + e.message, true);
+    console.log('[PageAgent]', '历史压缩失败：' + e.message); // 压缩是后台优化，失败不影响主流程，只留控制台可查
   }
 }
 
@@ -913,7 +913,7 @@ async function maybeCompress(t) {
 async function compressContext(t) {
   const hist = (t && t.history) || [];
   const B = hist.length - TAIL_KEEP_STEPS * 3; // 每步 = 快照 + 动作 + 结果 3 条
-  if (B < 3) return; // 历史太短，无法压缩
+  if (B < 3) return 0; // 历史太短，无法压缩
   const prevBoundary = t.ctxBoundary == null ? 0 : t.ctxBoundary;
   const start = Math.max(2, Math.min(prevBoundary, B)); // 2 = 跳过 system 与原始目标
   const middle = [];
@@ -931,12 +931,13 @@ async function compressContext(t) {
   if (!middle.length) {
     t.ctxBoundary = B; // 无新增可总结，只推进边界
     await saveTasks();
-    return;
+    return 0;
   }
   const summary = await summarizeChunks(middle, t.ctxSummary || '', t);
   t.ctxSummary = summary;
   t.ctxBoundary = B;
   await saveTasks();
+  return middle.length; // 本次并入摘要的中间记录条数（供"历史已压缩"那行显示）
 }
 
 // 分块链式摘要：输入过多时切成小块，逐块合并进同一份摘要（避免单次输入超限）
@@ -1073,7 +1074,7 @@ function shortUrl(url) {
   return host + '/' + rest.slice(0, 4) + (rest.length > 4 ? '…' : '');
 }
 
-// 中间省略截断：超长文字保留头尾，中间用 … 代替，用于"正在浏览 xxx"这类会话区的精简显示
+// 中间省略截断：超长文字保留头尾，中间用 … 代替，用于"浏览页面 xxx"这类会话区的精简显示
 function midTruncate(s, max) {
   const t = String(s || '').replace(/\s+/g, ' ').trim();
   if (t.length <= max) return t;
@@ -1172,7 +1173,7 @@ async function openAgentTab(url, display, t) {
   if (reused) {
     setCurrentRef(t, reused.ref);
     await saveTasks();
-    addLog(t.sid, '页面已打开，切换过去 ' + shortUrl(url) + ' · ' + Math.round(performance.now() - t0) + 'ms');
+    addLog(t.sid, '复用页面 ' + shortUrl(url) + ' · ' + Math.round(performance.now() - t0) + 'ms');
     broadcastTabs(t);
     return { entry: reused, reused: true };
   }
@@ -1188,7 +1189,7 @@ async function openAgentTab(url, display, t) {
   setCurrentRef(t, ref);
   await addToGroup(tab.id, t);
   await saveTasks();
-  addLog(t.sid, (display || '打开 ' + shortUrl(url)) + ' · ' + ms + 'ms');
+  addLog(t.sid, (display || '打开页面 ' + shortUrl(url)) + ' · ' + ms + 'ms');
   broadcastTabs(t);
   return { entry, reused: false };
 }
@@ -1617,7 +1618,7 @@ async function agentStepInner(t) {
   // 1) 读取当前操作标签的页面快照
   //    受限页面（chrome://、about:、扩展管理页等）无法注入内容脚本，直接构造"受限快照"让 LLM 判题另开网页，避免反复失败空转
   const curTab = await getTab(tabId);
-  const t0 = performance.now(); // 计时：快照读取耗时，用于"正在浏览 xxx · Nms"
+  const t0 = performance.now(); // 计时：快照读取耗时，用于"浏览页面 xxx · Nms"
   let snap = null;
   let lastSnapErr = null;
   // 元素窗口翻页偏移：只对同一 URL 生效（换页/导航/切标签后 URL 变了，自动回第一批）。
@@ -1673,11 +1674,11 @@ async function agentStepInner(t) {
       tipsBlock = '【本站操作技巧】（该网站历史操作经验，持续有效：决策前先对照再选元素，避免绕弯路；若某条与当前页面明显冲突/已改版，说明已过期，跳过它、以当前页面为准）\n' + tips.map((x) => '· ' + x).join('\n');
       if (snapHost !== t.lastTipsHost) { // 同一站点每会话只在首次进入时显示一次加载提示
         t.lastTipsHost = snapHost;
-        addLog(t.sid, '加载 ' + tipsCount + ' 个相关技巧 ' + Math.round(performance.now() - tt0) + 'ms');
+        addLog(t.sid, '加载该网站的技巧 ' + tipsCount + ' 条 ' + Math.round(performance.now() - tt0) + 'ms');
       }
     }
   }
-  addLog(t.sid, '正在浏览 ' + midTruncate(snap.title || shortUrl(snap.url), 16) + ' · ' + Math.round(performance.now() - t0) + 'ms');
+  addLog(t.sid, '浏览页面 ' + midTruncate(snap.title || shortUrl(snap.url), 30) + ' · ' + Math.round(performance.now() - t0) + 'ms');
   // 批量模式提示：熟悉页面明确告知 LLM 可一次输出多个动作（且给出批内定位约束），减少 LLM 往返
   const batchHint = batchReady
     ? '【批量模式】本页你已经熟悉（历史操作稳定成功）。请批量输出：本步一次给出最多 ' + MAX_BATCH + ' 个连续动作（{"actions":[{...},{...},...]}）。若接下来是重复性循环（逐条读列表、翻页、重复填表这类同构步骤），必须合成一批，别再一步步单动作空转。仅当下一步必须看到本步结果才能决定时才输出单个动作。批内约束：动作执行后才出现的元素不能用 ref 引用（ref 来自当前快照、执行时可能已失效），要用 clickText 按文字 / clickAt·dblclickAt 按坐标 / gotoCell 按格号定位；open_tab、search、navigate、switch_tab、close_tab、use_tab、snapshot、finish、ask_user 放在批尾（执行到它们本批收尾）。确认生效用短读（read 的 target 指向批内动作涉及的具体元素）或依赖下一张快照回显；点开帖子/翻页后，正文通常已由下一张快照的正文摘要提供（含画布文字），此时批内不必整页 read；但若正文摘要/元素列表里**没出现**目标正文（如正文仍在加载、正文在图片上、只见推荐/相关列表），说明快照没抓到正文，**就必须整页 read**（target:"page"）——点了不等于读了。'
@@ -1692,8 +1693,8 @@ async function agentStepInner(t) {
   if (!stillCurrent(t, myTurn)) return;
 
   // 2) LLM 决策（JSON 解析失败可重试）；单动作对象与批量 {actions:[...]} 都接受，解析结果一律为动作数组
-  const thinkT0 = performance.now(); // 思考耗时起点：决策完成后给"思考中…"那行补 XXms
-  addLog(t.sid, '思考中…'); // 可见进度：LLM 决策期间不再"无声"——看到这行后停顿说明在等 LLM（最多 LLM_TIMEOUT_MS 超时兜底）；这行都没出现说明卡在快照读取
+  const thinkT0 = performance.now(); // 思考耗时起点：决策完成后给"思考下一步…"那行补 XXms
+  addLog(t.sid, '思考下一步…'); // 可见进度：LLM 决策期间不再"无声"——看到这行后停顿说明在等 LLM（最多 LLM_TIMEOUT_MS 超时兜底）；这行都没出现说明卡在快照读取
   let actions = null;
   let lastErr = null;
   for (let i = 0; i < MAX_STEP_LLM_RETRY && !actions; i++) {
@@ -1720,8 +1721,8 @@ async function agentStepInner(t) {
   }
   if (!stillCurrent(t, myTurn)) return;
 
-  // 决策完成：给"思考中…"那行补上耗时（面板改写最后一条 activity 行；决策期间无其他 activity 插入，安全）
-  updateLog(t.sid, null, '思考中… ' + Math.round(performance.now() - thinkT0) + 'ms');
+  // 决策完成：给"思考下一步…"那行补上耗时（面板改写最后一条 activity 行；决策期间无其他 activity 插入，安全）
+  updateLog(t.sid, null, '思考下一步… ' + Math.round(performance.now() - thinkT0) + 'ms');
 
   // 单动作存对象（兼容 isReadAction 的历史配对压缩），批量存数组
   const stored = actions.length === 1 ? actions[0] : actions;
@@ -1885,10 +1886,10 @@ const BOOKMARK_INDEX_MAX = 200; // 注入上下文的索引条数上限，超出
 
 // 拍平书签树，生成 "文件夹/标题 — url" 的紧凑索引；读不到（无权限等）则清空，静默降级
 async function refreshBookmarkIndex() {
+  let total = 0;
   try {
     const tree = await chrome.bookmarks.getTree();
     const lines = [];
-    let total = 0;
     const walk = (nodes, path) => {
       for (const n of nodes || []) {
         const thisPath = path ? path + '/' + n.title : n.title;
@@ -1909,6 +1910,7 @@ async function refreshBookmarkIndex() {
   } catch (e) {
     bookmarkIndexCache = '';
   }
+  return total; // 总条数（供调用方显示"加载书签索引 N 条"）
 }
 
 // 按关键词搜索书签（标题/网址），返回匹配项；供 bookmark_find 动作调用
@@ -2116,7 +2118,7 @@ function friendlyAction(a, res, ms) {
     case 'clickAt': return T('点坐标(' + (Number.isFinite(Number(a.x)) ? Math.round(a.x) : '?') + ',' + (Number.isFinite(Number(a.y)) ? Math.round(a.y) : '?') + ')');
     case 'dblclickAt': return T('双击坐标(' + (Number.isFinite(Number(a.x)) ? Math.round(a.x) : '?') + ',' + (Number.isFinite(Number(a.y)) ? Math.round(a.y) : '?') + ')');
     case 'gotoCell': return T('跳格到 ' + String(a.ref || '?'));
-    case 'clickText': return T('按文字点「' + midTruncate(a.text, 12) + '」' + (typeof a.frame === 'number' && a.frame > 0 ? '（子窗' + a.frame + '）' : ''));
+    case 'clickText': return T('按文字点「' + midTruncate(a.text, 20) + '」' + (typeof a.frame === 'number' && a.frame > 0 ? '（子窗' + a.frame + '）' : ''));
     case 'hover': return T('悬浮' + (label ? '「' + label + '」' : '') + frameNote);
     case 'show': return T('强制显示' + (a.text ? '「' + short(a.text) + '」' : (a.selector ? '「' + short(a.selector) + '」' : (label ? '「' + label + '」' : ''))) + frameNote);
     case 'hide': return T('还原显示' + (a.target != null ? frameNote : ''));
@@ -2141,7 +2143,7 @@ function friendlyAction(a, res, ms) {
     case 'list_tabs': return T('列出标签');
     case 'use_tab': return T('纳入标签');
     case 'close_tab': return T('关闭标签');
-    case 'wait': return '假装人类 ' + (a.ms || 0) + 'ms';
+    case 'wait': return '假装人类发呆 ' + (a.ms || 0) + 'ms';
     default: return (a.action || '') + msTxt;
   }
 }
@@ -2373,7 +2375,7 @@ async function runAction(t, a) {
     setCurrentRef(t, adoptedRef);
     t.history.push({ role: 'user', content: '已把浏览器标签纳入任务：@' + adoptedRef + ' ' + (tab.title || shortUrl(tab.url)) + '（当前操作标签，未切浏览器前台）' });
     const ms = Math.round(performance.now() - t0);
-    addLog(t.sid, '纳入标签（' + (tab.title || shortUrl(tab.url)).slice(0, 30) + '） · ' + ms + 'ms');
+    addLog(t.sid, '复用页面 ' + midTruncate(tab.title || shortUrl(tab.url), 30) + ' · ' + ms + 'ms');
     await saveTasks();
     broadcastTabs(t);
     if (!stillCurrent(t, myTurn)) return;
@@ -2527,7 +2529,7 @@ async function runAction(t, a) {
         return;
       }
     } catch (e) {}
-    addLog(t.sid, '打开 ' + shortUrl(url));
+    addLog(t.sid, '打开页面 ' + shortUrl(url));
     t.state = 'awaiting_nav';
     t.awaitingNavAt = Date.now();
     t.waitTabId = tabId;
@@ -2578,7 +2580,7 @@ async function runAction(t, a) {
       return;
     }
     const ms = Math.round(200 + Math.random() * 600);
-    addLog(t.sid, '假装人类 ' + ms + 'ms');
+    addLog(t.sid, '假装人类发呆 ' + ms + 'ms');
     await sleep(ms);
     if (!stillCurrent(t, myTurn)) return;
     nextStepOrBatch(t, myTurn);
@@ -2661,7 +2663,7 @@ async function runAction(t, a) {
   if (!res || res.ok === false) {
     const why = (res && (res.message || res.error)) || '动作执行失败';
     console.warn('[PageAgent] 动作执行失败 tab=' + tabId + ' → ' + why);
-    await pushFailure(t, why, false, sig); // 失败也记入 lastActSig，反复重试同一失败动作会被识别为重复
+    await pushFailure(t, why, !!(res && res.quiet), sig); // 失败也记入 lastActSig；content 标 quiet 的失败（如"没找到文字，滚动重试"）只喂模型、不进面板，由后续 scroll 行体现修正
     return;
   }
 
@@ -3074,8 +3076,8 @@ function awaitNav(t, tabId) {
   t.waitTabId = tabId;
   t.lastActSig = ''; // 换了操作页面上下文，上一页的动作签名作废
   const entry = findTabEntryByTabId(tabId, t);
-  t.navWaitIdx = true; // 标记"正在打开页面"行已显示，就绪后合并成一行
-  addLog(t.sid, '正在打开页面，等待就绪…');
+  t.navWaitIdx = true; // 标记"打开页面"行已显示，就绪后合并成一行
+  addLog(t.sid, '打开页面…');
   saveTasks();
 }
 
@@ -3125,7 +3127,7 @@ function tryResume(sid, tabId) {
   const readyTxt = '页面已就绪 · ' + Math.round(Date.now() - (t.awaitingNavAt || 0)) + 'ms';
   t.state = 'working'; // 同步置位，避免 AGENT_READY 与 onUpdated 双触发
   if (t.navWaitIdx) {
-    updateLog(t.sid, t.navWaitIdx, '正在打开页面，等待就绪… ' + readyTxt); // 合并到"等待就绪"那一行
+    updateLog(t.sid, t.navWaitIdx, '打开页面… ' + readyTxt); // 合并到"打开页面"那一行
     t.navWaitIdx = null;
   } else {
     addLog(t.sid, readyTxt);
@@ -3378,7 +3380,9 @@ async function processUserMessage(sid, text, tabId) {
   t.lastInstruction = content; // 最新一条指令/补充说明：注入上下文醒目强调、务必采纳（可能是改目标，也可能只是纠正做法的指导）
   t.history.push({ role: 'user', content });
 
-  await refreshBookmarkIndex(); // 新指令重新载入书签索引（书签可能已变）
+  const bt0 = performance.now();
+  const bookmarkCount = await refreshBookmarkIndex(); // 新指令重新载入书签索引（书签可能已变）
+  if (bookmarkCount > 0) addLog(t.sid, '加载书签索引 ' + bookmarkCount + ' 条 · ' + Math.round(performance.now() - bt0) + 'ms');
   await saveTasks();
   broadcast({ type: 'AGENT_STATUS', status: 'working' }, t.sid);
   setupAlarm();

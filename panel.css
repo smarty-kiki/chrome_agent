@@ -1,13 +1,14 @@
 :root {
-  --bg: #1e1f24;
-  --bg-2: #26282f;
-  --bg-3: #2f3139;
-  --border: #3a3d47;
-  --text: #e7e8eb;
-  --muted: #9aa0aa;
+  --bg: #ffffff;
+  --bg-2: #f6f7f9;
+  --bg-3: #eceef1;
+  --border: #e1e4e8;
+  --text: #1f2328;
+  --muted: #6b7280;
   --accent: #4f8cff;
-  --danger: #ff6b6b;
-  --ok: #4cd47c;
+  --danger: #e5484d;
+  --ok: #2f9e63;
+  --amber: #b45309;
 }
 
 * { box-sizing: border-box; }
@@ -149,9 +150,9 @@ label.check input[type="checkbox"] {
 }
 .dot.idle { background: #555b66; }
 .dot.working { background: var(--accent); }
-.dot.warn { background: #ffb454; }
+.dot.warn { background: var(--amber); }
 .dot.ok { background: var(--ok); }
-.dot.teach { background: #ffb454; }
+.dot.teach { background: var(--amber); }
 
 .chip-del {
   background: transparent;
@@ -259,7 +260,7 @@ label.check input[type="checkbox"] {
 #statusBar.done { color: var(--ok); }
 #statusBar.wait { color: var(--ok); }
 #statusBar.askreply { color: var(--accent); }
-#statusBar.teach { color: #ffb454; }
+#statusBar.teach { color: var(--amber); }
 
 /* ---------------- 聊天区 ---------------- */
 #chat {
@@ -280,7 +281,7 @@ label.check input[type="checkbox"] {
 }
 
 .msg {
-  max-width: 88%;
+  max-width: 100%; /* 通栏布局：消息铺满整行，右侧不留空 */
   padding: 8px 11px;
   border-radius: 10px;
   font-size: 13px;
@@ -294,21 +295,21 @@ label.check input[type="checkbox"] {
 }
 
 .msg.user {
-  align-self: flex-end;
+  align-self: stretch; /* 通栏：用户消息也铺满整行 */
   background: var(--accent);
   color: #fff;
   border-bottom-right-radius: 2px;
 }
 
 .msg.agent {
-  align-self: flex-start;
+  align-self: stretch; /* 通栏：Agent 回复也铺满整行 */
   background: var(--bg-3);
   border: 1px solid var(--border);
   border-bottom-left-radius: 2px;
 }
 .msg.agent.err {
   border-color: var(--danger);
-  color: #ffc2c2;
+  color: var(--danger);
 }
 
 .msg.agent.ask {
@@ -350,14 +351,14 @@ label.check input[type="checkbox"] {
 
 /* 教我模式教卡：琥珀色描边，区别于 page 的绿色 / reply 的蓝色；含实时步数 */
 .msg.agent.ask.teach {
-  border-color: #ffb454;
+  border-color: var(--amber);
   background: rgba(255, 180, 84, .08);
 }
 .teach-steps {
   margin-top: 6px;
   font-size: 12px;
   font-weight: 600;
-  color: #ffb454;
+  color: var(--amber);
 }
 
 /* 复述确认模式：蓝色描边 + 绿色"没问题"按钮（有出入可直接在输入框纠正） */
@@ -368,13 +369,36 @@ label.check input[type="checkbox"] {
 
 .msg.activity {
   align-self: stretch;
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
   font-family: ui-monospace, "SF Mono", Menlo, monospace;
   font-size: 11px;
   color: var(--muted);
   background: transparent;
   border: none;
-  padding: 1px 2px;
+  padding: 1px 6px; /* 与 .batch 左/右一致，保证行首圆点竖线对齐 */
+}
+.msg.activity .act-body {
+  flex: 1;
+  min-width: 0;
   word-break: break-all;
+}
+.msg.activity .act-ms {
+  flex-shrink: 0;
+  font-variant-numeric: tabular-nums; /* 数字等宽，右对齐列不抖 */
+}
+
+/* 动作日志行列表感：行首加一个圆点，仅作用于活动日志，不影响其他消息气泡 */
+.msg.activity::before {
+  content: '•';
+}
+
+/* 批量操作的行：浅灰底（比白色稍灰一点点），一眼区分批内连续动作 */
+.msg.activity.batch {
+  background: #f3f4f6;
+  border-radius: 4px;
+  padding: 2px 6px;
 }
 
 /* 非阻塞提示行（输入卡住等）：accent 色提醒使用者介入，但不需要操作、不影响对话 */
@@ -422,7 +446,7 @@ label.check input[type="checkbox"] {
   font-size: .92em;
 }
 .msg.agent.md pre {
-  background: #14161b;
+  background: #f6f8fa;
   border: 1px solid var(--border);
   border-radius: 6px;
   padding: 8px 10px;
@@ -482,7 +506,7 @@ button {
   color: var(--text);
   background: var(--bg-3);
 }
-button:hover { filter: brightness(1.1); }
+button:hover { filter: brightness(.97); }
 button:disabled { opacity: .5; cursor: default; }
 
 .primary { background: var(--accent); border-color: var(--accent); color: #fff; flex: 1; }

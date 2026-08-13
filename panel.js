@@ -281,10 +281,25 @@ function agentEl(text, ok) {
   el.innerHTML = renderMarkdown(text);
   return el;
 }
-function activityEl(text) {
+// 活动行内容：主体靠左，行尾耗时（"· 838ms" / " 4191ms"）拆出靠右对齐；无耗时则整行当主体
+function fillActivity(el, text) {
+  const mm = /^(.*?)\s*·?\s*(\d+ms)$/.exec(text);
+  el.innerHTML = '';
+  const body = document.createElement('span');
+  body.className = 'act-body';
+  body.textContent = mm ? mm[1] : text;
+  el.appendChild(body);
+  if (mm) {
+    const ms = document.createElement('span');
+    ms.className = 'act-ms';
+    ms.textContent = mm[2];
+    el.appendChild(ms);
+  }
+}
+function activityEl(text, inBatch) {
   const el = document.createElement('div');
-  el.className = 'msg activity';
-  el.textContent = text;
+  el.className = 'msg activity' + (inBatch ? ' batch' : '');
+  fillActivity(el, text);
   return el;
 }
 // 非阻塞提示行（输入卡住等）：比活动行醒目一点（accent 色），但同样不需要使用者操作
@@ -406,7 +421,7 @@ function pushMsg(sid, desc, silent) {
     if (desc.kind === 'user') el = userEl(desc.text);
     else if (desc.kind === 'agent') el = agentEl(desc.text, desc.ok);
     else if (desc.kind === 'activity') {
-      el = activityEl(desc.text);
+      el = activityEl(desc.text, desc.inBatch);
       const acts = document.querySelectorAll('.msg.activity');
       if (acts.length > 60) acts[0].remove();
     } else if (desc.kind === 'nudge') el = nudgeEl(desc.text);
@@ -426,7 +441,7 @@ function renderSessionMsgs(sid) {
   for (const m of cache.msgs) {
     if (m.kind === 'user') box.appendChild(userEl(m.text));
     else if (m.kind === 'agent') box.appendChild(agentEl(m.text, m.ok));
-    else if (m.kind === 'activity') box.appendChild(activityEl(m.text));
+    else if (m.kind === 'activity') box.appendChild(activityEl(m.text, m.inBatch));
     else if (m.kind === 'nudge') box.appendChild(nudgeEl(m.text));
     else if (m.kind === 'ask') box.appendChild(askEl(cache, m));
   }
@@ -900,17 +915,20 @@ async function init() {
         pushMsg(sid, { kind: 'ask', text: msg.text, mode: msg.mode || 'page' });
         break;
       case 'AGENT_ACTIVITY':
-        pushMsg(sid, { kind: 'activity', text: msg.text });
+        pushMsg(sid, { kind: 'activity', text: msg.text, inBatch: msg.inBatch });
         break;
       case 'AGENT_ACTIVITY_UPDATE': {
         // 改写缓存里最后一行动作行（如"正在打开页面，等待就绪…"补上就绪时间）
         const arr = cache.msgs;
         for (let i = arr.length - 1; i >= 0; i--) {
-          if (arr[i].kind === 'activity') { arr[i].text = msg.text; break; }
+          if (arr[i].kind === 'activity') { arr[i].text = msg.text; arr[i].inBatch = msg.inBatch; break; }
         }
         if (sid === activeSid) {
           const acts = document.querySelectorAll('.msg.activity');
-          if (acts.length) acts[acts.length - 1].textContent = msg.text;
+          if (acts.length) {
+            fillActivity(acts[acts.length - 1], msg.text);
+            acts[acts.length - 1].classList.toggle('batch', !!msg.inBatch);
+          }
         }
         break;
       }
