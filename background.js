@@ -19,6 +19,7 @@
 const DEFAULT_BASE_URL = 'https://api.deepseek.com/v1';
 const DEFAULT_MODEL = 'deepseek-v4-flash'; // DeepSeek V4 Flash（deepseek-chat/reasoner 旧别名已退役）
 const DEFAULT_TEMPERATURE = 0.2;
+const TEST_MODEL_TIMEOUT_MS = 10000; // 设置里拉取 /models 模型列表的超时：比正常 LLM 短，快速反馈
 const DEFAULT_MAX_STEPS = 25;
 const NAV_TIMEOUT_MS = 120000;   // 页面加载/跳转等待上限
 const MAX_AGENT_TABS = 20;       // Agent 自开标签上限，防止失控
@@ -764,6 +765,46 @@ async function callLLM(messages, opts, t) {
     broadcast({ type: 'AGENT_TOKENS', tokens: t.tokens, cacheHit: t.cacheHit, cacheMiss: t.cacheMiss }, t.sid);
   }
   return content;
+}
+
+// 设置里填了 API Key / Base URL（失焦）或进入配置时：GET /models 拉取服务端可用模型列表填充下拉，
+// 顺带验证 API Key 与 Base URL（Key 错→401，URL 错→网络失败）。不走 callLLM（那是会话步骤，带 JSON
+// 约束、token 统计与长超时）；官方 /models 每个模型只返回 id/object/owned_by，不含上下文窗口大小。
+async function fetchModels(cfg) {
+  const stored = await getConfig();
+  const apiKey = cfg.apiKey || stored.apiKey;
+  if (!apiKey) return { ok: false, error: '未配置 API Key，请在设置中填写' };
+  const baseUrl = (cfg.baseUrl || DEFAULT_BASE_URL).replace(/\/+$/, '');
+  const url = baseUrl + '/models';
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), TEST_MODEL_TIMEOUT_MS);
+  const t0 = Date.now();
+  let res;
+  try {
+    res = await fetch(url, {
+      method: 'GET',
+      headers: { Authorization: 'Bearer ' + apiKey },
+      signal: ctrl.signal
+    });
+  } catch (e) {
+    clearTimeout(timer);
+    if (e && e.name === 'AbortError') return { ok: false, error: '请求超时（' + (TEST_MODEL_TIMEOUT_MS / 1000) + 's）：Base URL 可能不可达或 DNS 解析失败' };
+    return { ok: false, error: '网络错误：' + (e.message || e) + '（请检查 Base URL）' };
+  }
+  clearTimeout(timer);
+  if (!res.ok) {
+    let detail = '';
+    try { detail = (await res.text()).slice(0, 200); } catch (e) {}
+    if (res.status === 401 || res.status === 403) return { ok: false, error: 'HTTP ' + res.status + '：API Key 无效或未授权' };
+    if (res.status === 404 || res.status === 405) return { ok: false, error: 'HTTP ' + res.status + '：Base URL 下没有 /models 接口（可能是只支持 /chat/completions 的中转）' };
+    return { ok: false, error: 'HTTP ' + res.status + ' ' + detail };
+  }
+  let data;
+  try { data = await res.json(); } catch (e) { return { ok: false, error: '返回不是合法 JSON，Base URL 可能不是 OpenAI 兼容接口' }; }
+  const models = Array.isArray(data && data.data)
+    ? data.data.map((m) => m && m.id).filter(Boolean)
+    : [];
+  return { ok: true, latencyMs: Date.now() - t0, models };
 }
 
 // 解析 LLM 输出为动作列表。兼容三种形态：
@@ -3738,6 +3779,9 @@ async function handleMessage(msg, sender) {
     case 'SAVE_CONFIG':
       await saveConfig(msg.config || {});
       return { ok: true };
+    case 'FETCH_MODELS': { // 设置里填 Key / Base URL（失焦）时：GET /models 拉服务端模型列表填充下拉，顺带验证连接
+      return await fetchModels(msg.config || {});
+    }
     case 'GET_STATE':
       await loadTasks();
       const sessions = Object.keys(tasks)

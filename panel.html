@@ -22,8 +22,9 @@
     <label>Base URL
       <input id="baseUrl" placeholder="https://api.deepseek.com/v1">
     </label>
-    <label>模型
-      <input id="model" placeholder="deepseek-v4-flash">
+    <label>
+      <span class="label-title">模型 <span id="modelTestResult" class="hint" hidden></span></span>
+      <select id="model"></select>
     </label>
     <div class="row">
       <label>温度
@@ -49,7 +50,7 @@
     <label>诊断（调试）
       <button id="diagBtn" class="ghost" title="把当前标签页 Agent 浏览侧看到的页面快照（可交互元素清单 + 正文摘要 + 子窗口）提取为 JSON 复制到剪贴板">诊断</button>
     </label>
-    <div class="hint">上下文窗口默认 1000000（DeepSeek V4 为 1M）；上下文使用达到压缩阈值（默认 70%）时自动把中间历史压缩成摘要，保留原始目标与最近几步。搜索模板含 {q} 时替换为关键词，否则直接拼接。诊断：把当前标签页 Agent 提取的页面快照复制到剪贴板，方便核对元素有没有被看到、role 描述对不对。Base URL 可换任意 OpenAI 兼容地址。</div>
+    <div class="hint">上下文窗口默认 1000000（DeepSeek V4 为 1M）；官方 /models 接口只返回模型 ID、不含窗口大小，所以这里需手动维护；上下文使用达到压缩阈值（默认 70%）时自动把中间历史压缩成摘要，保留原始目标与最近几步。模型下拉由服务端 /models 接口实时拉取：填写 API Key 或 Base URL（失焦）即重新拉取并验证连接，成功才填充可选模型，失败会显示原因。搜索模板含 {q} 时替换为关键词，否则直接拼接。诊断：把当前标签页 Agent 提取的页面快照复制到剪贴板，方便核对元素有没有被看到、role 描述对不对。Base URL 可换任意 OpenAI 兼容地址。</div>
   </section>
 
   <section id="tipsPanel" hidden>

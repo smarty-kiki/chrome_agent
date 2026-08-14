@@ -70,7 +70,7 @@ header {
 
 label { display: flex; flex-direction: column; gap: 3px; color: var(--muted); font-size: 12px; }
 
-input {
+input, select {
   background: var(--bg-3);
   border: 1px solid var(--border);
   color: var(--text);
@@ -79,7 +79,12 @@ input {
   font-size: 12px;
   width: 100%;
 }
-input:focus { outline: none; border-color: var(--accent); }
+input:focus, select:focus { outline: none; border-color: var(--accent); }
+
+#modelTestResult { font-size: 11px; }
+#modelTestResult.ok { color: var(--ok); }
+#modelTestResult.err { color: var(--danger); }
+#modelTestResult.warn { color: var(--amber); }
 
 .row { display: flex; gap: 8px; }
 .row label { flex: 1; }

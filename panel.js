@@ -42,11 +42,15 @@ function ensureCache(sid, n) {
 function activeCache() { return activeSid ? ensureCache(activeSid) : null; }
 
 // ---------------- 设置 ----------------
+// 模型下拉由服务端 /models 实时拉取（见 fetchModels）：填了 API Key 或 Base URL（失焦）即重新拉取重建下拉。
+// preferredModel 记录"当前该选的模型"（存量配置或用户刚选的），拉取后优先保留它，不在列表则落第一个。
+let preferredModel = '';
+
 async function loadConfig() {
   const { config } = await chrome.runtime.sendMessage({ type: 'GET_CONFIG' });
   $('#apiKey').value = config.apiKey || '';
   $('#baseUrl').value = config.baseUrl || 'https://api.deepseek.com/v1';
-  $('#model').value = config.model || 'deepseek-v4-flash';
+  preferredModel = config.model || '';
   $('#temperature').value = config.temperature ?? 0.2;
   $('#maxSteps').value = config.maxSteps || 25;
   $('#searchTemplate').value = config.searchTemplate || 'https://www.bing.com/search?q=';
@@ -54,28 +58,95 @@ async function loadConfig() {
   $('#compressThreshold').value = config.compressThreshold ?? 70;
   $('#batchEnabled').checked = config.batchEnabled !== false;
   $('#batchMark').checked = config.batchMark === true;
+  // 已有 Key 进配置就拉一次模型列表；没有则留占位提示（填了 Key/URL 失焦会自动再拉）
+  if (config.apiKey) fetchModels();
+  else populateModelSelect([]);
+}
+
+// 把模型下拉重建为服务端返回的模型列表；preferred 在列表则选中它，否则落第一个；空列表放占位提示
+function populateModelSelect(models, preferred, placeholder) {
+  const sel = $('#model');
+  sel.innerHTML = '';
+  const list = (models || []).filter(Boolean);
+  if (!list.length) {
+    const opt = document.createElement('option');
+    opt.value = '';
+    opt.textContent = placeholder || '请先填写 API Key 与 Base URL';
+    opt.disabled = true;
+    sel.appendChild(opt);
+    sel.value = '';
+    return;
+  }
+  const pick = preferred && list.indexOf(preferred) !== -1 ? preferred : list[0];
+  for (const m of list) {
+    const opt = document.createElement('option');
+    opt.value = m;
+    opt.textContent = m;
+    sel.appendChild(opt);
+  }
+  sel.value = pick;
+}
+
+// 用当前表单里的 API Key / Base URL 拉模型列表：成功→重建下拉并保存自动选中的模型；失败→清空下拉并显示原因
+async function fetchModels() {
+  const res = $('#modelTestResult');
+  res.hidden = false;
+  res.textContent = '测试中…';
+  res.className = 'hint';
+  try {
+    const r = await chrome.runtime.sendMessage({
+      type: 'FETCH_MODELS',
+      config: {
+        apiKey: $('#apiKey').value.trim(),
+        baseUrl: $('#baseUrl').value.trim()
+      }
+    });
+    if (r && r.ok) {
+      populateModelSelect(r.models, preferredModel);
+      res.textContent = '连接正常（' + r.latencyMs + 'ms）';
+      res.className = 'hint ok';
+      if ($('#model').value) saveConfig(); // 自动选中/保留的模型写进配置，跑任务时直接用
+    } else {
+      populateModelSelect([], '', '（无可用模型）');
+      res.textContent = '连接失败：' + ((r && r.error) || '未知错误');
+      res.className = 'hint err';
+    }
+  } catch (e) {
+    populateModelSelect([], '', '（无可用模型）');
+    res.textContent = '拉取模型列表失败：' + (e.message || e);
+    res.className = 'hint err';
+  }
+}
+
+function saveConfig() {
+  chrome.runtime.sendMessage({
+    type: 'SAVE_CONFIG',
+    config: {
+      apiKey: $('#apiKey').value.trim(),
+      baseUrl: $('#baseUrl').value.trim(),
+      model: $('#model').value,
+      temperature: parseFloat($('#temperature').value),
+      maxSteps: parseInt($('#maxSteps').value, 10) || 25,
+      searchTemplate: $('#searchTemplate').value.trim(),
+      contextWindow: parseInt($('#contextWindow').value, 10) || 1000000,
+      compressThreshold: parseInt($('#compressThreshold').value, 10) || 70,
+      batchEnabled: $('#batchEnabled').checked,
+      batchMark: $('#batchMark').checked
+    }
+  });
 }
 
 function wireSettings() {
-  const save = () => {
-    chrome.runtime.sendMessage({
-      type: 'SAVE_CONFIG',
-      config: {
-        apiKey: $('#apiKey').value.trim(),
-        baseUrl: $('#baseUrl').value.trim(),
-        model: $('#model').value.trim(),
-        temperature: parseFloat($('#temperature').value),
-        maxSteps: parseInt($('#maxSteps').value, 10) || 25,
-        searchTemplate: $('#searchTemplate').value.trim(),
-        contextWindow: parseInt($('#contextWindow').value, 10) || 1000000,
-        compressThreshold: parseInt($('#compressThreshold').value, 10) || 70,
-        batchEnabled: $('#batchEnabled').checked,
-        batchMark: $('#batchMark').checked
-      }
-    });
-  };
-  ['apiKey', 'baseUrl', 'model', 'temperature', 'maxSteps', 'searchTemplate', 'contextWindow', 'compressThreshold', 'batchEnabled', 'batchMark'].forEach((id) => {
-    $('#' + id).addEventListener('change', save);
+  ['temperature', 'maxSteps', 'searchTemplate', 'contextWindow', 'compressThreshold', 'batchEnabled', 'batchMark'].forEach((id) => {
+    $('#' + id).addEventListener('change', saveConfig);
+  });
+  // API Key / Base URL：失焦保存，并重新拉一次模型列表（填对才填充下拉）
+  $('#apiKey').addEventListener('change', () => { saveConfig(); fetchModels(); });
+  $('#baseUrl').addEventListener('change', () => { saveConfig(); fetchModels(); });
+  // 模型：切换即保存（列表来自服务端，无需再测）
+  $('#model').addEventListener('change', () => {
+    preferredModel = $('#model').value;
+    saveConfig();
   });
   $('#toggleSettings').addEventListener('click', () => {
     $('#settings').hidden = !$('#settings').hidden;
