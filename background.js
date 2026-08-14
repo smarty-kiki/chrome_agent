@@ -33,7 +33,7 @@ const OUTPUT_RESERVE = 8192;          // 每次调用给 LLM 输出预留的 tok
 const COMPRESS_THRESHOLD = 0.7;       // 上下文使用到 70% 触发历史压缩
 const TAIL_KEEP_STEPS = 2;            // 压缩时保留最近几步原文（快照+动作+结果）
 const MAX_SNAPSHOT_KEEP = 3;          // 每次请求最多发给 LLM 的页面快照数（旧快照元素已过期，只留最近几次）
-const MAX_BATCH = 10;                 // 单批动作数硬上限（LLM 按动作颗粒度自行决定批量多少，最多此值）
+const MAX_BATCH = 100;                // 单批动作数硬上限（LLM 按动作颗粒度自行决定批量多少，最多此值）
 const BATCH_FAMILIAR_THRESHOLD = 2;   // 同一页面成功快照 ≥ 此值 → 判定"熟悉"，允许批量输出
 const BATCH_TERMINALS = new Set(['open_tab', 'search', 'navigate', 'switch_tab', 'close_tab', 'use_tab', 'snapshot', 'finish', 'ask_user']); // 遇此类动作本批收尾（它们会切页/改变会话状态；snapshot 会切换元素窗口，翻页后需重新观察）
 const LLM_TIMEOUT_MS = 240000; // LLM 单次请求超时：网络/服务端挂起时不再无限等（超时按解析失败重试），避免循环整体干等
@@ -168,6 +168,7 @@ async function createSession(tabId) {
     pageSnapCounts: {}, // 页面熟悉度：pageKey(host+pathname) → 成功快照次数；动作失败会清零该页计数（恢复谨慎模式）
     snapOffset: 0,      // 元素窗口翻页偏移（每批 REF_WINDOW_SIZE 个）；snapshot 动作改写，URL 变化自动回第一批
     snapOffsetUrl: '',  // snapOffset 所属页面 URL：换页/导航/切标签后 offset 失效重置为 0
+    readList: [],       // 已读清单："读 N 条"循环里实际点开读过的条目 {ref,title,pageKey,content}；快照标【已读】、重复点"已有正文记录"的同一条被拦截；正文随详情页快照采集（独立于历史，压缩后总结仍保真）。每回合重置，上限 300 条
     timer: null, // 任务计时器：{ running, startAt, acc }；从任务发出开始计时、等你操作时暂停、finish 答案落定时停止（复盘不算）
   };
   tasks[sid] = t;
@@ -599,13 +600,14 @@ function systemPrompt() {
 多轮对话中，请记住并复用此前完成的操作和得出的结论（对话记录跨轮保留）。例如使用者说"把刚才的总结存成文件"，你应能找到之前的总结内容并用 save_file 保存。注意：每轮完成时你自开的标签（@T 系）会被自动关闭，跨轮不再存在；要重新访问某页面时用 open_tab/search 重新打开，或用 use_tab 用使用者已打开的标签。
 
 你拥有"任务标签页"：@MAIN 是使用者交给你的标签页（属于使用者，不要随便关）；@T1/@T2/... 是你自己新开的后台标签（已自动归入本会话的 PageAgent N 分组，不影响使用者浏览；点击"新开页面"的链接也会自动变成后台 @T 标签，不抢你正在看的焦点）；@U1/@U2/... 是你用 use_tab 纳入任务的使用者已有标签（同样属于使用者，不要随便关）。
-你通过"页面快照"感知当前操作标签的网页：包括标签页列表、URL、标题、可交互元素列表（[ref] 类型 文本 值 选择器）和正文摘要。正文摘要默认滤掉了站点恒定导航/页脚/法务备案等噪音（页脚税），只留页面内容主体（含画布渲染的正文），读帖读文、确认内容不必每次重复 read 整页（那是冗余往返）——但快照正文摘要/元素列表里**没出现**目标正文时（如正文仍在加载、正文在图片上、只见推荐/相关列表），说明快照没抓到正文，必须 read 整页（target:"page"）去拿——点开不等于读到；read 用于读摘要没覆盖的局部（如某元素/弹窗内单独文字，target 填那个 ref）。read 整页同样已滤掉页脚税、并已并入画布渲染的正文，读帖子/文档/表格内容直接用默认 read（**不要加 "raw":true**）；"raw":true 只在需要核对页脚/备案/许可这类底部原文时用（会带页脚噪音）。页面可能包含内嵌 iframe 子窗口（如某些网站的弹窗/新建流程），子窗口里的可交互元素也会并进快照、用【子窗口 N】分组标出，正文摘要里附有子窗口内容，你同样可以点击/读取它们。若快照提示有未读取成功的内嵌窗口（可能仍在加载），先 wait 等它加载完再重新观察，目标往往会出现，不要因为一时看不到就转去别处乱点。若你刚点击了一个按钮/链接，下一次快照里出现了新的【子窗口 N】分组或元素变多，说明弹窗/面板已经打开，接下来的目标应该在这个新窗口里找——**不要重复点击刚才那个按钮**（可能把弹窗又关掉），直接在弹窗里继续操作。
+你通过"页面快照"感知当前操作标签的网页：包括标签页列表、URL、标题、可交互元素列表（[ref] 类型 文本 值 选择器）和正文摘要。正文摘要默认滤掉了站点恒定导航/页脚/法务备案等噪音（页脚税），只留页面内容主体（含画布渲染的正文），读取正文、确认内容不必每次重复 read 整页（那是冗余往返）——但快照正文摘要/元素列表里**没出现**目标正文时（如正文仍在加载、正文在图片上、只见推荐/相关列表），说明快照没抓到正文，必须 read 整页（target:"page"）去拿——点开不等于读到；read 用于读摘要没覆盖的局部（如某元素/弹窗内单独文字，target 填那个 ref）。read 整页同样已滤掉页脚税、并已并入画布渲染的正文，读内容/文档/表格直接用默认 read（**不要加 "raw":true**）；"raw":true 只在需要核对页脚/备案/许可这类底部原文时用（会带页脚噪音）。页面可能包含内嵌 iframe 子窗口（如某些网站的弹窗/新建流程），子窗口里的可交互元素也会并进快照、用【子窗口 N】分组标出，正文摘要里附有子窗口内容，你同样可以点击/读取它们。若快照提示有未读取成功的内嵌窗口（可能仍在加载），先 wait 等它加载完再重新观察，目标往往会出现，不要因为一时看不到就转去别处乱点。若你刚点击了一个按钮/链接，下一次快照里出现了新的【子窗口 N】分组或元素变多，说明弹窗/面板已经打开，接下来的目标应该在这个新窗口里找——**不要重复点击刚才那个按钮**（可能把弹窗又关掉），直接在弹窗里继续操作。
 快照开头（元素列表之前）的【本站操作技巧】是该网站历史沉淀下来的操作经验（比如"搜索要直接点第一条结果""要先点开下拉再选择"）。它放在元素列表**之前**：**每次选元素、定动作前先对照它**，与技巧描述不符的做法多半在绕弯路，优先按技巧来。当反复失败、找不到元素、或准备执行的动作与技巧不一致时，先回头对照本站技巧调整，而不是硬试同一招；若某条技巧与当前页面明显冲突（页面已改版），说明它已过期，跳过它、以当前页面为准。
 
-每收到一个快照，你必须输出 JSON 动作。**默认输出单个动作对象** {"action":"...",...}；当快照提示【批量模式】已开启时，请输出**批量动作** {"actions":[{...},{...},...]}（本页已熟悉，重复性循环——逐条读列表、翻页、重复填表这类同构步骤——务必合成一批，别再一步步单动作空转），系统会一次连续执行全部（最多 10 个，大幅减少往返、更快）。批量规则：
+每收到一个快照，你必须输出 JSON 动作。**默认倾向批量输出**：一次把多个**连续、同页、下一步不必看中间结果**的动作合在一起输出 {"actions":[{...},{...},...]}（最多 ${MAX_BATCH} 个），系统会连续执行，大幅减少往返、更快。逐条勾选、连续填表、列表内翻页、逐行操作这类重复性循环，**务必合成一批，别再一步步单动作空转**；当快照提示【批量模式】已开启（本页你已熟悉）时，**更要把能确定的同页动作尽量多合批、一次多干几件——熟悉页面合批是性能要求，不是可选优化**。当快照提示【谨慎模式】（本页不熟悉/刚出错）时才退回一次一个动作。**例外——即使熟悉也输出单个动作**：下一步会改变页面结构/跳转（点开详情读正文→返回、翻页、搜索、open_tab/switch_tab 等，批内跳转动作只能放批尾、本批最多一个）；或必须看到本步结果才能决定下一步；或拿不准。批量规则：
 - **批内顺序依赖要弱**：某个动作执行后才出现的元素，后续动作**不能用它的 ref**（ref 来自旧快照，执行时会失效），要用 clickText 按文字 / clickAt·dblclickAt 按坐标 / gotoCell 按格号来定位；
 - 会改变页面结构或跳转的动作（open_tab / search / navigate / switch_tab / close_tab / use_tab / snapshot / finish / ask_user）**放在批尾**，执行到它们本批就收尾，之后系统重新观察页面；
-- 每批尽量以 read 或读回校验结尾，确认动作生效；一个动作最多 10 个，拿不准就输出单个动作。
+- 每批尽量以 read 或读回校验结尾，确认动作生效；一个动作最多 ${MAX_BATCH} 个，拿不准就输出单个动作。
+- **熟悉页面合批是性能要求**：快照标【批量模式】后，凡能确定的连续同页动作都合批、尽量往大了合（单批上限 ${MAX_BATCH}）；只有上面"跳转 / 必须看结果 / 拿不准"的例外才输出单个动作。
 可用动作：
 
 0. 标签操作（ref 用 @MAIN / @T1 / @U1 ...；tabId 用 list_tabs 返回的编号）：
@@ -629,7 +631,7 @@ function systemPrompt() {
    {"action":"select","target":<ref>,"value":"..."}        下拉框选择
    {"action":"scroll","direction":"down|up","amount":<像素,可选>}  滚动页面
    {"action":"snapshot","offset":<100 的倍数>}             翻到下一批元素窗口：快照标注"还有下一批"且目标不在列表时用（offset 取快照提示里的值；回第一批用 0）
-   {"action":"read","target":<ref 或 "page">,"raw":<可选 true>}  读取某元素或整页文本（用于总结）。默认已滤掉页面恒定导航/页脚/法务备案等噪音（页脚税），且已并入画布渲染的正文——读帖子/文档/表格内容直接 read 整页即可，**不要加 raw**；"raw":true 只在需要核对页脚/备案/许可这类底部原文时用（会带页脚噪音）
+   {"action":"read","target":<ref 或 "page">,"raw":<可选 true>}  读取某元素或整页文本（用于总结）。默认已滤掉页面恒定导航/页脚/法务备案等噪音（页脚税），且已并入画布渲染的正文——读内容/文档/表格直接 read 整页即可，**不要加 raw**；"raw":true 只在需要核对页脚/备案/许可这类底部原文时用（会带页脚噪音）
    {"action":"wait","ms":<毫秒>}                           等待页面/动画/网络
    {"action":"keypress","keys":"Enter|Escape|Tab|Backspace|ArrowDown|..."}  向当前焦点发送按键
    {"action":"navigate","url":"https://..."}               在【当前操作标签】内跳转（沿用其会话/登录状态）
@@ -659,7 +661,8 @@ function systemPrompt() {
 - 严格只输出一个 JSON 对象，不要输出解释、代码块或其它文字。
 - 元素 ref 是数字；标签 ref 带 @ 前缀。绝不臆造，找不到就先 scroll/read/switch_tab 再观察。
 - 点击后若点击结果里 changed 为 false（URL 没变、页面内容也没变，说明这次点击没生效）：不要重复点同一元素，也不要对几乎相同的 URL 反复 navigate（同样多半不生效）；换一种做法推进——clickText 按页面文字点、hover 出悬浮项、read 读当前状态再判断。
-- 目标是"读 N 条"（逐条读完列表/多篇帖子再总结，如"读 20 篇帖子后分类总结"）时，用"已读清单"推进循环：①点一个【已读清单里没有】的标题 → ②点开后正文通常已出现在当轮快照的正文摘要里（或 read 返回），当场把"标题+要点"记入已读清单 → ③Escape/返回列表，再点下一个未读标题。判断"这篇读过没"只看已读清单，绝不重复点清单里已有的标题——列表里没读的条目多的是，别在一批上反复点。
+- 目标是"读 N 条"（逐条读完列表/多篇内容再总结，如"读 20 条后分类总结"）时，用"已读清单"推进循环：快照顶部的【已读清单】块、以及列表元素上的【已读】标记，是系统自动记录的、你已实际点开读过的条目，不用自己记。①在列表里点一个【未读】的标题 → ②点开后正文通常已出现在当轮快照的正文摘要里（或 read 返回），当场读掉记下要点 → ③Escape/返回列表，再点下一个未读标题。判断"这条读过没"只看【已读清单】，绝不重复点清单里已有的标题——列表里没读的条目多的是，别在一条上反复点。
+- **总结只许写你实际点开读过正文的条目**：只看到标题/摘要（没打开正文）的条目，最多只列它的标题（可加列表里就有的作者/时间），**绝不能编造正文内容或主观评价**。没读够目标条数就继续读、不要提前收尾；收尾时说明"实际点开读了 N 条 / 目标 M 条"。
 - 任何详情正文出现在快照摘要或 read 结果里时，先把它并入当轮的结论再关闭/离开：要按 Escape 关掉详情前，确认它的内容已记入你的进度——看完就关等于没读，关了又忘、忘了又点回来，是纯空转。
 - 点开条目后，若正文内容没有出现在当轮快照的正文摘要或元素列表里（如正文还在加载、正文在图片上、只见推荐/相关条目列表），说明这次没拿到正文：**点了不等于读了**，别为"读"再点一遍同一条目——read 都读不到就说明正文本就不在可读文本里。任务要详情就用 read 读正文，只要条目级信息就当场记下标题即可；点了却不打算读正文时，click 后的 wait 不必长等。
 - 想对列表/表格里的某一行执行操作（编辑 / 删除 / 更多菜单等）却找不到对应按钮时，别急着放弃——很多站点的行内操作按钮是**悬浮在那一行上才出现**的：用 hover 悬浮那一行（或其上的任意元素）让按钮显示出来，重截快照后就能看到并点击了。在页面上找不到下一步该点的按钮/入口时，同样先想想它是不是要 hover 某个列表项才会出现，用 hover 动作去试。若 hover 后按钮仍不出现，多半是**纯 CSS :hover 才显示**的菜单（合成事件触发不了），改用 show 按文字强制显示（如 show {"text":"编辑"}），重截快照后即可见可点。
@@ -856,6 +859,16 @@ async function buildMessages(t) {
       role: 'system',
       content: '【已压缩的历史进展】（此前的详细操作不再逐条列出，以下摘要涵盖已完成的事、踩过的坑与使用者补充的注意点，越靠后越新，继续执行时参考它）\n' + t.ctxSummary
     });
+  }
+  // 已读正文记录：上下文压缩后，历史里"实际读过的条目"的原文已并入(有损)摘要甚至删除，只剩这里保真。
+  // readList 独立存于任务对象不受压缩影响，压缩一发生就注入，保证总结时有真材实料、不靠标题脑补。
+  const readNotes = (t.readList || []).filter((x) => x.title);
+  if (t.ctxSummary && readNotes.length) {
+    const rl = ['【已读正文记录】（系统自动记录你已实际点开读过的条目，共 ' + readNotes.length + ' 条；上下文已压缩、历史里这些原文不再保留，总结以这里为准：有正文要点的直接用要点，**不要凭标题脑补**；标注"正文未采集到"的条目如确需详情，可重新打开它 read 补读——这类重复打开不会被拦截）'];
+    for (const r of readNotes) {
+      rl.push('· ' + r.title + (r.content ? '：' + midTruncate(r.content, 200) : '（正文未采集到）'));
+    }
+    msgs.push({ role: 'system', content: rl.join('\n') });
   }
   // 尾部历史窗口：从最新往前收集，直到放不下（充分用满上下文窗口；边界以下已由摘要覆盖）。
   // 页面快照只保留最近 MAX_SNAPSHOT_KEEP 次：旧快照里的元素 ref / 摘要早已过期（页面已重渲染），
@@ -1115,12 +1128,56 @@ function shortUrl(url) {
   return host + '/' + rest.slice(0, 4) + (rest.length > 4 ? '…' : '');
 }
 
-// 中间省略截断：超长文字保留头尾，中间用 … 代替，用于"浏览页面 xxx"这类会话区的精简显示
+// 中间省略截断（按显示宽度）：中文/全角/emoji 记 2 个半角单位、ASCII/半角符号记 1，
+// 用于"浏览页面 xxx"这类会话活动行的精简显示——max 传半角单位（如 26 ≈ 13 个汉字 / 26 个英文字母）。
+// 按 grapheme 分段，避免 emoji 序列（😵‍💫）或代理对在截断处被切成半个。
 function midTruncate(s, max) {
   const t = String(s || '').replace(/\s+/g, ' ').trim();
-  if (t.length <= max) return t;
-  const keep = Math.max(1, Math.floor((max - 1) / 2)); // 头尾各留一半（留 1 位给 …）
-  return t.slice(0, keep) + '…' + t.slice(t.length - keep);
+  const segs = splitGraphemes(t);
+  let total = 0;
+  for (const g of segs) total += charHalfWidth(g);
+  if (total <= max) return t;
+  const keep = Math.max(1, Math.floor((max - 1) / 2)); // … 占 1 单位，头尾各留一半
+  let head = '', hw = 0;
+  for (let i = 0; i < segs.length && hw < keep; i++) { head += segs[i]; hw += charHalfWidth(segs[i]); }
+  let tail = '', tw = 0;
+  for (let i = segs.length - 1; i >= 0 && tw < keep; i--) { tail = segs[i] + tail; tw += charHalfWidth(segs[i]); }
+  return head + '…' + tail;
+}
+
+// 按可见字符（grapheme）分段；不支持 Segmenter 时退回按 code point 拆（至少不拆代理对）
+function splitGraphemes(s) {
+  if (Intl && Intl.Segmenter) {
+    try { return Array.from(new Intl.Segmenter('zh', { granularity: 'grapheme' }).segment(s), (x) => x.segment); }
+    catch (e) {}
+  }
+  return Array.from(s);
+}
+
+// 单个可见字符的显示宽度（半角单位）：CJK/全角/emoji 为 2，ASCII/半角符号为 1
+function charHalfWidth(g) {
+  const cp = g.codePointAt(0);
+  if (cp == null || isNaN(cp)) return 1;
+  return isWideChar(cp) ? 2 : 1;
+}
+
+// 宽字符判定（East Asian Width Wide/Fullwidth + 主要 emoji 区段）
+function isWideChar(cp) {
+  return (
+    (cp >= 0x1100 && cp <= 0x115f) ||   // Hangul Jamo
+    (cp >= 0x2e80 && cp <= 0x303e) ||   // CJK 部首 ~ 日文标点
+    (cp >= 0x3041 && cp <= 0x33ff) ||   // 平假名 ~ CJK 兼容
+    (cp >= 0x3400 && cp <= 0x4dbf) ||   // CJK 扩展 A
+    (cp >= 0x4e00 && cp <= 0x9fff) ||   // CJK 统一汉字
+    (cp >= 0xa000 && cp <= 0xa4cf) ||   // 彝文
+    (cp >= 0xac00 && cp <= 0xd7a3) ||   // 谚文音节
+    (cp >= 0xf900 && cp <= 0xfaff) ||   // CJK 兼容表意文字
+    (cp >= 0xfe10 && cp <= 0xfe6f) ||   // 竖排形式 + CJK 兼容形式
+    (cp >= 0xff00 && cp <= 0xff60) ||   // 全角形式
+    (cp >= 0xffe0 && cp <= 0xffe6) ||   // 全角符号
+    (cp >= 0x1f300 && cp <= 0x1faff) ||  // emoji 主要区段（含 😵💫 等）
+    (cp >= 0x20000 && cp <= 0x3fffd)     // CJK 扩展 B+（生僻字）
+  );
 }
 
 // 记录"最近使用"：currentRef 每次切换到一个标签都刷新 lastUseSeq，供撞上限时按"最久未用"淘汰
@@ -1416,6 +1473,27 @@ function refreshTabEntry(tabId, info, t) {
   }
 }
 
+// ---------------- 已读清单（"读 N 条"循环） ----------------
+// 系统自动记录"实际点开读过的条目"，解决模型在列表返回后忘掉读没读、重复点同一篇的问题。
+// 条目标识：同一页里 ref 相同（click），或点文字时标题归一后相同（clickText）。ref 是全局编号（frameIndex*1000+局部 ref），与快照元素一致。
+function normTxt(s) { return String(s == null ? '' : s).replace(/\s+/g, ' ').trim(); }
+const READ_NAV_RE = /^(下一页|上一页|首页|末页|尾页|返回|后退|关闭|收起|展开|更多|加载更多|确定|确认|取消|提交|保存|搜索)$/; // 点这些导航文字"改变页面"不算"读了一条"，不记入已读清单
+function readListMatch(t, pageKey, ref, text) {
+  const nt = text ? normTxt(text) : '';
+  for (const x of (t.readList || [])) {
+    if (x.pageKey !== pageKey) continue; // 只认同一页里点过的
+    if (ref != null && x.ref === ref) return x;
+    // 标题精确相等也认（不限 x.ref == null）：click 记的（带 ref）条目在列表重渲染/滚动后 ref 会漂移，ref 匹配落空；
+    // 但模型再用 clickText 点同一条时标题没变，靠标题一样能拦到。同页 + 标题完全一致几乎必然是同一条；
+    // 恰好两个帖子同名时拦一下也不算错（内容本就基本一样）。
+    if (nt && x.title && x.title === nt) return x;
+  }
+  return null;
+}
+function readListForPage(t, snap) {
+  return (t.readList || []).filter((x) => x.pageKey === pageKeyOf(snap.url) && x.title);
+}
+
 // ---------------- 快照消息构建 ----------------
 // tipsBlock（可选）：本站操作技巧块。放在 URL/标题与受限页提示之后、元素列表【之前】——
 // LLM 要先读到历史经验再扫元素，避免技巧沉在快照末尾被 90 个元素淹没（否则"加载了但没怎么用"）。
@@ -1434,6 +1512,12 @@ function buildSnapshotMessage(snap, tipsBlock, t, batchHint) {
   }
   if (tipsBlock) lines.push(tipsBlock);
   if (batchHint) lines.push(batchHint);
+  // 已读清单块：本页（通常是列表页）里已实际点开读过的条目，放在元素列表【之前】让 LLM 先看到"哪些已读、别重复点"
+  const readList = readListForPage(t, snap);
+  if (readList.length) {
+    lines.push('【已读清单】（系统自动记录：本页你已点开读过 ' + readList.length + ' 条，对应列表元素已标【已读】。这些不要重复点，从列表中点【未读】的下一条标题继续读）');
+    for (const x of readList) lines.push('· ' + x.title);
+  }
   if (!snap.elements || snap.elements.length === 0) {
     lines.push('（未发现可见的可交互元素）');
   } else {
@@ -1450,11 +1534,23 @@ function buildSnapshotMessage(snap, tipsBlock, t, batchHint) {
         lines.push('【子窗口 ' + fIdx + '】' + (meta && meta.title ? ' ' + meta.title : '') + (meta && meta.url ? ' ' + shortUrl(meta.url) : ''));
       }
       const label = el.text || el.hint || el.tag;
+      // 已读标记：ref 匹配优先（同一页同 ref）；点文字记入的（无 ref）按标题归一匹配，点文字常用短词（如「百果园真是疯了」点中「百果园真是疯了！！」），再兜底前缀互含。
+      // 采到正文的标【已读】（重复点会被拦截）；没采到正文的标【已读·可重开】（正文丢了，允许重开补读）
+      let readMark = '';
+      for (const x of readList) {
+        if (x.ref != null) {
+          if (el.ref === x.ref) { readMark = x.content ? ' [已读]' : ' [已读·可重开]'; break; }
+        } else if (x.title && el.text) {
+          const a = normTxt(x.title), b = normTxt(el.text);
+          if (a === b || a.startsWith(b) || b.startsWith(a)) { readMark = x.content ? ' [已读]' : ' [已读·可重开]'; break; }
+        }
+      }
       // 不把 CSS 选择器喂给 LLM：对决策是噪音且很占 token；ref 才是它用来定位动作的
       lines.push(
         `[${el.ref}] ${el.role} "${label}"` +
         (el.value ? ` 值=${el.value}` : '') +
-        (el.disabled ? ' [disabled]' : '')
+        (el.disabled ? ' [disabled]' : '') +
+        readMark
       );
     }
   }
@@ -1698,6 +1794,28 @@ async function agentStepInner(t) {
   // 页面熟悉度：本次快照成功后计数 +1，达到阈值且未失败过 → 本步允许批量动作。
   // 失败（pushFailure 清零该页计数）后恢复谨慎模式：单动作 + 每步读页，连续成功几步再放开。
   const pageKey = pageKeyOf(snap.url);
+  t.snapElements = Array.isArray(snap.elements) ? snap.elements : []; // 供已读清单记录解析点击目标文字（点击结果 label 是通用"标题"，ref 要回查快照元素取标题）
+  t.snapUrl = snap.url || ''; // 已读清单的页面归属：动作发出时所在的页面
+  // ---- 已读正文采集：刚点开的详情页快照（页面 key 与点开前不同）→ 把正文摘要附到对应已读条目上。
+  // 上下文压缩会把历史里这些正文并入(有损)摘要甚至删掉，而 readList 独立存于任务对象不受压缩影响——总结时靠这里保真。
+  // 匹配：从最新往回找"还没采到正文、且不在点开前页面(列表页)"的条目，只认详情页标题含条目标题（或互为前缀）。
+  // 不用正文摘要兜底：详情页的摘要常含"相关推荐/猜你喜欢"列表，会把别的条目标题匹配进来造成假采集（守卫误拦→死锁）。
+  if (t.readList && t.readList.length) {
+    const curKey = pageKeyOf(snap.url);
+    const snappedTitle = normTxt(snap.title || '');
+    if (snappedTitle) {
+      for (let i = t.readList.length - 1; i >= 0; i--) {
+        const r = t.readList[i];
+        if (r.content || r.pageKey === curKey) continue; // 已采过，或还停在点开前的列表页（避免把列表摘要误当成详情）
+        const t1 = normTxt(r.title || '');
+        if (!t1 || t1.length < 2) continue;
+        if (snappedTitle.includes(t1) || t1.includes(snappedTitle)) {
+          r.content = String(snap.excerpt || '').trim().slice(0, 800); // 单条正文要点上限 800 字（压缩后总结仍可用的保真记录）
+          break;
+        }
+      }
+    }
+  }
   t.pageSnapCounts = t.pageSnapCounts || {};
   t.pageSnapCounts[pageKey] = (t.pageSnapCounts[pageKey] || 0) + 1;
   const batchReady = cfg.batchEnabled !== false && t.pageSnapCounts[pageKey] >= BATCH_FAMILIAR_THRESHOLD;
@@ -1719,10 +1837,10 @@ async function agentStepInner(t) {
       }
     }
   }
-  addLog(t.sid, '浏览页面 ' + midTruncate(snap.title || shortUrl(snap.url), 30) + ' · ' + Math.round(performance.now() - t0) + 'ms');
+  addLog(t.sid, '浏览页面 ' + midTruncate(snap.title || shortUrl(snap.url), 32) + ' · ' + Math.round(performance.now() - t0) + 'ms');
   // 批量模式提示：熟悉页面明确告知 LLM 可一次输出多个动作（且给出批内定位约束），减少 LLM 往返
   const batchHint = batchReady
-    ? '【批量模式】本页你已经熟悉（历史操作稳定成功）。请批量输出：本步一次给出最多 ' + MAX_BATCH + ' 个连续动作（{"actions":[{...},{...},...]}）。若接下来是重复性循环（逐条读列表、翻页、重复填表这类同构步骤），必须合成一批，别再一步步单动作空转。仅当下一步必须看到本步结果才能决定时才输出单个动作。批内约束：动作执行后才出现的元素不能用 ref 引用（ref 来自当前快照、执行时可能已失效），要用 clickText 按文字 / clickAt·dblclickAt 按坐标 / gotoCell 按格号定位；open_tab、search、navigate、switch_tab、close_tab、use_tab、snapshot、finish、ask_user 放在批尾（执行到它们本批收尾）。确认生效用短读（read 的 target 指向批内动作涉及的具体元素）或依赖下一张快照回显；点开帖子/翻页后，正文通常已由下一张快照的正文摘要提供（含画布文字），此时批内不必整页 read；但若正文摘要/元素列表里**没出现**目标正文（如正文仍在加载、正文在图片上、只见推荐/相关列表），说明快照没抓到正文，**就必须整页 read**（target:"page"）——点了不等于读了。'
+    ? '【批量模式】本页你已经熟悉（历史操作稳定成功），默认就该批量输出。请尽量**往大了合**：本步一次给出最多 ' + MAX_BATCH + ' 个连续动作（{"actions":[{...},{...},...]}）。若接下来是重复性循环且动作**不改变页面结构**（逐条勾选、连续填表、列表内翻页、逐行操作这类同构步骤），务必合成一批，别再一步步单动作空转——**能确定的同页动作不要只合两三个就收手**。**但"点开详情读正文 → 返回列表"这类循环，点开是跳转动作、必须放批尾（本批最多一个动作），本来就只能逐条单动作——这是正常节奏，不用为凑批量硬拼**。仅当下一步必须看到本步结果才能决定时才输出单个动作。批内约束：动作执行后才出现的元素不能用 ref 引用（ref 来自当前快照、执行时可能已失效），要用 clickText 按文字 / clickAt·dblclickAt 按坐标 / gotoCell 按格号定位；open_tab、search、navigate、switch_tab、close_tab、use_tab、snapshot、finish、ask_user 放在批尾（执行到它们本批收尾）。确认生效用短读（read 的 target 指向批内动作涉及的具体元素）或依赖下一张快照回显；点开条目/翻页后，正文通常已由下一张快照的正文摘要提供（含画布文字），此时批内不必整页 read；但若正文摘要/元素列表里**没出现**目标正文（如正文仍在加载、正文在图片上、只见推荐/相关列表），说明快照没抓到正文，**就必须整页 read**（target:"page"）——点了不等于读了。'
     : '【谨慎模式】本页你还不熟悉（首次进入或刚出过错），一次只输出一个动作，系统会重新观察页面后再继续。';
   let snapMsg = buildSnapshotMessage(snap, tipsBlock, t, batchHint);
   t.history.push({ role: 'user', content: snapMsg, kind: 'snapshot' }); // kind 标记快照，buildMessages 只发最近 MAX_SNAPSHOT_KEEP 次
@@ -1751,7 +1869,7 @@ async function agentStepInner(t) {
       }
     } catch (e) {
       lastErr = e;
-      addLog(t.sid, 'LLM 输出解析失败（' + (i + 1) + '/' + MAX_STEP_LLM_RETRY + '）：' + e.message + (raw ? ' 原文=' + String(raw).slice(0, 100) : ''), true);
+      addLog(t.sid, 'LLM 输出解析失败（' + (i + 1) + '/' + MAX_STEP_LLM_RETRY + '）：' + e.message + (raw ? ' 原文=' + midTruncate(raw, 100) : ''), true); // 100：错误调试原文，预算放宽到约原 100 字符（半角单位），宽度感知
       console.warn('[PageAgent] LLM 调用/解析异常：' + e.message);
       await sleep(800 * (i + 1)); // 退避：0.8s / 1.6s / 2.4s / 3.2s，应对偶发空白/限流
     }
@@ -2144,23 +2262,35 @@ async function reviewCollectBookmark(t, p) {
   return 'updated';
 }
 
+// 键名 → 中文显示名（仅日志展示用；实际派发按键事件仍用浏览器键名 Enter/ArrowDown 等，见 content.js）
+const KEY_CN = {
+  Enter: '回车', Escape: 'Esc', Esc: 'Esc', Tab: 'Tab', Backspace: '退格',
+  ArrowUp: '上方向键', ArrowDown: '下方向键', ArrowLeft: '左方向键', ArrowRight: '右方向键',
+  ' ': '空格', Space: '空格', Delete: '删除', Insert: '插入', Home: '起始', End: '末尾',
+  PageUp: '上翻页', PageDown: '下翻页', Shift: 'Shift', Control: 'Ctrl', Ctrl: 'Ctrl',
+  Alt: 'Alt', Meta: 'Cmd', Command: 'Cmd', CapsLock: '大写锁定',
+};
+function cnKeys(s) {
+  return String(s || '').split(',').map((k) => (k.trim() ? KEY_CN[k.trim()] || k.trim() : k)).join(',');
+}
+
 // 把动作转成给使用者看的极简文案：只报"做了什么 · Nms"，不带标签/输入值/按键等细节，保持列表清爽
 function friendlyAction(a, res, ms) {
   const msTxt = ms != null ? ' · ' + ms + 'ms' : '';
   const label = (res && (res.label || res.targetLabel)) || '';
   const T = (s) => s + msTxt;
-  const short = (s) => String(s || '').replace(/\s+/g, ' ').trim().slice(0, 30);
+  const short = (s) => midTruncate(s, 32); // 宽度截断：16 个汉字 / 32 个英文符号
   // 目标是 iframe 子窗口元素时标注（子窗号·局部ref），方便核对 Agent 到底在不在点弹层里的目标
   const frameNote = (typeof a.target === 'number' && a.target >= FRAME_REF_BASE)
     ? '（子窗' + Math.floor(a.target / FRAME_REF_BASE) + '·ref' + (a.target % FRAME_REF_BASE) + '）'
     : '';
   switch (a.action) {
-    case 'click': return T('点击' + (label ? '「' + label + '」' : '') + frameNote);
+    case 'click': return T('点击' + (label ? '「' + short(label) + '」' : '') + frameNote);
     case 'clickAt': return T('点坐标(' + (Number.isFinite(Number(a.x)) ? Math.round(a.x) : '?') + ',' + (Number.isFinite(Number(a.y)) ? Math.round(a.y) : '?') + ')');
     case 'dblclickAt': return T('双击坐标(' + (Number.isFinite(Number(a.x)) ? Math.round(a.x) : '?') + ',' + (Number.isFinite(Number(a.y)) ? Math.round(a.y) : '?') + ')');
     case 'gotoCell': return T('跳格到 ' + String(a.ref || '?'));
-    case 'clickText': return T('按文字点「' + midTruncate(a.text, 20) + '」' + (typeof a.frame === 'number' && a.frame > 0 ? '（子窗' + a.frame + '）' : ''));
-    case 'hover': return T('悬浮' + (label ? '「' + label + '」' : '') + frameNote);
+    case 'clickText': return T('按文字点「' + midTruncate(a.text, 32) + '」' + (typeof a.frame === 'number' && a.frame > 0 ? '（子窗' + a.frame + '）' : ''));
+    case 'hover': return T('悬浮' + (label ? '「' + short(label) + '」' : '') + frameNote);
     case 'show': return T('强制显示' + (a.text ? '「' + short(a.text) + '」' : (a.selector ? '「' + short(a.selector) + '」' : (label ? '「' + label + '」' : ''))) + frameNote);
     case 'hide': return T('还原显示' + (a.target != null ? frameNote : ''));
     case 'type': return T('输入' + (short(a.text) ? '「' + short(a.text) + '」' : (label ? '「' + label + '」' : '')) + frameNote);
@@ -2174,7 +2304,7 @@ function friendlyAction(a, res, ms) {
     case 'snapshot': return T('翻元素窗口到第 ' + (Math.floor((Number(a.offset) || 0) / REF_WINDOW_SIZE) + 1) + ' 批');
     case 'keypress': {
       const keys = String(a.keys || '').trim();
-      return T('按键' + (keys ? ' ' + keys : (label ? '「' + label + '」' : '')));
+      return T('按键' + (keys ? ' ' + cnKeys(keys) : (label ? '「' + short(label) + '」' : '')));
     }
     case 'save_file': return T('保存文件');
     case 'bookmarks_write': return T('收藏书签');
@@ -2304,9 +2434,10 @@ async function runAction(t, a) {
 
   // ---- 元素窗口翻页（snapshot）----
   if (a.action === 'snapshot') {
+    const t0 = performance.now();
     const off = Math.max(0, Math.min(Number(a.offset) || 0, MAX_SNAPSHOT_OFFSET));
     t.snapOffset = off; // 只改窗口偏移；下一步 agentStep 会按新 offset 重读快照（URL 变了自动回第一批）
-    addLog(t.sid, '翻元素窗口到第 ' + (Math.floor(off / REF_WINDOW_SIZE) + 1) + ' 批');
+    addLog(t.sid, '翻元素窗口到第 ' + (Math.floor(off / REF_WINDOW_SIZE) + 1) + ' 批 · ' + Math.round(performance.now() - t0) + 'ms');
     nextStepOrBatch(t, myTurn);
     return;
   }
@@ -2343,7 +2474,7 @@ async function runAction(t, a) {
       : template + encodeURIComponent(query);
     let res;
     try {
-      res = await openAgentTab(url, '搜索「' + query + '」', t);
+      res = await openAgentTab(url, '搜索「' + midTruncate(query, 32) + '」', t);
     } catch (e) {
       await pushFailure(t, e.message);
       return;
@@ -2416,7 +2547,7 @@ async function runAction(t, a) {
     setCurrentRef(t, adoptedRef);
     t.history.push({ role: 'user', content: '已把浏览器标签纳入任务：@' + adoptedRef + ' ' + (tab.title || shortUrl(tab.url)) + '（当前操作标签，未切浏览器前台）' });
     const ms = Math.round(performance.now() - t0);
-    addLog(t.sid, '复用页面 ' + midTruncate(tab.title || shortUrl(tab.url), 30) + ' · ' + ms + 'ms');
+    addLog(t.sid, '复用页面 ' + midTruncate(tab.title || shortUrl(tab.url), 32) + ' · ' + ms + 'ms');
     await saveTasks();
     broadcastTabs(t);
     if (!stillCurrent(t, myTurn)) return;
@@ -2665,6 +2796,25 @@ async function runAction(t, a) {
       return;
     }
   }
+  // ---- 已读清单拦截（"读 N 条"循环）：要点的目标已在【已读】里（同一页同一 ref / 相同文字点过）→ 挡住并提示，避免重复读同一篇。
+  // 与上面的 lastActSig 判重不同：它只抓"上一步刚做完、页面没变"的连续重复；这里是跨多步的"返回列表后重读已读过的条目"。
+  if (!t._inBatch && (a.action === 'click' || a.action === 'clickText')) {
+    const pkey = pageKeyOf(t.snapUrl || '');
+    const dup = readListMatch(t, pkey, a.action === 'click' && typeof a.target === 'number' ? a.target : undefined, a.text);
+    // 只拦"已采到正文"的条目：正文已保真记录下来，重复点它没有新信息、纯空转。
+    // 没采到正文的（content 为空，如详情标题对不上/正文加载失败）不拦——压缩后模型可能正需要重开补读，放行让它恢复。
+    if (dup && dup.title && dup.content) {
+      t.history.push({
+        role: 'user',
+        content: '注意：标题「' + dup.title + '」已经在你的【已读清单】里（你刚才点开读过它，快照里那一条元素标着【已读】）。不要重复点同一条——从列表里点一个【未读】的下一条标题继续读；如果确实要再看这一条，用 open_tab 直接打开它的详情地址，而不是在列表上反复点。'
+      });
+      addLog(t.sid, '已读拦截：' + midTruncate(dup.title, 32) + ' 已在已读清单，本次点击未执行', true);
+      await saveTasks();
+      if (!stillCurrent(t, myTurn)) return;
+      nextStepOrBatch(t, myTurn);
+      return;
+    }
+  }
   await saveTasks();
   if (!stillCurrent(t, myTurn)) return;
   const t0 = performance.now();
@@ -2714,7 +2864,7 @@ async function runAction(t, a) {
     let resTab;
     const label = (res.label || '').trim();
     const display = label
-      ? ('点击「' + label + '」→ 后台打开 ' + shortUrl(res.openTab))
+      ? ('点击「' + midTruncate(label, 32) + '」→ 后台打开 ' + shortUrl(res.openTab))
       : ('点击 → 后台打开 ' + shortUrl(res.openTab));
     try {
       resTab = await openAgentTab(res.openTab, display, t);
@@ -2740,6 +2890,26 @@ async function runAction(t, a) {
     return;
   }
 
+  // ---- 已读清单记录：点击真实导航了（changed=true，或点了 target=_blank 新开页）或点文字打开了 link 类内容 → 记入已读清单。
+  // 判断标准：1) 动作生效（read 类/没生效的点击不记；click 还要求页面真的变了）；2) 目标是 link（列表项）或 clickText（按文字点的标题，不记"下一页/返回"这类导航文字）；
+  // 3) 标题非空。clickText 不要求 changed：弹层式详情（URL/页面键不变，如站内弹层）是这类站点的主流读法，若也要求 changed，
+  // 弹层打开的一条都记不进"已读"，模型看不到自己读过哪些，就会反复点同一批。已点开的重复点击由拦截兜底（有正文直接拦、没正文标【已读·可重开】放行补读）。
+  if (res && (a.action === 'click' ? (res.changed || res.openTab) : true) && (a.action === 'click' || a.action === 'clickText')) {
+    const pkey = pageKeyOf(t.snapUrl || '');
+    const ref = (a.action === 'click' && typeof a.target === 'number') ? a.target : undefined;
+    const el = ref != null ? (t.snapElements || []).find((e) => e.ref === ref) : undefined;
+    const title = a.action === 'clickText' ? String(a.text || '') : (el ? (el.text || el.hint || '') : '');
+    const isLinkish = a.action === 'clickText' ? !READ_NAV_RE.test(normTxt(title)) : !!(el && el.role === 'link');
+    if (isLinkish && normTxt(title) && pkey && !readListMatch(t, pkey, ref, title)) {
+      t.readList = t.readList || [];
+      if (t.readList.length >= 300) {
+        // 已读清单上限：超过后新条目不再跟踪（已记的照常拦截/采集），避免任务对象无限膨胀
+        addLog(t.sid, '已读清单已满 ' + t.readList.length + ' 条，本轮不再记录新条目', true);
+      } else {
+        t.readList.push({ ref, title: normTxt(title), pageKey: pkey, content: '' });
+      }
+    }
+  }
   t.history.push({
     role: 'user',
     content: '动作结果：' + JSON.stringify(res).slice(0, 3000)
@@ -2776,7 +2946,7 @@ function currentSiteLabel(t) {
     if (main) { title = main.title || ''; url = main.url || ''; }
   }
   const ttl = String(title).replace(/\s+/g, ' ').trim();
-  if (ttl) return ttl.length > 30 ? ttl.slice(0, 30) + '…' : ttl;
+  if (ttl) return midTruncate(ttl, 32);
   return hostOf(url) || '当前页面';
 }
 
@@ -3307,7 +3477,7 @@ async function processUserMessage(sid, text, tabId) {
   //     循环一直持续到使用者确认 / 说不教了 / 说先去做为止，不再"一有出入就重开演示"。
   if (t.askMode === 'confirm') {
     if (TEACH_QUIT_INTENT.test(content)) {
-      addLog(t.sid, '使用者终止教学：' + content.slice(0, 40));
+      addLog(t.sid, '使用者终止教学：' + midTruncate(content, 32));
       t.askMode = null;
       t.askText = null;
       t.waitTabId = null;
@@ -3338,12 +3508,12 @@ async function processUserMessage(sid, text, tabId) {
       return;
     }
     if (TEACH_CONFIRM_INTENT.test(content)) {
-      addLog(t.sid, '使用者在对话里确认复述无误：' + content.slice(0, 40));
+      addLog(t.sid, '使用者在对话里确认复述无误：' + midTruncate(content, 32));
       await resumeAfterUser(t.sid, content); // 把使用者的话带进去，避免重复占位
       return;
     }
     // 纠正：保留原始目标/goal，进入"再理解-再确认"循环
-    addLog(t.sid, '使用者对复述提出纠正，进入再理解-再确认循环：' + content.slice(0, 60));
+    addLog(t.sid, '使用者对复述提出纠正，进入再理解-再确认循环：' + midTruncate(content, 32));
     t.askMode = null;
     t.askText = null;
     t.waitTabId = null;
@@ -3411,6 +3581,7 @@ async function processUserMessage(sid, text, tabId) {
   t.consecWaits = 0;   // 新回合重置"连续 wait 空转"计数
   t.lastActSig = '';   // 新回合重置"重复动作"识别
   t.stuck = 0;         // 新回合重置"无进展计数"
+  t.readList = [];     // 新回合重置"已读清单"：上一轮读过的条目不再拦截，新任务从零记录
   t.lastActiveAt = Date.now();
   t.lastTipsHost = ''; // 新回合重置"技巧加载提示"去重
 
