@@ -34,7 +34,8 @@ function ensureCache(sid, n) {
       teachSteps: 0,
       tokens: 0,
       cacheHit: 0,
-      cacheMiss: 0
+      cacheMiss: 0,
+      plan: [] // 当前任务步骤计划 [{text,done}]：状态栏下方悬浮展示，done 行划线
     };
   }
   return sessionCache[sid];
@@ -219,6 +220,36 @@ function statusText(cache, label) {
 // 统一在显示某会话状态时调用（状态栏 + 会话栏），确保 token 用量随状态一并刷新
 function setSessionStatus(cache, label, cls) {
   setStatus(statusText(cache, label), cls);
+}
+
+// 任务步骤浮层渲染：有计划显示清单（done 划线）；计划空但正在运行显示"拆解中"占位；否则隐藏
+function renderStepPlan(sid) {
+  const el = $('#stepPlan');
+  const cache = sessionCache[sid];
+  if (sid !== activeSid || !cache) { el.hidden = true; return; }
+  const plan = cache.plan || [];
+  if (plan.length) {
+    el.innerHTML = '';
+    const head = document.createElement('div'); head.className = 'step-head';
+    head.textContent = '任务步骤 · ' + plan.length + ' 步';
+    const list = document.createElement('div'); list.className = 'step-list';
+    plan.forEach((s, i) => {
+      const row = document.createElement('div');
+      row.className = 'step-row' + (s.done ? ' done' : '');
+      row.textContent = (i + 1) + '. ' + s.text;
+      list.appendChild(row);
+    });
+    el.appendChild(head); el.appendChild(list);
+    el.hidden = false;
+  } else if (cache.status === 'working') {
+    el.innerHTML = '';
+    const head = document.createElement('div'); head.className = 'step-head'; head.textContent = '任务步骤';
+    const row = document.createElement('div'); row.className = 'step-row placeholder'; row.textContent = '正在拆解任务步骤…';
+    el.appendChild(head); el.appendChild(row);
+    el.hidden = false;
+  } else {
+    el.hidden = true;
+  }
 }
 
 // 顶部标题旁的"总 token 消耗"：各会话用量求和
@@ -597,6 +628,7 @@ function switchSession(sid) {
   renderSessionMsgs(sid);
   renderTabs(cache.tabs);
   setSessionStatus(cache);
+  renderStepPlan(sid); // 切换会话同步浮层（各会话计划独立缓存）
   chrome.runtime.sendMessage({ type: 'SET_ACTIVE', sid }).catch(() => {});
 }
 
@@ -642,12 +674,14 @@ function resetSessionUI(sid) {
   c.tokens = 0; // 清空本会话：token 用量一并清零
   c.cacheHit = 0; c.cacheMiss = 0; // 缓存命中统计一并清零
   c.timer = null; // 任务计时一并清空
+  c.plan = []; // 步骤计划一并清空
   renderSessionBar();
   renderHeaderTokens();
   if (sid === activeSid) {
     renderSessionMsgs(sid);
     renderTabs([]);
     setSessionStatus(c, '就绪', '');
+    renderStepPlan(sid); // 清空后隐藏浮层
   }
 }
 
@@ -914,6 +948,7 @@ function hydrateCache(s) {
   cache.cacheHit = s.cacheHit || 0;
   cache.cacheMiss = s.cacheMiss || 0;
   cache.timer = s.timer || null; // 任务计时器（面板本地按秒刷新显示）
+  cache.plan = Array.isArray(s.plan) ? s.plan : []; // 步骤计划：从后台会话状态恢复（面板重载/重连后立即显示当前计划，而非"拆解中"占位）
   cache.status = (s.state === 'working' || s.state === 'awaiting_nav') ? 'working'
     : s.state === 'waiting_user' ? 'waiting_user' : 'idle';
   cache.statusLabel = cache.status === 'working' ? '运行中…'
@@ -928,6 +963,8 @@ function hydrateCache(s) {
     else if (c.kind === 'nudge') cache.msgs.push({ kind: 'nudge', text: c.text });
     else cache.msgs.push(c.role === 'user' ? { kind: 'user', text: c.text } : { kind: 'agent', text: c.text, ok: c.ok !== false });
   }
+  // 最近动作轨迹：重载后从后台会话恢复（对话记录不含活动行，实时广播是临时的；这里按顺序补在消息末尾）
+  for (const a of s.activities || []) cache.msgs.push({ kind: 'activity', text: a.text, inBatch: !!a.inBatch });
   // 兜底：等待中但求助气泡不在对话记录里（如记录被裁剪）
   if (s.state === 'waiting_user' && !renderedAsk && s.askText) cache.msgs.push({ kind: 'ask', text: s.askText, mode: s.askMode || 'page' });
   return cache;
@@ -1022,6 +1059,7 @@ async function init() {
         }
         renderSessionBar();
         if (sid === activeSid) setSessionStatus(cache);
+        renderStepPlan(sid); // 状态变化同步浮层（working 无计划→占位；idle 有计划→保留全划线）
         break;
       }
       case 'AGENT_TOKENS': // 某会话 token 用量更新：刷新总消耗；若正是当前会话，状态栏一并更新
@@ -1030,6 +1068,10 @@ async function init() {
         cache.cacheMiss = msg.cacheMiss || 0;
         renderHeaderTokens();
         if (sid === activeSid) setSessionStatus(cache);
+        break;
+      case 'AGENT_PLAN': // 步骤计划更新：缓存并渲染浮层（模型每轮随 actions 顺带输出，完成一步划一线）
+        cache.plan = Array.isArray(msg.steps) ? msg.steps : [];
+        renderStepPlan(sid);
         break;
       case 'TIMER': // 任务计时器状态变化（开始/暂停/恢复/停止/清空）
         cache.timer = msg.timer || null;

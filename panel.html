@@ -70,6 +70,9 @@
     <button id="logToggle" class="ghost" title="导出本会话全量日志：发给大模型的完整消息、大模型原始返回、浏览器动作与结果（下载为文件）">日志</button>
   </section>
 
+  <!-- 任务步骤计划卡片：插在状态栏与聊天区之间、占文档流空间（聊天区让位，顶部消息不被遮挡）；完成的行划线 -->
+  <div id="stepPlan" hidden></div>
+
   <main id="chat">
     <div id="messages">
       <div class="chat-hint">持续对话模式：下达指令，完成后可继续追问。</div>

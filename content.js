@@ -310,6 +310,9 @@
       tag === 'input' || tag === 'select' || tag === 'textarea'
         ? String(el.value || '').slice(0, 40)
         : '';
+    // 链接地址：<a>/<area> 的 el.href 是解析后的绝对地址（相对路径/锚点也会解析）。快照据此给列表元素带 →地址，
+    // 模型攒详情 URL 批量 open_tab 用。非链接元素留空。
+    const href = (tag === 'a' || tag === 'area') && el.href ? String(el.href) : '';
     return {
       ref,
       role,
@@ -317,6 +320,7 @@
       text,
       hint,
       value,
+      href,
       disabled: !!el.disabled,
       selector: cssPath(el)
     };

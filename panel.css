@@ -119,6 +119,25 @@ label.check input[type="checkbox"] {
 }
 #statusText { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 #logToggle { padding: 1px 8px; font-size: 11px; flex-shrink: 0; }
+
+/* 任务步骤计划卡片：插在状态栏与聊天区之间、占文档流空间（聊天区让位，顶部消息不被遮挡）；
+   带阴影与圆角保留"浮层卡片"观感；完成的行划线（纯文字，不用 emoji） */
+#stepPlan {
+  flex-shrink: 0;
+  max-height: 220px;
+  overflow-y: auto;
+  background: var(--bg);
+  color: var(--text);
+  border-bottom: 1px solid var(--border);
+  box-shadow: 0 6px 16px rgba(0,0,0,.10);
+  padding: 8px 14px;
+  font-size: 12px;
+}
+#stepPlan[hidden] { display: none; }
+.step-head { color: var(--muted); font-size: 11px; margin-bottom: 6px; }
+.step-row { padding: 2px 0; line-height: 1.5; word-break: break-word; }
+.step-row.done { color: var(--muted); text-decoration: line-through; }
+.step-row.placeholder { color: var(--accent); }
 /* ---------------- 顶部会话栏 ---------------- */
 #sessionBar {
   display: flex;
