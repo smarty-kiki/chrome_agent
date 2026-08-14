@@ -756,6 +756,19 @@
     return desc ? '未找到「' + desc + '」' : ('未找到目标 ref=' + ref);
   }
 
+  // 等-动：动动作动手前确保目标元素出现。目标本就在时首查即返回（零成本）；动作/加载触发的重渲染把元素
+  // 替换成新节点、或元素稍后才渲染出来时，轮询 finder 直到找到或超时，超时返回 null 走原"找不到"逻辑。
+  const TARGET_WAIT_MS = 1500; // 目标等待上限：目标真没有时最多等这么久再失败
+  const TARGET_WAIT_STEP = 80; // 轮询间隔
+  async function findTargetOrWait(finder, timeoutMs = TARGET_WAIT_MS) {
+    for (let waited = 0; ; waited += TARGET_WAIT_STEP) {
+      const el = finder();
+      if (el) return el;
+      if (waited >= timeoutMs) return null;
+      await sleep(TARGET_WAIT_STEP);
+    }
+  }
+
   // ---------------- 按文字找元素（clickText 兜底用） ----------------
   // 大模型对页面文字做语义判断、直接试点列表外元素时，用文字在 DOM 里定位最具体的元素。
   // 先扫文本节点做包含匹配（只走字符串判断、开销小），找不到再退回元素 textContent 扫描
@@ -1078,22 +1091,31 @@
     return cands.length ? cands[0].el : null; // 兜底：文本最短匹配（可见的也算，强制显示它本身或隐藏祖先）
   }
 
-  // 动作后的页面稳定等待（事件驱动，非固定延时）：会触发跳转或重渲染的动作——Enter/Tab/Escape/空格这类"提交/
-  // 关闭"键、scroll 滚动触发懒加载、click 触发的 SPA 状态切换——执行后，页面往往异步跳转或重渲染。若不等渲染完
-  // 就返回，background 紧接着拍的快照会拍到动作前的旧页面，模型就基于旧页面乱点（如点击已失效的无名按钮）而失败。
+  // ---- 彻底统一：动作分"等-动/动"，操作后一律不等待，等待前移为读动作的等 ----
+  // 可变动作成功执行后记 lastMutatingAt；snapshot / read 这类"读页面状态"的动作读前若刚动过 DOM，
+  // 先 settlePage 一次（等渲染静）再读——替代原动作内部的固定 sleep（hover 600ms / show 200ms / type 350ms 等）。
+  // 纯读动作（read）不进 MUTATING_ACTIONS；openTab 拦截未真动页面也不标记。
+  let lastMutatingAt = 0; // 最近一次可变动作成功的时间戳（0=未标记）；读动作 settle 后清 0，避免每张快照重复等
+  const MUTATING_ACTIONS = new Set(['click', 'clickAt', 'dblclickAt', 'clickText', 'gotoCell', 'hover', 'show', 'hide', 'type', 'select', 'scroll', 'keypress']);
+  // 读动作读前等 DOM 静：上一步动过则 settle 一次并清标记（读到动作后的稳定状态）
+  async function settleIfJustMutated() {
+    if (!lastMutatingAt) return;
+    await settlePage();
+    lastMutatingAt = 0;
+  }
+
+  // 读动作前的页面稳定等待（事件驱动，非固定延时）：上一步动作触发的跳转/重渲染往往是异步的，
+  // 若不等渲染完就拍快照，会拍到动作前的旧页面，模型就基于旧页面乱点而失败。
   // 机制：MutationObserver 监听 DOM 变更，连续 SETTLE_QUIET_MS 无变更（渲染静止）即认为稳定；
-  // URL 变化视为跳转进行中，重置静默计时再等渲染；整页导航（pagehide）立即放行，交给 background 的 awaitNav；
+  // URL 变化视为跳转进行中，重置静默计时再等渲染；整页导航（pagehide）立即放行，交给 background 恢复循环；
   // SETTLE_MAX_MS 仅为防挂死上限（页面持续动画/懒加载时兜底），正常路径远到不了它。
   const SETTLE_QUIET_MS = 300; // DOM 连续静默此毫秒数视为渲染稳定（事件驱动的静默窗口，非总等待时长）
   const SETTLE_MAX_MS = 2500;  // 兜底上限：防止页面永不静止（无限滚动/动画/懒加载）时本步挂死
-  const KEYPRESS_NAV_KEYS = new Set(['Enter', 'Tab', 'Escape', ' ', 'Space']); // 可能触发跳转/重渲染的按键（仅 keypress 用）
   function settlePage() {
     return new Promise((resolve) => {
       let done = false;
       let last = Date.now();
       let lastUrl = location.href;
-      const url0 = location.href; // 进入本动作时的 URL，用于判断本次动作是否触发了跳转
-      let mutated = false;       // 静默窗口内 DOM 是否有过变更
       let timer = null;
       let maxTimer = null;
       const finish = () => {
@@ -1103,12 +1125,9 @@
         clearTimeout(maxTimer);
         obs.disconnect();
         window.removeEventListener('pagehide', onPageHide);
-        // changed=本次动作是否产生了可观察变化（URL 跳转或 DOM 重渲染）。click 用它告知模型
-        // "这次点击到底有没有生效"：全 false 说明是死点（点了没反应），模型据此换招，别对死点反复试。
-        resolve({ changed: mutated || location.href !== url0 });
+        resolve();
       };
-      const arm = () => { // DOM 有变更：记下变化、静默计时归零，重新数 QUIET_MS
-        mutated = true;
+      const arm = () => { // DOM 有变更：静默计时归零，重新数 QUIET_MS
         last = Date.now();
         clearTimeout(timer);
         timer = setTimeout(check, SETTLE_QUIET_MS);
@@ -1135,7 +1154,7 @@
   async function executeActionInner(a) {
     switch (a.action) {
       case 'click': {
-        const el = findTarget(a.target);
+        const el = await findTargetOrWait(() => findTarget(a.target)); // 等-动：目标出现再点
         if (!el) return { ok: false, message: notFoundMsg(a.target) };
 
         // 点击"会新开页面"的链接（target="_blank"）时，浏览器默认会新开标签并抢前台焦点。
@@ -1154,10 +1173,9 @@
         try { el.scrollIntoView({ block: 'center' }); } catch (e) {}
         fireClick(el);
         focusEl(el);
-        // 点击常触发 SPA 跳转/弹层/状态切换，DOM 会异步重渲染：等页面稳定再返回，避免下个快照拍到点击前的旧页面。
-        // settled.changed=false 说明点击没产生可观察变化（URL 没变、DOM 没动）= 死点，模型据此换招。
-        const settled = await settlePage();
-        return { ok: true, label: elementLabel(el), changed: !!settled.changed };
+        // 彻底统一：操作后不等待——点击是否生效（SPA 跳转/弹层/死点）由下一个快照体现，
+        // 模型对比前后两轮快照判断，不再靠动作返回的 changed。
+        return { ok: true, label: elementLabel(el) };
       }
 
       case 'clickAt': { // 按视口坐标点击：画布文字钩子给出坐标后，点画布上具体位置/单元格（内容不在 DOM，无法用 ref 定位）
@@ -1213,22 +1231,26 @@
       }
 
       case 'gotoCell': { // 电子表格通用能力：按格子引用跳格（D2 / $A$1 / E5:G8），不依赖像素坐标。
-        // 识别"单元格名称框"（value 是格子号格式的输入框——表格通用特征）→ 输格号 + 回车 → 读回验证。
+        // 识别"单元格名称框"（value 是格子号格式的输入框——表格通用特征）→ 输格号 + 回车。
         const rawRef = String(a.ref || '').trim();
         const ref = rawRef.toUpperCase();
         if (!/^[$]?[A-Z]{1,3}[$]?[0-9]{1,7}(:[$]?[A-Z]{1,3}[$]?[0-9]{1,7})?$/.test(ref)) {
           return { ok: false, message: 'gotoCell 需要格子引用（如 D8、$A$1、E5:G8），收到: ' + (rawRef || '(空)') };
         }
-        let nameBox = null;
-        try {
-          for (const el of document.querySelectorAll('input')) {
-            const v = String(el.value || '').trim().toUpperCase();
-            if (/^[$]?[A-Z]{1,3}[$]?[0-9]{1,7}(:[$]?[A-Z]{1,3}[$]?[0-9]{1,7})?$/.test(v)) {
-              const r = el.getBoundingClientRect();
-              if (r.width > 0 && r.height > 0) { nameBox = el; break; } // 首个可见匹配即名称框（公式栏里排最前）
+        // 名称框查找抽成函数供 findTargetOrWait 轮询：跳格前重渲染可能替换了输入框节点
+        const findNameBox = () => {
+          try {
+            for (const el of document.querySelectorAll('input')) {
+              const v = String(el.value || '').trim().toUpperCase();
+              if (/^[$]?[A-Z]{1,3}[$]?[0-9]{1,7}(:[$]?[A-Z]{1,3}[$]?[0-9]{1,7})?$/.test(v)) {
+                const r = el.getBoundingClientRect();
+                if (r.width > 0 && r.height > 0) return el; // 首个可见匹配即名称框（公式栏里排最前）
+              }
             }
-          }
-        } catch (e) {}
+          } catch (e) {}
+          return null;
+        };
+        const nameBox = await findTargetOrWait(findNameBox);
         if (!nameBox) return { ok: false, message: '没找到单元格名称框（页面没有 value 是格子号格式的输入框，无法跳格），可用 clickAt 坐标点选兜底' };
         try { nameBox.scrollIntoView({ block: 'center' }); } catch (e) {}
         nameBox.focus();
@@ -1239,36 +1261,32 @@
         nameBox.dispatchEvent(new KeyboardEvent('keydown', k));
         nameBox.dispatchEvent(new KeyboardEvent('keypress', k));
         nameBox.dispatchEvent(new KeyboardEvent('keyup', k));
-        await sleep(300); // 等跳转 + 表格重画
-        const now = String(nameBox.value || '').trim().toUpperCase();
-        const ok = now === ref;
-        // ---- 跳格成功后把焦点交还给表格网格 ----
+        // 彻底统一：操作后不等待、不读回验证——跳格是否生效由下一个快照体现（单元格位置/名称框值可见）。
+        // ---- 把焦点交还给表格网格 ----
         // 名称框回车后焦点常留在输入框上，导致后续 F2/打字作用不到表格（F2 按在输入框上不进编辑）。
         // 表格的键盘处理器挂在"网格表面"容器上、键事件会冒泡，所以把焦点放到网格内部元素即可：
         // 先 blur 名称框（应用可能自己把焦点还回网格），焦点仍不在网格上时，再找大画布的可聚焦祖先/画布本身。
-        if (ok) {
-          try { nameBox.blur(); } catch (e) {}
-          await sleep(60); // 给应用机会自行把焦点还回网格
-          let g = document.activeElement;
-          const gIsInput = g && (g.tagName === 'INPUT' || g.tagName === 'TEXTAREA' || g.isContentEditable);
-          if (!g || g === document.body || g === document.documentElement || gIsInput) {
-            g = null;
-            try {
-              for (const c of document.querySelectorAll('canvas')) {
-                const r = c.getBoundingClientRect();
-                if (r.width < 200 || r.height < 200) continue; // 小画布（图标/头像）跳过，只认大网格
-                let cur = c;
-                for (let i = 0; cur && cur !== document.body && i < 6; i++) {
-                  const at = cur.getAttribute && cur.getAttribute('tabindex');
-                  if (at != null && at !== '-1') { g = cur; break; } // 网格表面的可聚焦容器
-                  cur = cur.parentElement;
-                }
-                g = g || (c.closest('[role="grid"],[role="application"],[role="table"],[role="treegrid"]') || c);
-                break;
+        try { nameBox.blur(); } catch (e) {}
+        await sleep(60); // 给应用机会自行把焦点还回网格
+        let g = document.activeElement;
+        const gIsInput = g && (g.tagName === 'INPUT' || g.tagName === 'TEXTAREA' || g.isContentEditable);
+        if (!g || g === document.body || g === document.documentElement || gIsInput) {
+          g = null;
+          try {
+            for (const c of document.querySelectorAll('canvas')) {
+              const r = c.getBoundingClientRect();
+              if (r.width < 200 || r.height < 200) continue; // 小画布（图标/头像）跳过，只认大网格
+              let cur = c;
+              for (let i = 0; cur && cur !== document.body && i < 6; i++) {
+                const at = cur.getAttribute && cur.getAttribute('tabindex');
+                if (at != null && at !== '-1') { g = cur; break; } // 网格表面的可聚焦容器
+                cur = cur.parentElement;
               }
-              if (g) { g.focus(); await sleep(30); }
-            } catch (e) {}
-          }
+              g = g || (c.closest('[role="grid"],[role="application"],[role="table"],[role="treegrid"]') || c);
+              break;
+            }
+            if (g) { g.focus(); await sleep(30); }
+          } catch (e) {}
         }
         // 诊断：跳格+焦点交还后，焦点落在哪个元素（日志里能直接看到，方便排查 F2 是否作用到表格）
         let foc = '';
@@ -1276,13 +1294,14 @@
           const f = document.activeElement;
           foc = f && f !== document.body && f !== document.documentElement ? (elementLabel(f) || f.tagName) : 'body';
         } catch (e) {}
-        return { ok, message: ok ? '已跳到 ' + ref + '，焦点在「' + foc + '」' : '跳转未生效：名称框仍显示 ' + (now || '(空)') + '，可用 clickAt 坐标点选兜底', at: [ref, now] };
+        return { ok: true, message: '已向名称框提交 ' + ref + '，焦点在「' + foc + '」', at: [ref] };
       }
 
       case 'clickText': { // 兜底：元素列表解决不了时，大模型对页面文字做语义判断、直接试点"可能可点"的文字
         const raw = String(a.text || '').trim();
         if (!raw) return { ok: false, message: 'clickText 缺少要点的文字 text' };
-        const el = findElementByText(raw);
+        // 等-动：目标文字出现再点（等渲染/懒加载补上文字；真没有时最多等 TARGET_WAIT_MS 再报提示）
+        const el = await findTargetOrWait(() => findElementByText(raw));
         if (!el) return { ok: false, quiet: true, message: '页面上没找到文字「' + raw.slice(0, 30) + '」——它可能已随列表滚动被回收（虚拟列表只保留视口附近的项），先 scroll 让列表项回到页面再重试 clickText' };
         // 从命中文字向上找最近的"可点"元素（自身或祖先：a/button/[role]/绑了点击处理器/手型），
         // 找不到可点的就点命中元素本身——兜底本就允许赌一把。
@@ -1309,11 +1328,11 @@
         return { ok: true, label: elementLabel(el), byText: true };
       }
 
-      case 'hover': { // 悬浮在元素上（不点击），用于让"悬浮才出现"的元素显示出来；发完合成事件等渲染
-        const el = findTarget(a.target);
+      case 'hover': { // 悬浮在元素上（不点击），用于让"悬浮才出现"的元素显示出来
+        const el = await findTargetOrWait(() => findTarget(a.target)); // 等-动：目标出现再悬
         if (!el) return { ok: false, message: notFoundMsg(a.target) };
         dispatchHover(el);
-        await sleep(600); // 等悬浮展开的菜单/操作项渲染完，background 下一步快照才能看到
+        // 彻底统一：操作后不等待——菜单/操作项渲染完由下一个读动作（快照）读前 settle 承担
         return { ok: true, label: elementLabel(el), hovered: true };
       }
 
@@ -1334,7 +1353,7 @@
           return { ok: false, message: 'show 需要 target / selector / text 之一' };
         }
         const shown = forceShowChain(el);
-        await sleep(200); // 等一瞬让强制显示后的重排/渲染落定，下个快照能拍到（纯 CSS 隐藏此时已可见）
+        // 彻底统一：操作后不等待——强制显示同步生效，重排/渲染落定由下一个读动作读前 settle 承担
         return { ok: true, label: elementLabel(el), shown }; // shown=实际动过的元素数，0 说明本来就可见（show 没揭示新东西）
       }
 
@@ -1350,8 +1369,8 @@
       }
 
       case 'type': {
-        const t0 = performance.now(); // 记录开始时间，用于判定"输入卡住超过 10 秒"
-        const el = findTarget(a.target);
+        const t0 = performance.now(); // 记录开始时间，用于返回耗时
+        const el = await findTargetOrWait(() => findTarget(a.target)); // 等-动：目标出现再输入
         if (!el) return { ok: false, message: notFoundMsg(a.target) };
         const text = String(a.text ?? '');
         // 隐藏输入捕获编辑器（如腾讯文档 melo-hidden-editor）：可见宿主是纯 div，真实输入面
@@ -1398,28 +1417,13 @@
         } else {
           return { ok: false, message: '目标不是可输入元素（' + el.tagName + '）' };
         }
-        // 输入落地校验 + 超时判定：后台标签常被浏览器节流、或网站没接受合成输入（打进去又回退），
-        // 此时 inputStuck=true 让后台非阻塞地提醒使用者介入（Agent 不等待、继续执行）。
-        let inputStuck = false;
-        if (text.trim() !== '') {
-          await sleep(350); // 等一拍，让网站处理合成 input 事件 / 受控组件回写后再验
-          if (inputEl) {
-            // 隐藏编辑器自身常被引擎清空（内容渲染到可见层），照旧校验会误报"输入卡住"；
-            // 改看可见宿主是否真的出现了输入内容。
-            const hostText = (el.innerText || '').replace(/\s+/g, '');
-            const probe = text.trim().replace(/\s+/g, '').slice(0, 30);
-            inputStuck = hostText === '' || !hostText.includes(probe);
-          } else {
-            const got = target.isContentEditable ? (target.textContent || '') : (target.value || '');
-            inputStuck = got.trim() === '';
-          }
-        }
-        if (performance.now() - t0 > 10000) inputStuck = true;
-        return { ok: true, label: elementLabel(el), inputStuck, ms: Math.round(performance.now() - t0) };
+        // 彻底统一：操作后不等待、不读回验证——输入是否落地（含后台节流/网站拒收）由下一个快照体现，
+        // 模型自己看得出，不再靠 inputStuck 返回值触发提醒。
+        return { ok: true, label: elementLabel(el), ms: Math.round(performance.now() - t0) };
       }
 
       case 'select': {
-        const el = findTarget(a.target);
+        const el = await findTargetOrWait(() => findTarget(a.target)); // 等-动：目标出现再选
         if (!el || el.tagName !== 'SELECT') return { ok: false, message: '目标不是下拉框' };
         el.value = a.value;
         el.dispatchEvent(new Event('input', { bubbles: true }));
@@ -1444,15 +1448,16 @@
             innerMoved = Math.abs(el.scrollTop - eb);
           }
         }
-        // 滚动常触发懒加载/重排（无限流补内容），页面会异步加节点：等渲染稳定再返回，避免下个快照与滚动前无差异（白耗一轮往返）
-        await settlePage();
+        // 彻底统一：操作后不等待——懒加载/重排由下一个读动作读前 settle 承担
         return { ok: true, moved: innerMoved || moved };
       }
 
       case 'read': {
+        // 等-动：上一步刚动过 DOM（点击/输入/滚动等）则先等渲染稳定再读，读到的是落定后的内容
+        await settleIfJustMutated();
         let el;
         if (a.target === 'page' || a.target == null) el = document.body;
-        else el = findTarget(a.target);
+        else el = await findTargetOrWait(() => findTarget(a.target));
         if (!el) return { ok: false, message: notFoundMsg(a.target) };
         const raw = a.raw === true;
         // 默认去页脚税；raw:true 只在核对页脚/备案等底部原文时用（会含页脚噪音）
@@ -1483,11 +1488,7 @@
         // 只有真正聚焦了可交互元素时才报元素标签；聚焦 body 则留空，让面板显示按键本身
         const focused = document.activeElement;
         const hasTarget = focused && focused !== document.body && focused !== document.documentElement;
-        // Enter/Tab/Escape/空格 可能触发 SPA 跳转或重渲染：等页面稳定再返回，避免下个快照拍到旧页面。
-        // 纯编辑键（Backspace/方向键/字符）不等待，保持响应。
-        if (keys.some((k) => KEYPRESS_NAV_KEYS.has(k))) {
-          await settlePage();
-        }
+        // 彻底统一：操作后不等待——Enter/Tab 等触发的跳转/重渲染由下一个读动作读前 settle 承担
         return { ok: true, label: hasTarget ? elementLabel(focused) : '' };
       }
 
@@ -1830,11 +1831,19 @@
         case 'PING':
           return { pong: true };
         case 'GET_SNAPSHOT': {
+          // 等-动：快照是"读页面状态"的动作，读前若上一步刚动过 DOM 先 settle 一次（等渲染静），
+          // 保证拍到动作后的状态；settle 先于 collectCanvasText，画布重绘也被带出。
+          await settleIfJustMutated();
           const canvasEntries = await collectCanvasText(); // 画布文字：收最新一批并重置钩子，供 buildSnapshot 带出
           return buildSnapshot(canvasEntries, Number(msg.offset) || 0); // offset：翻页窗口起始偏移
         }
-        case 'EXECUTE_ACTION':
-          return executeAction(msg.action || {});
+        case 'EXECUTE_ACTION': {
+          const a = msg.action || {};
+          const res = await executeAction(a);
+          // 动过页面 → 标记，下一步读动作（快照/read）读前先 settle；openTab 拦截未真动页面不标记
+          if (res && res.ok && !res.openTab && MUTATING_ACTIONS.has(a.action)) lastMutatingAt = Date.now();
+          return res;
+        }
         case 'TEACH_START':
           teachStart();
           return { ok: true };

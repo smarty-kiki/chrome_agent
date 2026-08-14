@@ -163,7 +163,7 @@ async function createSession(tabId) {
     navWaitIdx: null, // "打开页面"行已显示标记（navigate/awaitNav 置位），就绪后把用时合并进该行
     navWaitUrl: null, // navigate 的截断地址（awaitNav 为 null），合并时决定行文
     plan: [],         // 当前任务步骤计划（模型每轮输出的 steps 拆解 [{text,done}]），面板状态栏下方悬浮展示
-    activities: [],   // 最近动作轨迹 [{text,inBatch}]（上限 ACTIVITY_PERSIST）：面板重载后恢复动作日志用，非实时展示载体
+    activities: [],   // 最近动作轨迹 [{text,inBatch,t}]（上限 ACTIVITY_PERSIST）：面板重载后恢复动作日志用，非实时展示载体；t 时间戳供面板与对话记录按时间交错恢复
     lastActiveAt: Date.now(),
     consecWaits: 0,   // 连续 wait 次数（无真实动作插入时累计，防"假装人类"空转）
     lastActSig: '',   // 最近一次执行（成功或失败）的页面动作签名，识别"反复执行同一个动作"的无进展循环
@@ -255,7 +255,7 @@ function addLog(sid, m, quiet, forceInBatch) {
     const tk = getTask(sid);
     if (tk) {
       tk.activities = tk.activities || [];
-      tk.activities.push({ text: String(m), inBatch });
+      tk.activities.push({ text: String(m), inBatch, t: Date.now() });
       if (tk.activities.length > ACTIVITY_PERSIST) tk.activities.splice(0, tk.activities.length - ACTIVITY_PERSIST);
     }
   }
@@ -619,21 +619,20 @@ function systemPrompt() {
 2. 逐步执行：观察 → 决策 → 执行 → 再观察，直到完成这条指令。
 3. 用 finish 给出这条指令的回答，然后**等待使用者下一条指令**（不要结束对话，不要关闭标签）。
 
-多轮对话中，请记住并复用此前完成的操作和得出的结论（对话记录跨轮保留）。例如使用者说"把刚才的总结存成文件"，你应能找到之前的总结内容并用 save_file 保存。注意：每轮完成时你自开的标签（@T 系）会被自动关闭，跨轮不再存在；要重新访问某页面时用 open_tab/search 重新打开，或用 use_tab 用使用者已打开的标签。
+多轮对话中，请记住并复用此前完成的操作和得出的结论（对话记录跨轮保留）。例如使用者说"把刚才的总结存成文件"，你应能找到之前的总结并用 save_file 保存。注意：每轮结束你自开的标签（@T 系）会被自动关闭、跨轮不再存在，需要重新访问时用 open_tab/search 重开，或 use_tab 用使用者已打开的标签。
 
-你拥有"任务标签页"：@MAIN 是使用者交给你的标签页（属于使用者，不要随便关）；@T1/@T2/... 是你自己新开的后台标签（已自动归入本会话的 PageAgent N 分组，不影响使用者浏览；点击"新开页面"的链接也会自动变成后台 @T 标签，不抢你正在看的焦点）；@U1/@U2/... 是你用 use_tab 纳入任务的使用者已有标签（同样属于使用者，不要随便关）。
-你通过"页面快照"感知当前操作标签的网页：包括标签页列表、URL、标题、可交互元素列表（[ref] 类型 文本 值 选择器）和正文摘要。正文摘要默认滤掉了站点恒定导航/页脚/法务备案等噪音（页脚税），只留页面内容主体（含画布渲染的正文），读取正文、确认内容不必每次重复 read 整页（那是冗余往返）——但快照正文摘要/元素列表里**没出现**目标正文时（如正文仍在加载、正文在图片上、只见推荐/相关列表），说明快照没抓到正文，必须 read 整页（target:"page"）去拿——点开不等于读到；read 用于读摘要没覆盖的局部（如某元素/弹窗内单独文字，target 填那个 ref）。read 整页同样已滤掉页脚税、并已并入画布渲染的正文，读内容/文档/表格直接用默认 read（**不要加 "raw":true**）；"raw":true 只在需要核对页脚/备案/许可这类底部原文时用（会带页脚噪音）。页面可能包含内嵌 iframe 子窗口（如某些网站的弹窗/新建流程），子窗口里的可交互元素也会并进快照、用【子窗口 N】分组标出，正文摘要里附有子窗口内容，你同样可以点击/读取它们。若快照提示有未读取成功的内嵌窗口（可能仍在加载），先 wait 等它加载完再重新观察，目标往往会出现，不要因为一时看不到就转去别处乱点。若你刚点击了一个按钮/链接，下一次快照里出现了新的【子窗口 N】分组或元素变多，说明弹窗/面板已经打开，接下来的目标应该在这个新窗口里找——**不要重复点击刚才那个按钮**（可能把弹窗又关掉），直接在弹窗里继续操作。
-快照开头（元素列表之前）的【本站操作技巧】是该网站历史沉淀下来的操作经验（比如"搜索要直接点第一条结果""要先点开下拉再选择"）。它放在元素列表**之前**：**每次选元素、定动作前先对照它**，与技巧描述不符的做法多半在绕弯路，优先按技巧来。当反复失败、找不到元素、或准备执行的动作与技巧不一致时，先回头对照本站技巧调整，而不是硬试同一招；若某条技巧与当前页面明显冲突（页面已改版），说明它已过期，跳过它、以当前页面为准。
+你拥有"任务标签页"：@MAIN 是使用者交给你的标签（属于使用者，不要随便关）；@T1/@T2/... 是你自己新开的后台标签（自动归入本会话 PageAgent N 分组、不抢焦点；点"新开页面"链接也会自动变成后台 @T）；@U1/@U2/... 是你用 use_tab 纳入的使用者已有标签（同样不要随便关）。
+你通过"页面快照"感知当前操作标签的网页：包括标签页列表、URL、标题、可交互元素列表（[ref] 类型 文本 值 选择器）和正文摘要。正文摘要默认滤掉站点恒定导航/页脚/法务备案等噪音（页脚税）、并入画布渲染的正文，只留内容主体——读取正文、确认内容不必每次重复 read 整页（那是冗余往返）；但快照摘要/元素列表里**没出现**目标正文时（如正文还在加载、正文在图片上、只见推荐/相关列表），说明快照没抓到正文，必须 read 整页（target:"page"）去拿，**点开不等于读到**；read 用于读摘要没覆盖的局部（如某元素/弹窗内单独文字，target 填那个 ref）。read 整页的页脚税过滤与 raw 细节见动作说明。页面可能含内嵌 iframe 子窗口（弹窗/新建流程），其元素并进快照、用【子窗口 N】分组标出，正文摘要附其内容，可正常点击/读取。快照提示有未读取成功的内嵌窗口时，先 wait 等加载完再观察，别一时看不到就乱点。刚点击后快照出现新的【子窗口 N】分组或元素变多，说明弹窗已打开，目标在这个新窗口里找——**别重复点击刚才那个按钮**（可能把弹窗又关掉），直接在弹窗里继续操作。
+快照开头的【本站操作技巧】是该网站历史沉淀的操作经验（如"搜索要直接点第一条结果"）。**每次选元素、定动作前先对照它**——与技巧不符的做法多半在绕弯路，优先按技巧来；反复失败、找不到元素、或动作与技巧不一致时先回头对照调整，别硬试同一招；某条技巧与当前页面明显冲突（页面已改版）说明已过期，跳过它、以当前页为准。
 
-每收到一个快照，你必须输出 JSON 动作。接到新指令的首轮先拆解：把达成这条指令要做的事分成 3~8 步（按大事件/阶段分，不是单个动作），随本轮 actions 一起输出 steps 字段 {"steps":[{"text":"...","done":false},...],"actions":[...]}；之后每轮随 actions 顺带输出更新后的 steps（已完成的 done 置 true），面板会实时划线展示进度，全部完成才 finish。**默认倾向批量输出**：一次把多个**连续、下一步不必看中间结果**的动作合在一起输出 {"actions":[{...},{...},...]}（最多 ${MAX_BATCH} 个），系统会连续执行，大幅减少往返、更快。逐条勾选、连续填表、列表内翻页、逐行操作这类重复性循环，**务必合成一批，别再一步步单动作空转**；当快照提示【批量模式】已开启（本页你已熟悉）时，**更要把能确定的动作尽量多合批、一次多干几件——熟悉页面合批是性能要求，不是可选优化**。当快照提示【谨慎模式】（本页不熟悉/刚出错）时才退回一次一个动作。**多 tab 是默认工作方式**：只要任务需要（读多条详情、跨页对比、并行处理），就用 open_tab 开多个后台标签并放进同一批执行，而不是脑子里只盯一个 tab。**例外——输出单个动作**：必须看到本步结果才能决定下一步；或拿不准；或要结束本轮（finish）。批量规则：
+每收到一个快照，你必须输出 JSON 动作。接到新指令的首轮先拆解：把达成这条指令要做的事分成 3~8 步（按大事件/阶段分，不是单个动作），随本轮 actions 一起输出 steps 字段 {"steps":[{"text":"...","done":false},...],"actions":[...]}；之后每轮随 actions 顺带输出更新后的 steps（已完成的 done 置 true），面板会实时划线展示进度，全部完成才 finish。**默认倾向批量输出**：把多个**连续、下一步不必看中间结果**的动作合在一起输出 {"actions":[{...},{...},...]}（最多 ${MAX_BATCH} 个），系统连续执行、大幅减少往返。逐条勾选、连续填表、列表内翻页、逐行操作这类重复循环，**务必合成一批，别单动作空转**；快照标【批量模式】（本页已熟悉）时更要尽量多合批，标【谨慎模式】（本页不熟悉/刚出错）时才退回一次一个动作。**多 tab 是默认工作方式**：任务需要（读多条详情、跨页对比、并行处理）时用 open_tab 开多个后台标签放进同一批执行，而不是只盯一个 tab。**例外——输出单个动作**：必须看到本步结果才能决定下一步、拿不准、或要结束本轮（finish）。批量规则：
 - **批内顺序依赖要弱**：某个动作执行后才出现的元素，后续动作**不能用它的 ref**（ref 来自旧快照，执行时会失效），要用 clickText 按文字 / clickAt·dblclickAt 按坐标 / gotoCell 按格号来定位；
 - **批内可跨页**：open_tab / search / navigate / switch_tab / use_tab / close_tab 可在批内任意位置；连续跨页之间系统不等（多个新页并行加载），系统会在真正读/点的动作前自动等当前操作标签页面就绪——单页加载不打断整批。只有 snapshot / finish / ask_user 放批尾（执行到它们本批收尾），之后系统重新观察页面；
-- 每批尽量以 read 或读回校验结尾，确认动作生效；一个动作最多 ${MAX_BATCH} 个，拿不准就输出单个动作。
-- **熟悉页面合批是性能要求**：快照标【批量模式】后，凡能确定的连续同页动作都合批、尽量往大了合（单批上限 ${MAX_BATCH}）；只有上面"跳转 / 必须看结果 / 拿不准"的例外才输出单个动作。
+- 每批尽量以 read 或读回校验结尾，确认动作生效。
 可用动作：
 
 0. 标签操作（ref 用 @MAIN / @T1 / @U1 ...；tabId 用 list_tabs 返回的编号）：
-   {"action":"open_tab","url":"https://..."}   新开后台标签（不抢焦点、自动加入分组）。链接元素在快照里带 →地址，需要详情地址时直接从快照取（如读 N 条任务：用列表元素的 →地址 攒 URL 批量 open_tab + read），不必先点开再找
+   {"action":"open_tab","url":"https://..."}   新开后台标签（不抢焦点、自动加入分组）。链接元素快照里带 →地址，需要详情地址直接取来 open_tab（如读 N 条任务：用列表元素的 →地址 攒 URL 批量开页），不必先点开再找
    {"action":"search","query":"关键词"}          用搜索引擎搜索（自动打开后台标签，不要手动拼 URL）
    {"action":"switch_tab","ref":"@T1"}          切换 Agent 关注的操作标签（不切换浏览器前台）
    {"action":"list_tabs"}                       列出浏览器【所有】标签（标题+网址+tabId，标记当前选中的、已在任务里的和无法操作的受限页）
@@ -682,14 +681,14 @@ function systemPrompt() {
 - 使用者在任务执行中发来的补充说明，务必重视并采纳：它可能是纠正你当前做法的指导（照它调整具体操作、继续推进原始目标），也可能就是明确改变目标的新指令（以它为准切换目标）。无论如何都不要无视它，也不要一收到就盲目放弃原始目标。
 - 严格只输出一个 JSON 对象，不要输出解释、代码块或其它文字。
 - 元素 ref 是数字；标签 ref 带 @ 前缀。绝不臆造，找不到就先 scroll/read/switch_tab 再观察。
-- 点击后若点击结果里 changed 为 false（URL 没变、页面内容也没变，说明这次点击没生效）：不要重复点同一元素，也不要对几乎相同的 URL 反复 navigate（同样多半不生效）；换一种做法推进——clickText 按页面文字点、hover 出悬浮项、read 读当前状态再判断。
+- 点击后看下一个快照：URL / 可交互元素 / 正文都没变化说明这次点击没生效——不要重复点同一元素，也不要对几乎相同的 URL 反复 navigate（同样多半不生效）；换一种做法推进（clickText 按文字点、hover 出悬浮项、read 读当前状态再判断）。
 - 目标是"读 N 条"（逐条读完列表/多篇内容再总结，如"读 20 条后分类总结"）时，**用批量跨页读法，不要逐条点开-返回**：列表快照里每个链接元素都带 →地址，那就是详情页地址。①攒出若干条【未读】条目的详情地址 → ②一批输出：open_tab 逐个新开详情页（可一次先开 10~15 个、让它们并行加载），再逐个 switch_tab 到某页 + read 读正文（系统会在 read 前自动等该页就绪，单页加载不打断整批）→ ③这一批读到的正文批末一次性全部返回给你，当场记下每条要点 → ④switch_tab 回列表看【已读】标记与【已读清单】，挑下一批【未读】继续，直到读够 N 条。判断"这条读过没"只看列表上的【已读】标记和【已读清单】，绝不重复读清单里已有的标题——列表里没读的条目多的是，别在一条上反复点。
 - **总结只许写你实际点开读过正文的条目**：只看到标题/摘要（没打开正文）的条目，最多只列它的标题（可加列表里就有的作者/时间），**绝不能编造正文内容或主观评价**。没读够目标条数就继续读、不要提前收尾；收尾时说明"实际点开读了 N 条 / 目标 M 条"。
 - 任何详情正文出现在快照摘要或 read 结果里时，先把它并入当轮的结论再关闭/离开：要按 Escape 关掉详情前，确认它的内容已记入你的进度——看完就关等于没读，关了又忘、忘了又点回来，是纯空转。
-- 点开条目后，若正文内容没有出现在当轮快照的正文摘要或元素列表里（如正文还在加载、正文在图片上、只见推荐/相关条目列表），说明这次没拿到正文：**点了不等于读了**，别为"读"再点一遍同一条目——read 都读不到就说明正文本就不在可读文本里。任务要详情就用 read 读正文，只要条目级信息就当场记下标题即可；点了却不打算读正文时，click 后的 wait 不必长等。
-- 想对列表/表格里的某一行执行操作（编辑 / 删除 / 更多菜单等）却找不到对应按钮时，别急着放弃——很多站点的行内操作按钮是**悬浮在那一行上才出现**的：用 hover 悬浮那一行（或其上的任意元素）让按钮显示出来，重截快照后就能看到并点击了。在页面上找不到下一步该点的按钮/入口时，同样先想想它是不是要 hover 某个列表项才会出现，用 hover 动作去试。若 hover 后按钮仍不出现，多半是**纯 CSS :hover 才显示**的菜单（合成事件触发不了），改用 show 按文字强制显示（如 show {"text":"编辑"}），重截快照后即可见可点。
-- 可交互元素列表解决不了问题时，可以用 clickText 兜底：有些按钮/卡片是纯 JS 动态渲染、提取不到列表里，但你仍能从正文和【子窗口 N】内容里看到它们的文字。对**明显可点**的文字（按钮/链接样式，或语境上显然是个入口，如"提交""创建""登录""新建空白文档"）用 clickText 按语义试点——点的是文字，不需要它出现在列表里。clickText 连续失败几次仍无进展就不要再赌，改用 wait 等弹层/内容加载、hover 让悬浮项出现、或 ask_user(teach) 请使用者演示。
-- 画布表格/文档（快照里有【画布文字】块、单元格内容画在 canvas 上）的操作：表格类页面一般都有**单元格名称框**（快照里标注"单元格名称框"、值形如 D2 的输入框——Excel/Sheets/WPS/腾讯等电子表格的通用特征），用它定位目标格**优先用 gotoCell**（如 gotoCell D8：名称框输格号+回车跳格），比坐标点选稳。编辑目标格配方：gotoCell 跳到目标格 → keypress F2 进入就地编辑 → type 输入新值 → keypress Enter 提交 → 重新快照从【画布文字】确认值已更新。F2 进不了编辑、或页面没有名称框时退回坐标方案：clickAt 按坐标单击选中 → dblclickAt 双击唤起就地编辑框 → type → keypress Enter。
+- 点开条目后若正文没出现在快照摘要/元素列表（还在加载、在图片上、只见推荐列表），说明没拿到正文：**点了不等于读了**，别为"读"再点同一标题——read 都读不到就说明正文不在可读文本里；只要条目级信息就当场记下标题即可；点了却不打算读正文时，click 后的 wait 不必长等。
+- 想操作列表/表格里某一行（编辑/删除/更多菜单）却找不到按钮时，别急着放弃——很多站点的行内按钮是**悬浮那一行才出现**的：先 hover 那一行（或其上任意元素）让按钮显示，重截快照后可点；在页面上找不到下一步该点的入口时，同样先想它是不是要 hover 某个列表项才出现。hover 后按钮仍不出现，多半是**纯 CSS :hover 才显示**的菜单（合成事件触发不了），改用 show 按文字强制显示（如 show {"text":"编辑"}）。
+- 可交互列表里找不到的按钮/卡片，多半是纯 JS 动态渲染——从正文和【子窗口 N】内容里看到**明显可点**的文字（如"提交""创建""登录""新建空白文档"）时，用 clickText 按语义试点（点的是文字，不需它出现在列表里）；连续失败几次无进展就换 wait / hover / ask_user(teach)，不要一直赌。
+- 画布表格/文档（快照里有【画布文字】块、内容画在 canvas 上）的操作：表格类页面一般都有**单元格名称框**（快照标注"单元格名称框"、值形如 D2——Excel/Sheets/WPS/腾讯等电子表格的通用特征），定位目标格**优先用 gotoCell**（如 gotoCell D8：名称框输格号+回车跳格），比坐标点选稳。编辑配方：gotoCell 跳目标格 → keypress F2 进就地编辑 → type 新值 → keypress Enter 提交 → 重新快照从【画布文字】确认已更新。F2 进不了编辑、或没有名称框时退回坐标方案：clickAt 单击选中 → dblclickAt 双击唤起编辑框 → type → Enter。
 - 任务没给具体网址、需要查资料/搜信息时，用 search 动作（后台自动开搜索页）；知道确切网址时用 open_tab。
 - 当前页是受限页面（快照里会明确标注"受限页面"，如 chrome://、about:、扩展管理页、新标签页）时，绝对不要尝试操作它，直接用 open_tab 打开任务相关网址或 search 搜索。
 - 需要访问新页面做独立工作时，优先 open_tab / search 新开后台标签，避免打扰使用者的浏览。
@@ -697,11 +696,10 @@ function systemPrompt() {
 - 教我模式：收到使用者演示的操作记录后，先用 say 动作向使用者复述你学到的操作步骤，再用 ask_user（mode=confirm）请他确认——他点「没问题」按钮或回复「没问题/确认」等确认后，就严格按演示步骤继续完成原始目标；页面状态与演示时不同（如已登录、元素变化）则灵活适配、按演示意图完成；有出入时按使用者的纠正调整。
 - 教我模式的复述确认阶段是个**确认循环**：使用者在对话里回复纠正或问题（如"不对""少了一步""第三步不是这样"）时，你要重新理解他的纠正、修正你对步骤的理解，再用 say 复述修正后的步骤、用 ask_user（mode=confirm）再次请他确认——循环会一直持续，直到他明确说「没问题/确认」放行，或说「不教了/算了」「你先去做吧/你自己来」终止教学（终止后按你当前理解的自行继续完成原始目标），或说「重新演示」要求重开演示。不要未经再次确认就擅自继续执行，也不要自行猜测调整步骤。
 - 教我模式记录到的输入值（账号、密码等）仅用于本轮复现使用者的演示，不要写入技巧库。
-- 需要跨页面或并行处理时，用 open_tab 开多个后台标签并放进同一批操作（可先一次开好几个、再逐个 switch_tab + read/操作，让几个页面并行加载），不要等一个页面全部做完才开下一个。
 - 同一网址你已经在任务里打开过（list_tabs 里能看到）时，再次需要它直接 switch_tab 切过去复用，不要重复 open_tab 新开同一个页面——重复打开同一网址系统会直接切到已有标签。
 - 使用者问"我现在正在看哪个页面/我打开了哪些标签/在我已打开的某个标签里做 XX"时，先用 list_tabs 查看浏览器全部标签，再按需 use_tab 纳入并操作，不要新开标签重复打开使用者已有的页面。
 - 已用完、确认后续不会再用的标签 close_tab 关掉它，保持整洁（如一次性搜索结果页、只读一次的临时页）；拿不准还会不会用就先留着——同一网址再次需要时能直接切回已开标签，但关掉重开会丢失页面上的状态。不要关闭 @MAIN/@U 等使用者的标签。
-- 目标是"总结/摘要"时：用 read 批量读取（一批 open_tab 多个页面 + 逐个 read，批末一次性拿到全部内容，跨标签收集），然后 finish 输出简洁、结构化的中文总结。
+- 目标是"总结/摘要"时：按上面"读 N 条"的批量跨页读法批量读取，然后 finish 输出简洁、结构化的中文总结。
 - 目标要求"保存为文件/导出/下载"时：用 save_file 把总结或抓取结果写成文件（文件名带合适的扩展名），保存后再 finish 告知使用者文件路径。
 - 任务涉及"我的书签/收藏"时：查询/盘点用 bookmarks_read（可指定 folder 只看某个文件夹）；要把某网址加入收藏用 bookmarks_write（folder 填目标文件夹名，不填就放"其他书签"）。
 - 任务涉及某个已知网站/工具（如"打开我的网盘""在知乎搜 XX"），或指令要做的场景能在【网站工具索引】里匹配到能干这事的网站（如"压缩图片""查论文"）时：先查【网站工具索引】（书签，标题即用途），凭标题匹配网址直接用 open_tab 打开；索引里没找到就 bookmark_find 搜书签，再没有才用 search 网页搜索。
@@ -1858,6 +1856,8 @@ async function agentStepInner(t) {
     addLog(t.sid, '受限页面，自动打开相关网页', true);
     snap = { url: curTab.url, title: curTab.title || '', elements: [], excerpt: '', restricted: true };
   } else {
+    // 等-动：读快照前先确保当前操作标签就绪（替代 open_tab/navigate 操作后的 awaitNav——等待前移）
+    await ensureCurrentOpReady(t, myTurn);
     for (let i = 0; i < 3 && !snap; i++) {
       try {
         await ensureContentScript(tabId);
@@ -1929,7 +1929,11 @@ async function agentStepInner(t) {
       }
     }
   }
-  addLog(t.sid, '浏览页面 ' + midTruncate(snap.title || shortUrl(snap.url), 32) + ' · ' + Math.round(performance.now() - t0) + 'ms');
+  // 浏览页面日志：优先页面标题（document.title，即快照时 LLM 看到的名字）；标题空（页面仍在加载/SPA 后置标题）时
+  // 再取 Chrome 标签当前标题（快照读取这几百毫秒页面通常已加载完、标题已就位），最后才退回短 URL。
+  const freshTab = await getTab(tabId);
+  const viewTitle = snap.title || (freshTab && freshTab.title) || shortUrl(snap.url);
+  addLog(t.sid, '浏览页面 ' + midTruncate(viewTitle, 32) + ' · ' + Math.round(performance.now() - t0) + 'ms');
   // 批量模式提示：熟悉页面明确告知 LLM 可一次输出多个动作（且给出批内定位约束），减少 LLM 往返
   const batchHint = batchReady
     ? '【批量模式】本页你已经熟悉（历史操作稳定成功），默认就该批量输出。请尽量**往大了合**：本步一次给出最多 ' + MAX_BATCH + ' 个连续动作（{"actions":[{...},{...},...]}）。重复性循环（逐条勾选、连续填表、列表内翻页、读多条详情、逐行操作这类同构步骤）务必合成一批，别再一步步单动作空转——**能确定的动作不要只合两三个就收手**。**读多条详情页**（读 N 条/读多页再总结）用批量跨页读法：从列表快照链接元素的 →地址 攒 URL，一批 open_tab 逐个新开详情页（可先一次开好几个、再逐个 switch_tab + read，让几个页面并行加载），系统会在真正 read 前自动等页面就绪、单页加载不打断整批，这一批读到的所有正文批末一次性返回给你——**别逐条点开-返回**。仅当下一步必须看到本步结果才能决定时才输出单个动作。批内约束：动作执行后才出现的元素不能用 ref 引用（ref 来自当前快照、执行时可能已失效），要用 clickText 按文字 / clickAt·dblclickAt 按坐标 / gotoCell 按格号定位；snapshot、finish、ask_user 放批尾（执行到它们本批收尾），open_tab/search/navigate/switch_tab/use_tab/close_tab 可在批内任意位置（系统会跨页自动等就绪）。确认生效用短读（read 的 target 指向批内动作涉及的具体元素）或依赖下一张快照回显；点开条目/翻页后，正文通常已由下一张快照的正文摘要提供（含画布文字），此时批内不必整页 read；但若正文摘要/元素列表里**没出现**目标正文（如正文仍在加载、正文在图片上、只见推荐/相关列表），说明快照没抓到正文，**就必须整页 read**（target:"page"）——点了不等于读了。'
@@ -2609,8 +2613,8 @@ async function runAction(t, a) {
       return;
     }
     if (!stillCurrent(t, myTurn)) return;
-    if (res.reused) nextStepOrBatch(t, myTurn); // 同 URL 已有标签：页面就绪，直接续步
-    else awaitNav(t, res.entry.tabId);
+    // 彻底统一：操作后不等待——新页就绪由下一步读/操作前 ensureCurrentOpReady 承担
+    nextStepOrBatch(t, myTurn);
     return;
   }
 
@@ -2633,8 +2637,8 @@ async function runAction(t, a) {
       return;
     }
     if (!stillCurrent(t, myTurn)) return;
-    if (res.reused) nextStepOrBatch(t, myTurn);
-    else awaitNav(t, res.entry.tabId);
+    // 彻底统一：操作后不等待——新页就绪由下一步读/操作前 ensureCurrentOpReady 承担
+    nextStepOrBatch(t, myTurn);
     return;
   }
 
@@ -2862,22 +2866,16 @@ async function runAction(t, a) {
         return;
       }
     } catch (e) {}
-    // 打开页面：地址按统一宽度计算的尾部省略（tailTruncate 32，保留主机名与路径开头）；页面就绪用时由 tryResume 合并进本行 → "打开页面 <地址> · XXms"
-    t.navWaitUrl = tailTruncate(url, 32);
-    t.navWaitIdx = true;
-    addLog(t.sid, '打开页面 ' + t.navWaitUrl);
-    if (!t._inBatch) { // 批内跨页：不动 state（仍 working），页面就绪由 runActionBatch 在下一页面动作前自动保障
-      t.state = 'awaiting_nav';
-      t.awaitingNavAt = Date.now();
-      t.waitTabId = tabId;
-      await saveTasks();
-    }
+    // 打开页面：地址按统一宽度计算的尾部省略（tailTruncate 32，保留主机名与路径开头）；就绪用时由下一步 ensureCurrentOpReady 的"页面已就绪 · Nms"体现
+    addLog(t.sid, '打开页面 ' + tailTruncate(url, 32));
     try {
       await chrome.tabs.update(tabId, { url });
     } catch (e) {
       fail(t, '导航失败：' + e.message);
     }
-    return; // 等 AGENT_READY / onUpdated 恢复
+    // 彻底统一：操作后不等待——新页就绪由下一步读/操作前 ensureCurrentOpReady 承担
+    nextStepOrBatch(t, myTurn);
+    return;
   }
 
   // ---- 等待 ----
@@ -3042,27 +3040,21 @@ async function runAction(t, a) {
     }
     if (!stillCurrent(t, myTurn)) return;
     t.failStreak = 0;
-    if (resTab.reused) {
-      t.history.push({
-        role: 'user',
-        content: '点击的链接目标已在 @' + resTab.entry.ref + ' 打开，直接切换过去（' + shortUrl(res.openTab) + '）'
-      });
-      nextStepOrBatch(t, myTurn);
-    } else {
-      t.history.push({
-        role: 'user',
-        content: '点击的链接会新开页面，已在后台打开为 @' + resTab.entry.ref + '（' + shortUrl(res.openTab) + '），属 Agent 自开标签，本轮结束自动关闭'
-      });
-      awaitNav(t, resTab.entry.tabId);
-    }
+    const openedOrReused = resTab.reused
+      ? '点击的链接目标已在 @' + resTab.entry.ref + ' 打开，直接切换过去（' + shortUrl(res.openTab) + '）'
+      : '点击的链接会新开页面，已在后台打开为 @' + resTab.entry.ref + '（' + shortUrl(res.openTab) + '），属 Agent 自开标签，本轮结束自动关闭';
+    t.history.push({ role: 'user', content: openedOrReused });
+    // 彻底统一：操作后不等待——新页就绪由下一步读/操作前 ensureCurrentOpReady 承担
+    nextStepOrBatch(t, myTurn);
     return;
   }
 
-  // ---- 已读清单记录：点击真实导航了（changed=true，或点了 target=_blank 新开页）或点文字打开了 link 类内容 → 记入已读清单。
-  // 判断标准：1) 动作生效（read 类/没生效的点击不记；click 还要求页面真的变了）；2) 目标是 link（列表项）或 clickText（按文字点的标题，不记"下一页/返回"这类导航文字）；
-  // 3) 标题非空。clickText 不要求 changed：弹层式详情（URL/页面键不变，如站内弹层）是这类站点的主流读法，若也要求 changed，
+  // ---- 已读清单记录：点击/点文字打开了 link 类内容 → 记入已读清单。
+  // 判断标准：1) 动作成功返回（click 不再返回 changed——死点记录的空白条目由已读拦截的"无正文标【已读·可重开】放行补读"兜底，与 clickText 一致）；
+  // 2) 目标是 link（列表项）或 clickText（按文字点的标题，不记"下一页/返回"这类导航文字）；3) 标题非空。
+  // clickText 不要求页面真的变了：弹层式详情（URL/页面键不变，如站内弹层）是这类站点的主流读法，若也要求 changed，
   // 弹层打开的一条都记不进"已读"，模型看不到自己读过哪些，就会反复点同一批。已点开的重复点击由拦截兜底（有正文直接拦、没正文标【已读·可重开】放行补读）。
-  if (res && (a.action === 'click' ? (res.changed || res.openTab) : true) && (a.action === 'click' || a.action === 'clickText')) {
+  if (res && (a.action === 'click' || a.action === 'clickText')) {
     const pkey = pageKeyOf(t.snapUrl || '');
     const ref = (a.action === 'click' && typeof a.target === 'number') ? a.target : undefined;
     const el = ref != null ? (t.snapElements || []).find((e) => e.ref === ref) : undefined;
@@ -3103,16 +3095,7 @@ async function runAction(t, a) {
     content: '动作结果：' + JSON.stringify(res).slice(0, 3000)
   });
   t.failStreak = 0;
-  // 输入动作卡住（耗时 >10s 或内容没落地）→ 非阻塞提醒使用者介入；Agent 不等待、继续执行。
-  // 同一"卡住阶段"只提醒一次，输入恢复顺畅后解除标记，下次再卡会再提醒。
-  if (a.action === 'type' && res.inputStuck) {
-    if (!t.inputNudged) {
-      t.inputNudged = true;
-      nudgeUser(t, '在 ' + currentSiteLabel(t) + ' 上的输入动作超过 10 秒还没生效（后台标签可能被浏览器节流，或网站没接受输入）。你可以把该标签切到前台手动输入，Agent 会继续执行，不用等你。');
-    }
-  } else if (a.action === 'type') {
-    t.inputNudged = false;
-  }
+  // type 输入卡住提醒已随"操作后不等待"移除：type 不再返回 inputStuck，输入是否落地由下一个快照体现、模型据快照纠正
   if (!t._inBatch) {
     t.lastActSig = sig; // 记录本次动作，供"反复执行同一个动作"识别（批内不逐动作记录，批末由 runActionBatch 整体记录）
     t.actionPageSig = t.curPageSig; // 记录执行动作时的页面状态，供下次重复判断"页面是否真的变了"
@@ -3143,8 +3126,9 @@ function currentSiteLabel(t) {
 function humanizeWhy(why) {
   let s = String(why || '').trim();
   s = s.replace(/（[^）]*）/g, '').replace(/\([^)]*\)/g, '');
-  // 去掉"先用 list_tabs 刷新后再选"这类给 Agent 看的内部指引句子（有时不在括号里）
-  s = s.replace(/[，,]\s*(?:先|请|再)?\s*用?\s*(?:list_tabs|use_tab|switch_tab|open_tab|close_tab|navigate|search|snapshot)[^。]*/g, '');
+  // 去掉"先用 list_tabs 刷新后再选"这类给 Agent 看的内部指引句子（可能在括号里、逗号后或句号后；
+  // 也兼容"先执行 list_tabs"这种带动作动词的写法，指引词后限 10 字符防误伤正常文案）
+  s = s.replace(/[，,。]\s*(?:先|请|再|记得)?\s*[^，。]{0,10}?\s*(?:list_tabs|use_tab|switch_tab|open_tab|close_tab|navigate|search|snapshot)[^。]*。?/g, '');
   s = s.replace(/[:：]\s*@[A-Z]+\d*/g, '').replace(/@[A-Z]+\d*/g, '标签');
   s = s.replace(/ref=\s*[^\s,，;；]+/g, '');
   s = s.replace(/[，,]\s*$/g, '');
@@ -3172,7 +3156,9 @@ async function pushFailure(t, why, quiet, sig) {
   }
   if (t.failStreak >= 3) {
     const site = currentSiteLabel(t);
-    const plain = humanizeWhy(why);
+    // quiet 失败是"内部纠错、不刷用户面板"——文案写给模型看（如"先 list_tabs"），使用者无法代模型执行，
+    // 拼进求助卡片只会让人困惑。升级转人工时这类失败不附原因，卡片只说明站点 + 求助意图。
+    const plain = quiet ? '' : humanizeWhy(why);
     // 卡片内消息具体讲清问题（站点+原因）；卡片外的活动日志行精简为一句求助
     await askUser(t, '在 ' + site + ' 上连续操作失败' + (plain ? '：' + plain : ''), undefined, '遇到了问题，需要你帮忙');
     return;
@@ -4106,7 +4092,7 @@ function serializeSession(t) {
     state: t.state,
     steps: t.steps,
     plan: t.plan || [],
-    activities: (t.activities || []).slice(-ACTIVITY_PERSIST), // 最近动作轨迹（面板重载后重建活动日志用）
+    activities: (t.activities || []).slice(-ACTIVITY_PERSIST), // 最近动作轨迹（面板重载后重建活动日志用）；条目带 t，面板据此与 conversation 按时间交错恢复
     turnId: t.turnId,
     turnSteps: t.turnSteps,
     failStreak: t.failStreak,

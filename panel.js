@@ -958,13 +958,25 @@ function hydrateCache(s) {
     : cache.status === 'waiting_user' ? askStatusClass(cache.askMode)
     : '';
   let renderedAsk = false;
+  // 混合类型按时间交错恢复：对话记录与动作轨迹各自带 t 时间戳，合并排序还原真实时间顺序
+  // （此前 activities 无时间戳，重载后只能"对话在前、活动全在后"两坨，混合类型的交错顺序丢失）
+  let lastConvT = 0;
+  for (const c of s.conversation || []) lastConvT = Math.max(lastConvT, c.t || 0);
+  const items = [];
   for (const c of s.conversation || []) {
-    if (c.ask) { cache.msgs.push({ kind: 'ask', text: c.text, mode: c.mode || 'page' }); renderedAsk = true; }
-    else if (c.kind === 'nudge') cache.msgs.push({ kind: 'nudge', text: c.text });
-    else cache.msgs.push(c.role === 'user' ? { kind: 'user', text: c.text } : { kind: 'agent', text: c.text, ok: c.ok !== false });
+    items.push({ t: c.t || lastConvT, make: () => {
+      if (c.ask) { renderedAsk = true; return { kind: 'ask', text: c.text, mode: c.mode || 'page' }; }
+      if (c.kind === 'nudge') return { kind: 'nudge', text: c.text };
+      return c.role === 'user' ? { kind: 'user', text: c.text } : { kind: 'agent', text: c.text, ok: c.ok !== false };
+    } });
   }
-  // 最近动作轨迹：重载后从后台会话恢复（对话记录不含活动行，实时广播是临时的；这里按顺序补在消息末尾）
-  for (const a of s.activities || []) cache.msgs.push({ kind: 'activity', text: a.text, inBatch: !!a.inBatch });
+  // 最近动作轨迹：重载后从后台会话恢复（对话记录不含活动行，实时广播是临时的）
+  // 旧数据活动行缺 t 时按最后一条对话时间兜底（动作日志本就是"最近轨迹"，排对话之后符合语义），避免误排到顶部
+  for (const a of s.activities || []) {
+    items.push({ t: a.t || lastConvT, make: () => ({ kind: 'activity', text: a.text, inBatch: !!a.inBatch }) });
+  }
+  items.sort((x, y) => x.t - y.t); // 稳定排序（V8 保证相同 t 保持插入序）
+  for (const it of items) cache.msgs.push(it.make());
   // 兜底：等待中但求助气泡不在对话记录里（如记录被裁剪）
   if (s.state === 'waiting_user' && !renderedAsk && s.askText) cache.msgs.push({ kind: 'ask', text: s.askText, mode: s.askMode || 'page' });
   return cache;

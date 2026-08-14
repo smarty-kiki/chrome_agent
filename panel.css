@@ -136,7 +136,7 @@ label.check input[type="checkbox"] {
 #stepPlan[hidden] { display: none; }
 .step-head { color: var(--muted); font-size: 11px; margin-bottom: 6px; }
 .step-row { padding: 2px 0; line-height: 1.5; word-break: break-word; }
-.step-row.done { color: var(--muted); text-decoration: line-through; }
+.step-row.done { color: #9ca3af; text-decoration: line-through; } /* 已完成：划线 + 更浅的灰（比普通次要文字再淡一档），一眼区分已完成/进行中 */
 .step-row.placeholder { color: var(--accent); }
 /* ---------------- 顶部会话栏 ---------------- */
 #sessionBar {

@@ -185,7 +185,7 @@ canvas-hook.js     画布文字钩子（document_start + MAIN world，拦截 fil
 
 **多标签编排**：`@MAIN`（你的标签，不入分组）→ `@T1/@T2/...`（Agent 后台自开标签，`chrome.tabs.group` 归入本会话「PageAgent N」分组，任务结束删组一键清空）→ `@U1/@U2/...`（你已有的标签，`use_tab` 纳入任务）。自开标签一律 `active:false` 不抢焦点；每轮结束只清理本会话分组，你的 @MAIN/@U 永不自动关闭。
 
-**跨页恢复**：`open_tab` / `navigate` 后任务置为 `awaiting_nav`，新页 content script 就绪后广播 `AGENT_READY` 恢复循环；任务状态持久化到 `chrome.storage.session`，应对 MV3 service worker 被回收。**批内跨页**：`open_tab`/`navigate`/`switch_tab` 等不再打断整批，连续跨页之间不等、多个新页并行加载，系统在真正读取/点击页面的动作前自动等当前操作标签就绪（上限 10s，超时按动作失败走原有自愈）。
+**跨页恢复**：跨页动作（`open_tab` / `search` / `navigate` / 点击新开页）**操作后一律不等待**——多个新页并行加载，页面就绪统一由**下一个**读取/操作动作执行前自动等（读快照前 `ensureCurrentOpReady`，上限 10s，超时按动作失败走原有自愈）。任务状态持久化到 `chrome.storage.session`，应对 MV3 service worker 被回收。**批内跨页**：`open_tab`/`navigate`/`switch_tab` 等不再打断整批，连续跨页之间不等，系统在真正读取/点击页面的动作前自动等当前操作标签就绪。
 
 **复盘**：`finish` 时并行做两件事——① 书签复盘：把本轮实际访问过的网站筛出有用的写入书签（新站收藏 / 已收藏合并改进标题，一律存网站根 URL）；② 技巧复盘：统计各站点的动作数 / 失败数，对「反复失败 ≥2 次或绕弯 ≥4 次」的站点总结成技巧，与既有技巧冲突去重合并后存储。
 
