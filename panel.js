@@ -437,7 +437,7 @@ function askEl(cache, desc) {
   if (isTeach) {
     const hint = document.createElement('div');
     hint.className = 'reply-hint';
-    hint.textContent = '我会记录你在页面上的每一步操作来学习；操作完点下面按钮';
+    hint.textContent = '从当前页面状态开始，把你要教我的这步操作按你平时的做法一步步做出来（要输入的、鼠标悬停才出现的也照常操作）；我会记录每一步来学习，演示完点下面按钮。';
     wrap.appendChild(hint);
     const stepEl = document.createElement('div');
     stepEl.className = 'teach-steps';

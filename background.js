@@ -671,7 +671,7 @@ function systemPrompt() {
 2.5 请求使用者协助（卡住时用，分四种模式）：
    {"action":"ask_user","mode":"page","message":"需要你在页面上完成验证码/登录等，完成后我会继续"}  暂停并请使用者在【页面上】手动操作（验证码/登录/人机验证等）；使用者操作完点"继续"后自动继续
    {"action":"ask_user","mode":"reply","message":"请告诉我你的手机号，用于登录"}  暂停并请使用者在【对话中】直接回复信息（账号、个人信息、补充要求等）；使用者直接在下方的输入框回复即可
-   {"action":"ask_user","mode":"teach","message":"我在这个页面上卡住了，请你手把手演示一遍正确操作，我会记录学习"}  遇到实在不知道怎么做的环节（尤其某网站特有的操作方式）时，暂停并请使用者在当前页面上手把手演示一遍；你会自动记录他的每一步操作来学习——录制覆盖【任务下所有标签页】（不只当前标签，使用者在演示中切到/新开的标签也会自动纳入并继续录制，跨页跨站演示不断），悬浮才出现的元素，悬浮这一步也会被记录成步骤，他操作完点"我操作完了"后你复述学到的步骤，经他确认后再按其演示继续
+   {"action":"ask_user","mode":"teach","message":"我在这个页面上卡住了，想点击\"编辑\"按钮却找不到，请你手把手演示一遍正确做法，我会记录学习"}  遇到实在不知道怎么做的环节（尤其某网站特有的操作方式）时，暂停并请使用者在当前页面上手把手演示一遍；message 里必须写明你卡在的这一步想做什么（如"想点击'编辑'按钮却找不到""想给第2行删除"），让使用者一看就知道该演示什么操作；你会自动记录他的每一步操作来学习——录制覆盖【任务下所有标签页】（不只当前标签，使用者在演示中切到/新开的标签也会自动纳入并继续录制，跨页跨站演示不断），悬浮才出现的元素，悬浮这一步也会被记录成步骤，他操作完点"我操作完了"后你复述学到的步骤，经他确认后再按其演示继续
    {"action":"ask_user","mode":"confirm","message":"请确认我理解的步骤对不对"}  给使用者一个确认按钮（点「没问题」继续）；通常跟在 say 复述之后，使用者有出入会直接在对话里纠正
 
 3. 结束本轮（不是结束对话）：
@@ -2898,7 +2898,7 @@ async function runAction(t, a) {
       // 空等也算"无进展"，累计到阈值主动请使用者演示（多数情况走下面的"禁止再 wait"就够了，这里兜底）
       t.stuck = (t.stuck || 0) + 1;
       if (t.stuck >= STUCK_TEACH_LIMIT) {
-        await askUser(t, '我在等待页面变化上反复空转、一直没有进展。请你在当前页面上手把手演示一遍正确操作，我会记录学习后照着做。', 'teach');
+        await askUser(t, '我在等待页面变化上反复空转、一直没有进展。' + teachGoalNote(t) + '请你在当前页面上手把手演示一遍正确操作，我会记录学习后照着做。', 'teach');
         return;
       }
       if (t.consecWaits === 2) {
@@ -2956,7 +2956,7 @@ async function runAction(t, a) {
       t.stuck = 0; // 换了个新动作 = 在尝试新路径，无进展计数清零
     }
     if (t.stuck >= STUCK_TEACH_LIMIT) {
-      await askUser(t, '我反复尝试了 ' + t.stuck + ' 次同样的操作仍然没有进展，不知道怎么继续了。请你在当前页面上手把手演示一遍正确操作，我会记录学习后照着做。', 'teach');
+      await askUser(t, '我反复尝试了 ' + t.stuck + ' 次同样的操作仍然没有进展，不知道怎么继续了。' + teachGoalNote(t) + '请你在当前页面上手把手演示一遍正确操作，我会记录学习后照着做。', 'teach');
       return;
     }
   }
@@ -3151,7 +3151,7 @@ async function pushFailure(t, why, quiet, sig) {
     t.pageSnapCounts[pageKeyOf(cur.url)] = 0;
   }
   if (t.stuck >= STUCK_TEACH_LIMIT) {
-    await askUser(t, '我反复尝试了 ' + t.stuck + ' 次仍然没有进展。请你在当前页面上手把手演示一遍正确操作，我会记录学习后照着做。', 'teach');
+    await askUser(t, '我反复尝试了 ' + t.stuck + ' 次仍然没有进展。' + teachGoalNote(t) + '请你在当前页面上手把手演示一遍正确操作，我会记录学习后照着做。', 'teach');
     return;
   }
   if (t.failStreak >= 3) {
@@ -3167,6 +3167,13 @@ async function pushFailure(t, why, quiet, sig) {
   addLog(t.sid, why, quiet); // quiet=true 只进 SW console，不刷用户面板——内部纠错类失败（如切到不存在的标签 ref），使用者无需看原始 ref/tabId
   await saveTasks();
   agentStep(t).catch((e) => fail(t, '运行异常：' + e.message));
+}
+
+// 教我求助卡里附一句当前目标：让使用者知道该演示哪一步（卡片正文讲清"教什么"）。
+// 只用于 Agent 主动求助的 teach 卡；使用者主动说"我教你"时 goal 是占位文案，不进卡片。
+function teachGoalNote(t) {
+  const g = String((t && t.goal) || '').trim();
+  return g ? '当前目标：' + midTruncate(g, 44) + '。' : '';
 }
 
 // 请求使用者协助：暂停当前回合，等"继续"。
@@ -3636,7 +3643,7 @@ async function enterTeachMode(t, content, tabId) {
   t.lastInstruction = content;
   t.history.push({ role: 'user', content });
   await saveTasks();
-  await askUser(t, '请你在这个页面上操作，我会记录你的每一步操作来学习；完成后点「我操作完了」', 'teach');
+  await askUser(t, '请把你想让我学会的操作演示给我看，完成后点「我操作完了」', 'teach');
 }
 
 // 处理使用者新指令：无对话则新建；有则打断当前回合并开始新回合
