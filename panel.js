@@ -58,10 +58,25 @@ async function loadConfig() {
   $('#contextWindow').value = config.contextWindow || 1000000;
   $('#compressThreshold').value = config.compressThreshold ?? 70;
   $('#batchEnabled').checked = config.batchEnabled !== false;
+  $('#backgroundExec').checked = config.backgroundExec === true;
   $('#batchMark').checked = config.batchMark === true;
   // 已有 Key 进配置就拉一次模型列表；没有则留占位提示（填了 Key/URL 失焦会自动再拉）
   if (config.apiKey) fetchModels();
   else populateModelSelect([]);
+}
+
+// 设置区版本号：显示当前 git 提交号（scripts/gen-version.js 生成的 version.js 提供，提交/切换/合并后自动刷新）
+function fillVersion() {
+  const el = $('#extVersion');
+  if (!el) return;
+  const v = window.EXT_VERSION || null;
+  if (!v || !v.short) { el.textContent = 'dev'; return; }
+  el.textContent = v.short; // 短提交号，如 8e366c4；带 * 表示工作区有未提交改动
+  const tip = [];
+  if (v.full) tip.push('提交 ' + v.full);
+  if (v.date) tip.push('提交时间 ' + v.date);
+  if (v.dirty) tip.push('工作区有未提交改动，加载的代码不完全等于该提交');
+  el.title = tip.join('\n');
 }
 
 // 把模型下拉重建为服务端返回的模型列表；preferred 在列表则选中它，否则落第一个；空列表放占位提示
@@ -132,13 +147,14 @@ function saveConfig() {
       contextWindow: parseInt($('#contextWindow').value, 10) || 1000000,
       compressThreshold: parseInt($('#compressThreshold').value, 10) || 70,
       batchEnabled: $('#batchEnabled').checked,
+      backgroundExec: $('#backgroundExec').checked,
       batchMark: $('#batchMark').checked
     }
   });
 }
 
 function wireSettings() {
-  ['temperature', 'maxSteps', 'searchTemplate', 'contextWindow', 'compressThreshold', 'batchEnabled', 'batchMark'].forEach((id) => {
+  ['temperature', 'maxSteps', 'searchTemplate', 'contextWindow', 'compressThreshold', 'batchEnabled', 'backgroundExec', 'batchMark'].forEach((id) => {
     $('#' + id).addEventListener('change', saveConfig);
   });
   // API Key / Base URL：失焦保存，并重新拉一次模型列表（填对才填充下拉）
@@ -995,6 +1011,7 @@ async function restoreState() {
 }
 
 async function init() {
+  fillVersion();
   wireSettings();
   await loadConfig();
   await refreshTab();

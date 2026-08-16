@@ -9,9 +9,10 @@
  *     下一条指令；对话记录与 Agent 自开标签跨轮保留，构成多轮对话。
  *  5. 多标签编排：
  *     - @MAIN  = 使用者交给 Agent 的标签页（不入分组）。
- *     - @T1/@T2 = Agent 用 tabs.create({active:false}) 自开的后台标签（不抢焦点），
- *       自动归入同一个 tab group 统一管理。
- *     - switch_tab 只切换 Agent 的关注焦点，不切换浏览器前台。
+ *     - @T1/@T2 = Agent 自开的标签（后台模式用 tabs.create({active:false}) 不抢焦点；
+ *       前台模式切到浏览器前台），自动归入同一个 tab group 统一管理。
+ *     - switch_tab 切换 Agent 的关注焦点；后台模式不切浏览器前台，前台模式把操作标签切到前台。
+ *     - 执行模式由设置 config.backgroundExec 控制（false=前台执行默认，true=后台执行）。
  *  6. 向侧边栏面板广播聊天消息 / 活动日志 / 状态。
  */
 'use strict';
@@ -40,6 +41,9 @@ const BATCH_NAV_READY_MS = 10000; // 批内跨页保障：真正读/点的动作
 const LLM_TIMEOUT_MS = 240000; // LLM 单次请求超时：网络/服务端挂起时不再无限等（超时按解析失败重试），避免循环整体干等
 const SUMMARY_CHUNK_TOKENS = 150000;  // 摘要单次输入的 token 上限（超出分块链式合并）
 const SUMMARY_MAX_CHARS = 1500;       // 压缩摘要长度上限（字符）
+const RESULT_KEEP_ROUNDS = 5;         // 工具结果全量保留的回合数（最近 N 个 model 回合 = 最近 N 条 assistant 决策及其结果）；更早的结果在发送时降级为短空壳，避免大结果长期占上下文
+const RESULT_STUB_CHARS = 120;        // 旧回合工具结果空壳保留的开头字符数（足够让模型知道"这个动作返回过、ok/失败"，全量已省略）
+const RESULT_MAX_STORE = 30000;       // 单条工具结果写历史的字符软上限：不再做"一律 3000"的硬截断（那会连最近结果都读不全），只防极端超大的结果把存储/序列化撑爆（覆盖 pageInfo html 20000 等源头上限 + 冗余）
 
 // ---------------- 会话状态模型（多会话并发） ----------------
 // 会话对象 = 一个独立对话的全部状态（标签/分组/历史/回合）。tasks[sid] 为字典，
@@ -125,6 +129,7 @@ async function saveTasks() {
 async function createSession(tabId) {
   const n = nextNumber();
   if (n == null) return null;
+  const sysCfg = await getConfig(); // 系统提示词按当前执行模式（前台/后台）措辞
   const sid = newSid();
   const t = {
     id: 't' + Date.now().toString(36) + seq,
@@ -152,7 +157,7 @@ async function createSession(tabId) {
     teachTabIds: [],     // 教我模式监听【任务下所有 tab】的录制挂载清单
     teachEvents: [],     // 教我模式录制缓冲（content 批量上报 TEACH_EVENT 累积）
     // 大模型往返日志不在会话对象里：独立存 LLM_LOGS_KEY（见 logLLMExchange），避免每次 saveTasks 全量重写大日志
-    history: [{ role: 'system', content: systemPrompt() }],
+    history: [{ role: 'system', content: systemPrompt(sysCfg.backgroundExec) }],
     ctxSummary: null,   // 历史压缩摘要（已完成进展 / 踩过的坑 / 用户注意点）
     ctxBoundary: 0,     // 历史下标：该下标之前的消息已并入 ctxSummary，之后逐条发送
     conversation: [],
@@ -212,6 +217,7 @@ async function getConfig() {
       compressThreshold: Math.round(COMPRESS_THRESHOLD * 100),
       batchEnabled: true, // 批量动作总开关：允许在熟悉页面一次执行多个动作（false=每步读页、一次一个动作，稳妥但慢）
       batchMark: false, // 调试：活动日志标出批量边界（"批 N 步"/批内每步"批1/4"前缀/批完·失败收尾），验证批量策略时打开，日常可关
+      backgroundExec: false, // 执行模式：false=前台执行（默认，Agent 打开/切换操作标签时切到浏览器前台，实时可见）；true=后台执行（不切前台、不抢焦点，不打扰当前浏览）
       apiKey: ''
     },
     config || {}
@@ -432,8 +438,8 @@ async function exportSessionLog(t) {
         for (const x of acts) seq.push('动作: ' + JSON.stringify(x));
       } catch (e) { seq.push('动作(解析失败): ' + c.slice(0, 300)); }
     } else if (c.indexOf('动作结果：') === 0) {
-      // 结果截断与模型上下文里的历史一致（见下方存历史的 slice(0,3000)），避免导出复盘时只见结果开头（如 read 全被压成页脚）而误判
-      seq.push('结果: ' + c.slice(0, 3000));
+      // 结果全量与历史一致（历史写完整结果，模型近 5 回合全量可见）；导出是排查用途，全量更好排查"为什么执行乱"
+      seq.push('结果: ' + c);
     } else if (c.indexOf('动作执行失败：') === 0) {
       seq.push('失败: ' + c); // 失败消息进历史时本就不截断，导出保持一致
     }
@@ -611,7 +617,9 @@ chrome.alarms.onAlarm.addListener(async (al) => {
 });
 
 // ---------------- 系统提示词（持续对话模式） ----------------
-function systemPrompt() {
+function systemPrompt(background) {
+  // background=true → 后台执行（不切前台、不抢焦点）；false → 前台执行（操作标签切到浏览器前台）。缺省前台。
+  const bg = !!background;
   return `你是 PageAgent，一个运行在用户浏览器里的智能助手，采用"持续对话"模式。
 
 使用者会持续给你下达指令（操作类：登录、搜索、填表、抓取；总结类：提炼要点；查资料类：搜索/开网页；保存类：写成文件下载）。每收到一条新指令：
@@ -621,22 +629,22 @@ function systemPrompt() {
 
 多轮对话中，请记住并复用此前完成的操作和得出的结论（对话记录跨轮保留）。例如使用者说"把刚才的总结存成文件"，你应能找到之前的总结并用 save_file 保存。注意：每轮结束你自开的标签（@T 系）会被自动关闭、跨轮不再存在，需要重新访问时用 open_tab/search 重开，或 use_tab 用使用者已打开的标签。
 
-你拥有"任务标签页"：@MAIN 是使用者交给你的标签（属于使用者，不要随便关）；@T1/@T2/... 是你自己新开的后台标签（自动归入本会话 PageAgent N 分组、不抢焦点；点"新开页面"链接也会自动变成后台 @T）；@U1/@U2/... 是你用 use_tab 纳入的使用者已有标签（同样不要随便关）。
+你拥有"任务标签页"：@MAIN 是使用者交给你的标签（属于使用者，不要随便关）；@T1/@T2/... 是你自己新开的${bg ? '后台' : ''}标签（自动归入本会话 PageAgent N 分组${bg ? '、不抢焦点' : ''}；点"新开页面"链接也会自动变成${bg ? '后台 ' : ' '}@T）；@U1/@U2/... 是你用 use_tab 纳入的使用者已有标签（同样不要随便关）。${bg ? '' : '当前为前台执行模式：你切换/打开操作标签时，浏览器会把它切到前台展示，使用者能实时看到你的操作。'}
 你通过"页面快照"感知当前操作标签的网页：包括标签页列表、URL、标题、可交互元素列表（[ref] 类型 文本 值 选择器）和正文摘要。正文摘要默认滤掉站点恒定导航/页脚/法务备案等噪音（页脚税）、并入画布渲染的正文，只留内容主体——读取正文、确认内容不必每次重复 read 整页（那是冗余往返）；但快照摘要/元素列表里**没出现**目标正文时（如正文还在加载、正文在图片上、只见推荐/相关列表），说明快照没抓到正文，必须 read 整页（target:"page"）去拿，**点开不等于读到**；read 用于读摘要没覆盖的局部（如某元素/弹窗内单独文字，target 填那个 ref）。read 整页的页脚税过滤与 raw 细节见动作说明。页面可能含内嵌 iframe 子窗口（弹窗/新建流程），其元素并进快照、用【子窗口 N】分组标出，正文摘要附其内容，可正常点击/读取。快照提示有未读取成功的内嵌窗口时，先 wait 等加载完再观察，别一时看不到就乱点。刚点击后快照出现新的【子窗口 N】分组或元素变多，说明弹窗已打开，目标在这个新窗口里找——**别重复点击刚才那个按钮**（可能把弹窗又关掉），直接在弹窗里继续操作。
 快照开头的【本站操作技巧】是该网站历史沉淀的操作经验（如"搜索要直接点第一条结果"）。**每次选元素、定动作前先对照它**——与技巧不符的做法多半在绕弯路，优先按技巧来；反复失败、找不到元素、或动作与技巧不一致时先回头对照调整，别硬试同一招；某条技巧与当前页面明显冲突（页面已改版）说明已过期，跳过它、以当前页为准。
 
-每收到一个快照，你必须输出 JSON 动作。接到新指令的首轮先拆解：把达成这条指令要做的事分成 3~8 步（按大事件/阶段分，不是单个动作），随本轮 actions 一起输出 steps 字段 {"steps":[{"text":"...","done":false},...],"actions":[...]}；之后每轮随 actions 顺带输出更新后的 steps（已完成的 done 置 true），面板会实时划线展示进度，全部完成才 finish。**默认倾向批量输出**：把多个**连续、下一步不必看中间结果**的动作合在一起输出 {"actions":[{...},{...},...]}（最多 ${MAX_BATCH} 个），系统连续执行、大幅减少往返。逐条勾选、连续填表、列表内翻页、逐行操作这类重复循环，**务必合成一批，别单动作空转**；快照标【批量模式】（本页已熟悉）时更要尽量多合批，标【谨慎模式】（本页不熟悉/刚出错）时才退回一次一个动作。**多 tab 是默认工作方式**：任务需要（读多条详情、跨页对比、并行处理）时用 open_tab 开多个后台标签放进同一批执行，而不是只盯一个 tab。**例外——输出单个动作**：必须看到本步结果才能决定下一步、拿不准、或要结束本轮（finish）。批量规则：
+每收到一个快照，你必须输出 JSON 动作。接到新指令的首轮先拆解：把达成这条指令要做的事分成 3~8 步（按大事件/阶段分，不是单个动作），随本轮 actions 一起输出 steps 字段 {"steps":[{"text":"...","done":false},...],"actions":[...]}；之后每轮随 actions 顺带输出更新后的 steps（已完成的 done 置 true），面板会实时划线展示进度，全部完成才 finish。**默认倾向批量输出**：把多个**连续、下一步不必看中间结果**的动作合在一起输出 {"actions":[{...},{...},...]}（最多 ${MAX_BATCH} 个），系统连续执行、大幅减少往返。逐条勾选、连续填表、列表内翻页、逐行操作这类重复循环，**务必合成一批，别单动作空转**；快照标【批量模式】（本页已熟悉）时更要尽量多合批，标【谨慎模式】（本页不熟悉/刚出错）时才退回一次一个动作。**多 tab 是默认工作方式**：任务需要（读多条详情、跨页对比、并行处理）时用 open_tab 开多个${bg ? '后台' : ''}标签放进同一批执行，而不是只盯一个 tab。**例外——输出单个动作**：必须看到本步结果才能决定下一步、拿不准、或要结束本轮（finish）。批量规则：
 - **批内顺序依赖要弱**：某个动作执行后才出现的元素，后续动作**不能用它的 ref**（ref 来自旧快照，执行时会失效），要用 clickText 按文字 / clickAt·dblclickAt 按坐标 / gotoCell 按格号来定位；
 - **批内可跨页**：open_tab / search / navigate / switch_tab / use_tab / close_tab 可在批内任意位置；连续跨页之间系统不等（多个新页并行加载），系统会在真正读/点的动作前自动等当前操作标签页面就绪——单页加载不打断整批。只有 snapshot / finish / ask_user 放批尾（执行到它们本批收尾），之后系统重新观察页面；
 - 每批尽量以 read 或读回校验结尾，确认动作生效。
 可用动作：
 
 0. 标签操作（ref 用 @MAIN / @T1 / @U1 ...；tabId 用 list_tabs 返回的编号）：
-   {"action":"open_tab","url":"https://..."}   新开后台标签（不抢焦点、自动加入分组）。链接元素快照里带 →地址，需要详情地址直接取来 open_tab（如读 N 条任务：用列表元素的 →地址 攒 URL 批量开页），不必先点开再找
-   {"action":"search","query":"关键词"}          用搜索引擎搜索（自动打开后台标签，不要手动拼 URL）
-   {"action":"switch_tab","ref":"@T1"}          切换 Agent 关注的操作标签（不切换浏览器前台）
+   {"action":"open_tab","url":"https://..."}   新开${bg ? '后台标签（不抢焦点、自动加入分组）' : '标签并切到浏览器前台（自动加入分组）'}。链接元素快照里带 →地址，需要详情地址直接取来 open_tab（如读 N 条任务：用列表元素的 →地址 攒 URL 批量开页），不必先点开再找
+   {"action":"search","query":"关键词"}          用搜索引擎搜索（自动打开${bg ? '后台' : '并切到前台'}标签，不要手动拼 URL）
+   {"action":"switch_tab","ref":"@T1"}          切换 Agent 关注的操作标签（${bg ? '不切换浏览器前台' : '前台模式会切到浏览器前台'}）
    {"action":"list_tabs"}                       列出浏览器【所有】标签（标题+网址+tabId，标记当前选中的、已在任务里的和无法操作的受限页）
-   {"action":"use_tab","tabId":<list_tabs 给的 tabId>}   把浏览器里已打开的任意标签纳入任务并切换过去操作（不切浏览器前台；已在任务里的直接切过去）。**必须先 list_tabs 拿最新 tabId**：系统强制——最近一次 list_tabs 之后标签集一变（新开/关闭/淘汰/纳入过标签），use_tab 就会被拒，需要重新 list_tabs 才能用
+   {"action":"use_tab","tabId":<list_tabs 给的 tabId>}   把浏览器里已打开的任意标签纳入任务并切换过去操作（${bg ? '不切浏览器前台' : '前台模式会切到浏览器前台'}；已在任务里的直接切过去）。**必须先 list_tabs 拿最新 tabId**：系统强制——最近一次 list_tabs 之后标签集一变（新开/关闭/淘汰/纳入过标签），use_tab 就会被拒，需要重新 list_tabs 才能用
    {"action":"close_tab","ref":"@T1"}           关闭自己开的标签（@MAIN/@U 等使用者的标签不可关闭）
 
 1. 页面操作（target 用快照里的数字 ref，如 3；ref 是全局编号，若元素标在【子窗口 N】分组里，直接用它所在行的 ref 即可，系统会自动定位到那个 iframe）：
@@ -652,10 +660,17 @@ function systemPrompt() {
    {"action":"select","target":<ref>,"value":"..."}        下拉框选择
    {"action":"scroll","direction":"down|up","amount":<像素,可选>}  滚动页面
    {"action":"snapshot","offset":<100 的倍数>}             翻到下一批元素窗口：快照标注"还有下一批"且目标不在列表时用（offset 取快照提示里的值；回第一批用 0）
-   {"action":"read","target":<ref 或 "page">,"raw":<可选 true>}  读取某元素或整页文本（用于总结）。默认已滤掉页面恒定导航/页脚/法务备案等噪音（页脚税），且已并入画布渲染的正文——读内容/文档/表格直接 read 整页即可，**不要加 raw**；"raw":true 只在需要核对页脚/备案/许可这类底部原文时用（会带页脚噪音）
+   {"action":"read","target":<ref 或 "page">,"selector":<可选，"css:#id 或 xpath:// 或 直接 CSS">,"limit":<可选字符数>,"raw":<可选 true>}  读取某元素/整页/指定选择器元素的文本（用于总结）。默认已滤掉页面恒定导航/页脚/法务备案等噪音（页脚税），且已并入画布渲染的正文——读内容/文档/表格直接 read 整页即可，**不要加 raw**；"raw":true 只在需要核对页脚/备案/许可这类底部原文时用（会带页脚噪音）；只想读页面某一块（如某篇文章/某个列表）时用 selector 直接指定该元素，不必先经快照拿 ref；只要开头一小段就够回答的问题加 "limit":<字符数> 按需取段
    {"action":"wait","ms":<毫秒>}                           等待页面/动画/网络
    {"action":"keypress","keys":"Enter|Escape|Tab|Backspace|ArrowDown|..."}  向当前焦点发送按键
    {"action":"navigate","url":"https://..."}               在【当前操作标签】内跳转（沿用其会话/登录状态）
+   {"action":"clickSelector","selector":"css:#btn 或 xpath://div[text()='提交'] 或 直接 CSS","frame":<可选，子窗口号>}   按选择器点击：元素列表里 ref 不好定位/已失效时，用 CSS 或 XPath 精确指定要点的元素（frame 用法同 clickText）
+   {"action":"readCss","target":<ref>,"selector":<可选>,"props":<可选数组>,"frame":<可选>}   读元素计算样式：省略 props 返回全量（显隐/定位/盒子/字体等，重要属性在前），只要看几个属性时用 "props":["display","visibility","opacity","position","z-index","pointer-events","overflow"] 按需取（省上下文）。元素看不见/位置异常时先 readCss 判断原因（display:none / opacity:0 / 被遮挡）
+   {"action":"uploadFile","target":<ref>,"selector":<可选>,"content":<文本,可选>,"filename":"a.csv","mime":<可选>,"pick":<可选 true>}   文件上传：content 给文本自动编码注入（如 CSV 内容）；pick:true 会弹本地文件选择框等你选文件后注入（人工参与点，慎用）
+   {"action":"pasteRich","target":<ref>,"selector":<可选>,"html":"<section>…</section>","frame":<可选>}   富文本粘贴：把带样式 HTML 粘进富文本编辑器（contenteditable，先清空再插入）
+   {"action":"pageInfo","field":<可选数组，"url"/"title"/"iframes"/"html" 子集>,"html":<可选 true>}   读页面信息：url/标题/加载状态/iframe 清单；默认不含整页 HTML，需要整页 HTML 时才加 "html":true
+   {"action":"getJsErrors","limit":<可选条数>}   读页面累计的 JS 错误（跨所有窗口聚合，错误标注来源窗口）；排查页面报错用，只要最近几条就够时加 "limit":<条数> 按需取
+   {"action":"clearJsErrors"}   清空页面已采集的 JS 错误缓冲
 
 2. 结果保存：
    {"action":"save_file","filename":"总结.md","content":"文件内容"}  将结果保存为文件下载到本地（支持 md/txt/json/csv/html 等）
@@ -683,15 +698,16 @@ function systemPrompt() {
 - 元素 ref 是数字；标签 ref 带 @ 前缀。绝不臆造，找不到就先 scroll/read/switch_tab 再观察。
 - 点击后看下一个快照：URL / 可交互元素 / 正文都没变化说明这次点击没生效——不要重复点同一元素，也不要对几乎相同的 URL 反复 navigate（同样多半不生效）；换一种做法推进（clickText 按文字点、hover 出悬浮项、read 读当前状态再判断）。
 - 目标是"读 N 条"（逐条读完列表/多篇内容再总结，如"读 20 条后分类总结"）时，**用批量跨页读法，不要逐条点开-返回**：列表快照里每个链接元素都带 →地址，那就是详情页地址。①攒出若干条【未读】条目的详情地址 → ②一批输出：open_tab 逐个新开详情页（可一次先开 10~15 个、让它们并行加载），再逐个 switch_tab 到某页 + read 读正文（系统会在 read 前自动等该页就绪，单页加载不打断整批）→ ③这一批读到的正文批末一次性全部返回给你，当场记下每条要点 → ④switch_tab 回列表看【已读】标记与【已读清单】，挑下一批【未读】继续，直到读够 N 条。判断"这条读过没"只看列表上的【已读】标记和【已读清单】，绝不重复读清单里已有的标题——列表里没读的条目多的是，别在一条上反复点。
+- 同一列表点出来的子页面（同级的详情/条目页）结构基本一样——**先研究透一个子页要做的操作**（元素怎么定位、点什么、输什么、怎么提交），确认可行后，对剩下的同级子页**批量复用同一套做法**（open_tab 攒 URL 批量新开 → 逐个 switch_tab + 同样的动作序列，必要时再 read 校验），**不要每页从头摸索**；只有个别页面结构确实不同时才单独处理。
 - **总结只许写你实际点开读过正文的条目**：只看到标题/摘要（没打开正文）的条目，最多只列它的标题（可加列表里就有的作者/时间），**绝不能编造正文内容或主观评价**。没读够目标条数就继续读、不要提前收尾；收尾时说明"实际点开读了 N 条 / 目标 M 条"。
 - 任何详情正文出现在快照摘要或 read 结果里时，先把它并入当轮的结论再关闭/离开：要按 Escape 关掉详情前，确认它的内容已记入你的进度——看完就关等于没读，关了又忘、忘了又点回来，是纯空转。
 - 点开条目后若正文没出现在快照摘要/元素列表（还在加载、在图片上、只见推荐列表），说明没拿到正文：**点了不等于读了**，别为"读"再点同一标题——read 都读不到就说明正文不在可读文本里；只要条目级信息就当场记下标题即可；点了却不打算读正文时，click 后的 wait 不必长等。
 - 想操作列表/表格里某一行（编辑/删除/更多菜单）却找不到按钮时，别急着放弃——很多站点的行内按钮是**悬浮那一行才出现**的：先 hover 那一行（或其上任意元素）让按钮显示，重截快照后可点；在页面上找不到下一步该点的入口时，同样先想它是不是要 hover 某个列表项才出现。hover 后按钮仍不出现，多半是**纯 CSS :hover 才显示**的菜单（合成事件触发不了），改用 show 按文字强制显示（如 show {"text":"编辑"}）。
 - 可交互列表里找不到的按钮/卡片，多半是纯 JS 动态渲染——从正文和【子窗口 N】内容里看到**明显可点**的文字（如"提交""创建""登录""新建空白文档"）时，用 clickText 按语义试点（点的是文字，不需它出现在列表里）；连续失败几次无进展就换 wait / hover / ask_user(teach)，不要一直赌。
 - 画布表格/文档（快照里有【画布文字】块、内容画在 canvas 上）的操作：表格类页面一般都有**单元格名称框**（快照标注"单元格名称框"、值形如 D2——Excel/Sheets/WPS/腾讯等电子表格的通用特征），定位目标格**优先用 gotoCell**（如 gotoCell D8：名称框输格号+回车跳格），比坐标点选稳。编辑配方：gotoCell 跳目标格 → keypress F2 进就地编辑 → type 新值 → keypress Enter 提交 → 重新快照从【画布文字】确认已更新。F2 进不了编辑、或没有名称框时退回坐标方案：clickAt 单击选中 → dblclickAt 双击唤起编辑框 → type → Enter。
-- 任务没给具体网址、需要查资料/搜信息时，用 search 动作（后台自动开搜索页）；知道确切网址时用 open_tab。
+- 任务没给具体网址、需要查资料/搜信息时，用 search 动作（${bg ? '后台自动开搜索页' : '自动开搜索页并切到前台'}）；知道确切网址时用 open_tab。
 - 当前页是受限页面（快照里会明确标注"受限页面"，如 chrome://、about:、扩展管理页、新标签页）时，绝对不要尝试操作它，直接用 open_tab 打开任务相关网址或 search 搜索。
-- 需要访问新页面做独立工作时，优先 open_tab / search 新开后台标签，避免打扰使用者的浏览。
+- 需要访问新页面做独立工作时，用 open_tab / search 新开${bg ? '后台标签，避免打扰使用者的浏览' : '标签（前台模式会切到前台展示操作）'}。
 - 仅当要沿用当前标签的登录会话/上下文（如已登录站点）时才用 navigate。
 - 教我模式：收到使用者演示的操作记录后，先用 say 动作向使用者复述你学到的操作步骤，再用 ask_user（mode=confirm）请他确认——他点「没问题」按钮或回复「没问题/确认」等确认后，就严格按演示步骤继续完成原始目标；页面状态与演示时不同（如已登录、元素变化）则灵活适配、按演示意图完成；有出入时按使用者的纠正调整。
 - 教我模式的复述确认阶段是个**确认循环**：使用者在对话里回复纠正或问题（如"不对""少了一步""第三步不是这样"）时，你要重新理解他的纠正、修正你对步骤的理解，再用 say 复述修正后的步骤、用 ask_user（mode=confirm）再次请他确认——循环会一直持续，直到他明确说「没问题/确认」放行，或说「不教了/算了」「你先去做吧/你自己来」终止教学（终止后按你当前理解的自行继续完成原始目标），或说「重新演示」要求重开演示。不要未经再次确认就擅自继续执行，也不要自行猜测调整步骤。
@@ -923,15 +939,23 @@ async function buildMessages(t) {
   let used = messagesTokens(msgs);
   const budget = ctxWin - OUTPUT_RESERVE;
   let snapKept = 0;
+  let roundsSeen = 0; // 反向扫描中已越过的 assistant 决策条数 = "此条消息已有多新的回合"。工具结果超过 RESULT_KEEP_ROUNDS 回合 → 降级为空壳
   for (let i = hist.length - 1; i >= B; i--) {
     const m = hist[i];
     if (m.kind === 'snapshot') {
       if (snapKept >= MAX_SNAPSHOT_KEEP) continue; // 更老的快照不再发（最新快照永远在，循环从最新往前数）
       snapKept++;
     }
-    const cost = estimateTokens(m.content);
+    let content = m.content;
+    if (m.role === 'assistant') roundsSeen++; // 一个 model 决策 = 一回合（回合边界；一批多结果同属一回合）
+    else if (m.role === 'user' && String(m.content || '').indexOf('动作结果：') === 0 && roundsSeen >= RESULT_KEEP_ROUNDS) {
+      // 旧回合工具结果空壳化：保留开头短摘要（含 ok/失败与关键首字段），全量省略——让模型知道"这动作返回过"，
+      // 但不占用大段上下文；细节已由更晚的快照/readList 承载，必要时可重读。空壳本身成本极小，不再拖垮预算。
+      content = '动作结果（已过期，全量省略）：' + String(m.content).slice('动作结果：'.length, '动作结果：'.length + RESULT_STUB_CHARS);
+    }
+    const cost = estimateTokens(content);
     if (used + cost > budget) break;
-    body.unshift(m);
+    body.unshift({ ...m, content });
     used += cost;
   }
   // 目标与最新指令分开注入（都独立保存、不会被裁剪）：
@@ -941,19 +965,19 @@ async function buildMessages(t) {
   // 两者即使已出现在历史尾部也重复注入作醒目强调，让"补充说明要被重视、但不必然放弃原目标"充分生效。
   const goalText = (t.goal && String(t.goal).trim()) || (() => {
     const gi = firstUserIdx(t);
-    return gi > 0 ? String(hist[gi].content).slice(0, 600) : '';
+    return gi > 0 ? String(hist[gi].content) : '';
   })();
   if (goalText) {
     msgs.push({
       role: 'user',
-      content: '【原始目标（你最初接到的指令，请继续推进它；除非最新指令明确改变了它，否则不要放弃）】\n' + goalText.slice(0, 600)
+      content: '【原始目标（你最初接到的指令，请继续推进它；除非最新指令明确改变了它，否则不要放弃）】\n' + goalText
     });
   }
   const lastInstr = (t.lastInstruction && String(t.lastInstruction).trim()) || '';
   if (lastInstr && lastInstr !== goalText) {
     msgs.push({
       role: 'user',
-      content: '【最新指令/补充说明（使用者中途发来的，务必重视并采纳：若它只是纠正你的做法，就按它调整后继续推进原始目标；若它明确改变了目标，则以它为准切换目标）】\n' + lastInstr.slice(0, 600)
+      content: '【最新指令/补充说明（使用者中途发来的，务必重视并采纳：若它只是纠正你的做法，就按它调整后继续推进原始目标；若它明确改变了目标，则以它为准切换目标）】\n' + lastInstr
     });
   }
   msgs.push(...body);
@@ -1153,7 +1177,10 @@ async function resolveCurrentTabId(t) {
 }
 
 function findTabEntry(ref, t) {
-  return ((t && t.tabs) || []).find((e) => e.ref === ref) || null;
+  // 快照/动作说明给模型看的是带 @ 的 ref（[@T2]、@MAIN），存储里不带（'T2'/'MAIN'/'U1'）。
+  // 模型会把 @T2 原样发回 switch_tab/close_tab，这里剥掉开头单个 @ 再精确匹配，两种写法都认。
+  const key = String(ref == null ? '' : ref).replace(/^@/, '');
+  return ((t && t.tabs) || []).find((e) => e.ref === key) || null;
 }
 
 // 把 URL 压缩成会话区精简显示：去掉 https:// 协议头，只保留"域名 + path 前 4 个字符"；没有 path 就只显示域名
@@ -1325,7 +1352,15 @@ async function findReusableAgentTab(url, t) {
   return null;
 }
 
-// 新开 Agent 后台标签（不抢焦点），并加入分组。display 为给使用者看的友好文案（search 用），缺省显示 url。
+// 前台执行模式（config.backgroundExec=false）下，把 Agent 刚切换/打开的标签切到浏览器前台；后台模式不切。
+async function bringTabToForeground(tabId) {
+  try {
+    const cfg = await getConfig();
+    if (!cfg.backgroundExec && tabId != null) await chrome.tabs.update(tabId, { active: true });
+  } catch (e) {}
+}
+
+// 新开 Agent 标签（前台模式切前台、后台模式不抢焦点），并加入分组。display 为给使用者看的友好文案（search 用），缺省显示 url。
 // 返回 { entry, reused }：reused=true 表示本会话已有一个 tab 正停在这个 URL 上，直接切过去、没新开标签。
 async function openAgentTab(url, display, t) {
   const t0 = performance.now();
@@ -1334,6 +1369,7 @@ async function openAgentTab(url, display, t) {
   if (reused) {
     setCurrentRef(t, reused.ref);
     await saveTasks();
+    await bringTabToForeground(reused.tabId); // 前台模式：复用已有标签时也切到前台
     addLog(t.sid, '复用页面 ' + shortUrl(url) + ' · ' + Math.round(performance.now() - t0) + 'ms');
     broadcastTabs(t);
     return { entry: reused, reused: true };
@@ -1342,7 +1378,8 @@ async function openAgentTab(url, display, t) {
   if (agentTabs.length >= MAX_AGENT_TABS) {
     await evictLruAgentTab(t); // 腾一个位置再开
   }
-  const tab = await chrome.tabs.create({ url, active: false });
+  const cfg = await getConfig();
+  const tab = await chrome.tabs.create({ url, active: !cfg.backgroundExec }); // 前台模式：新标签直接切到浏览器前台
   const ms = Math.round(performance.now() - t0);
   const ref = 'T' + ++t.tabSeq;
   const entry = { ref, tabId: tab.id, role: 'agent', title: tab.title || '', url: tab.url || url };
@@ -1407,11 +1444,12 @@ async function adoptOpenedTab(tabId, t) {
   await addToGroup(tabId, t);
   await saveTasks();
   broadcastTabs(t);
+  const advCfg = await getConfig();
   t.history.push({
     role: 'user',
-    content: '页面动作新开的页面已在后台打开并纳入任务：@' + ref + '（' + (tab.title || shortUrl(tab.url || '')) + '），属 Agent 自开，本轮结束自动关闭'
+    content: '页面动作新开的页面已' + (advCfg.backgroundExec ? '在后台打开' : '打开') + '并纳入任务：@' + ref + '（' + (tab.title || shortUrl(tab.url || '')) + '），属 Agent 自开，本轮结束自动关闭'
   });
-  addLog(t.sid, '页面新开 → 后台打开 ' + shortUrl(tab.url || '新页面'));
+  addLog(t.sid, '页面新开 → ' + (advCfg.backgroundExec ? '后台打开 ' : '打开 ') + shortUrl(tab.url || '新页面'));
 }
 
 // 教我模式：使用者演示时切到/新开一个标签 → 纳入任务（@U 使用者标签）并挂上录制。
@@ -1519,9 +1557,9 @@ async function closeAgentTab(ref, t) {
   if (!entry) throw new Error('要关闭的标签不存在或已关闭：' + ref + '（先 list_tabs 确认再关）');
   if (entry.role === 'main' || entry.role === 'user') throw new Error('@' + entry.ref + ' 是使用者的标签，不可关闭');
   await chrome.tabs.remove(entry.tabId);
-  t.tabs = t.tabs.filter((e) => e.ref !== ref);
+  t.tabs = t.tabs.filter((e) => e.ref !== entry.ref); // 用规范 ref（不带 @）比对，输入可能是 @T2
   t.listTabsFresh = false; // 关掉一个标签，use_tab 需重新 list_tabs
-  if (t.currentRef === ref) {
+  if (t.currentRef === entry.ref) {
     // 回退到主标签
     const main = t.tabs.find((e) => e.role === 'main');
     t.currentRef = main ? main.ref : ((t.tabs[0] || {}).ref || null);
@@ -2397,6 +2435,13 @@ function friendlyAction(a, res, ms) {
     case 'dblclickAt': return T('双击坐标(' + (Number.isFinite(Number(a.x)) ? Math.round(a.x) : '?') + ',' + (Number.isFinite(Number(a.y)) ? Math.round(a.y) : '?') + ')');
     case 'gotoCell': return T('跳格到 ' + String(a.ref || '?'));
     case 'clickText': return T('按文字点「' + midTruncate(a.text, 32) + '」' + (typeof a.frame === 'number' && a.frame > 0 ? '（子窗' + a.frame + '）' : ''));
+    case 'clickSelector': return T('按选择器点「' + midTruncate(a.selector, 32) + '」' + (typeof a.frame === 'number' && a.frame > 0 ? '（子窗' + a.frame + '）' : ''));
+    case 'uploadFile': return T('上传文件' + (a.filename ? '「' + short(a.filename) + '」' : ''));
+    case 'pasteRich': return T('粘贴富文本' + (label ? '「' + short(label) + '」' : '') + frameNote);
+    case 'readCss': return T('读计算样式' + (label ? '「' + short(label) + '」' : '') + frameNote);
+    case 'pageInfo': return T('读页面信息');
+    case 'getJsErrors': return T('读 JS 错误' + (res && res.ok && typeof res.count === 'number' ? '（' + res.count + ' 条）' : ''));
+    case 'clearJsErrors': return T('清空 JS 错误' + (res && res.ok && typeof res.cleared === 'number' ? '（' + res.cleared + ' 条）' : ''));
     case 'hover': return T('悬浮' + (label ? '「' + short(label) + '」' : '') + frameNote);
     case 'show': return T('强制显示' + (a.text ? '「' + short(a.text) + '」' : (a.selector ? '「' + short(a.selector) + '」' : (label ? '「' + label + '」' : ''))) + frameNote);
     case 'hide': return T('还原显示' + (a.target != null ? frameNote : ''));
@@ -2460,7 +2505,7 @@ function pageKeyOf(url) {
 // 连续跨页动作之间不等，让多个新页并行加载，直到要用它之前才等（高效利用加载时间）。
 function actionNeedsLivePage(a) {
   if (!a || !a.action) return false;
-  return ['read', 'click', 'clickAt', 'dblclickAt', 'gotoCell', 'clickText', 'hover', 'show', 'hide', 'type', 'select', 'scroll', 'keypress'].includes(a.action);
+  return ['read', 'click', 'clickAt', 'dblclickAt', 'gotoCell', 'clickText', 'clickSelector', 'uploadFile', 'pasteRich', 'readCss', 'pageInfo', 'getJsErrors', 'clearJsErrors', 'hover', 'show', 'hide', 'type', 'select', 'scroll', 'keypress'].includes(a.action);
 }
 
 // 确保当前操作标签的页面就绪（内容脚本能响应 PING 且 tab status=complete）。
@@ -2575,10 +2620,38 @@ async function runActionBatch(t, actions) {
   agentStep(t).catch((e) => fail(t, '运行异常：' + e.message));
 }
 
+// ---- uploadFile 本地文件选择弹窗（pick:true）----
+// 打开 picker.html 扩展页让使用者选本地文件，picker 读成 base64 后经 PICK_FILE_RESULT 消息回传。
+// 消息 id 配对：并发/多次弹窗各自有独立 pickId，互不串扰；超时视为取消返回 null（走"弹窗被取消"失败）。
+const PICK_WAIT_MS = 120000; // 选文件等待上限：使用者 2 分钟没选完视为取消
+const pickWaiters = new Map(); // pickId -> resolve({base64, filename, mime, windowId})
+async function pickLocalFile() {
+  const pickId = Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => { pickWaiters.delete(pickId); resolve(null); }, PICK_WAIT_MS);
+    pickWaiters.set(pickId, (msg) => { clearTimeout(timer); pickWaiters.delete(pickId); resolve(msg); });
+    try {
+      chrome.windows.create({
+        url: chrome.runtime.getURL('picker.html') + '?pickId=' + pickId,
+        type: 'popup',
+        width: 420,
+        height: 240,
+        focused: true
+      });
+    } catch (e) {
+      clearTimeout(timer);
+      pickWaiters.delete(pickId);
+      resolve(null);
+    }
+  });
+}
+
 async function runAction(t, a) {
   if (!t || t.state !== 'working') return;
   const myTurn = t.turnId;
   if (!stillCurrent(t, myTurn)) return;
+  // 记录"这次在尝试什么动作"（使用者能看懂的话）：转人工求助时卡片据此告诉使用者卡在哪一步，
+  // 不会只报站点、使用者不知道要帮什么（如"点击「收藏」"就一眼知道是点在收藏上失败）
   // 记录"这次真实动作之前攒了几次 wait"（供"等待后又重复同一个动作"识别），并清零连续等待计数
   const prevWaits = (a.action !== 'wait') ? (t.consecWaits || 0) : 0;
   if (a.action !== 'wait') t.consecWaits = 0;
@@ -2654,6 +2727,7 @@ async function runAction(t, a) {
     const ms = Math.round(performance.now() - t0);
     addLog(t.sid, '切换标签 · ' + ms + 'ms');
     await saveTasks();
+    await bringTabToForeground(entry.tabId); // 前台模式：切到的标签切到浏览器前台；后台模式不切
     if (!stillCurrent(t, myTurn)) return;
     nextStepOrBatch(t, myTurn);
     return;
@@ -2709,12 +2783,14 @@ async function runAction(t, a) {
       t.tabs.push({ ref: adoptedRef, tabId, role: 'user', title: tab.title || '', url: tab.url || '' });
     }
     setCurrentRef(t, adoptedRef);
-    t.history.push({ role: 'user', content: '已把浏览器标签纳入任务：@' + adoptedRef + ' ' + (tab.title || shortUrl(tab.url)) + '（当前操作标签，未切浏览器前台）' });
+    const cfg = await getConfig();
+    t.history.push({ role: 'user', content: '已把浏览器标签纳入任务：@' + adoptedRef + ' ' + (tab.title || shortUrl(tab.url)) + '（当前操作标签' + (cfg.backgroundExec ? '，未切浏览器前台' : '，前台模式已切到浏览器前台') + '）' });
     t.listTabsFresh = false; // 纳入后可用标签集已变，再 use_tab 需重新 list_tabs
     const ms = Math.round(performance.now() - t0);
     addLog(t.sid, '复用页面 ' + midTruncate(tab.title || shortUrl(tab.url), 32) + ' · ' + ms + 'ms');
     await saveTasks();
     broadcastTabs(t);
+    await bringTabToForeground(tabId); // 前台模式：纳入的标签切到浏览器前台
     if (!stillCurrent(t, myTurn)) return;
     nextStepOrBatch(t, myTurn);
     return;
@@ -2898,7 +2974,7 @@ async function runAction(t, a) {
       // 空等也算"无进展"，累计到阈值主动请使用者演示（多数情况走下面的"禁止再 wait"就够了，这里兜底）
       t.stuck = (t.stuck || 0) + 1;
       if (t.stuck >= STUCK_TEACH_LIMIT) {
-        await askUser(t, '我在等待页面变化上反复空转、一直没有进展。' + teachGoalNote(t) + '请你在当前页面上手把手演示一遍正确操作，我会记录学习后照着做。', 'teach');
+        await askUser(t, '我在等待页面变化上反复空转、一直没有进展。' + currentStepNote(t) + '请你在当前页面上手把手演示一遍正确操作，我会记录学习后照着做。', 'teach');
         return;
       }
       if (t.consecWaits === 2) {
@@ -2956,7 +3032,7 @@ async function runAction(t, a) {
       t.stuck = 0; // 换了个新动作 = 在尝试新路径，无进展计数清零
     }
     if (t.stuck >= STUCK_TEACH_LIMIT) {
-      await askUser(t, '我反复尝试了 ' + t.stuck + ' 次同样的操作仍然没有进展，不知道怎么继续了。' + teachGoalNote(t) + '请你在当前页面上手把手演示一遍正确操作，我会记录学习后照着做。', 'teach');
+      await askUser(t, '我反复尝试了 ' + t.stuck + ' 次同样的操作仍然没有进展，不知道怎么继续了。' + currentStepNote(t) + '请你在当前页面上手把手演示一遍正确操作，我会记录学习后照着做。', 'teach');
       return;
     }
   }
@@ -2985,6 +3061,47 @@ async function runAction(t, a) {
   if (!stillCurrent(t, myTurn)) return;
   const t0 = performance.now();
   armFocusGuard(t); // 记录动作前的前台标签；动作期间页面若 window.open 抢焦点，后台会把它收回
+
+  // ---- uploadFile 本地文件弹窗编排：base64 / content 都没有且 pick:true → 弹扩展页选文件，等使用者选完补 base64 再走正常注入 ----
+  // 批内遇到会等使用者选择（本质是人工交互点，类似 ask_user 模式，只是靠系统文件对话框完成）。
+  if (a.action === 'uploadFile' && a.pick === true && !a.base64 && a.content == null) {
+    const picked = await pickLocalFile();
+    if (!stillCurrent(t, myTurn)) return;
+    if (!picked) {
+      res = { ok: false, message: '上传文件弹窗被取消或超时（' + Math.round(PICK_WAIT_MS / 1000) + ' 秒未选）' };
+      await finishRunAction(t, a, res, Math.round(performance.now() - t0), sig, myTurn);
+      return;
+    }
+    a = { ...a, base64: picked.base64, filename: picked.filename || a.filename, mime: picked.mime || a.mime, pick: false };
+  }
+
+  // ---- 广播动作（getJsErrors / clearJsErrors）：跨所有 frame 聚合/清空 JS 错误，不走单 frame 路由 ----
+  // 顶层 content 无法访问跨域 iframe 的 DOM，错误是各 frame 独立采集的；这里用 getAllFrames 遍历广播、
+  // 聚合时给非顶层错误标注来源窗口 url（对齐 chrome_do_action broadcastJsErrors）。
+  if (a.action === 'getJsErrors' || a.action === 'clearJsErrors') {
+    const frames = await frameList(tabId);
+    const results = await Promise.all(frames.map((f) => sendTab(tabId, { type: 'EXECUTE_ACTION', action: a }, 2000, { frameId: f.frameId })));
+    if (a.action === 'getJsErrors') {
+      const all = [];
+      for (let i = 0; i < frames.length; i++) {
+        const r = results[i];
+        if (r && r.ok && Array.isArray(r.errors)) {
+          for (const e of r.errors) all.push(frames[i].frameId === 0 ? e : Object.assign({ frame: shortUrl(frames[i].url || '') }, e));
+        }
+      }
+      res = { ok: true, count: all.length, errors: all };
+    } else {
+      let cleared = 0;
+      for (let i = 0; i < frames.length; i++) {
+        const r = results[i];
+        if (r && r.ok && typeof r.cleared === 'number') cleared += r.cleared;
+      }
+      res = { ok: true, cleared };
+    }
+    await finishRunAction(t, a, res, Math.round(performance.now() - t0), sig, myTurn);
+    return;
+  }
+
   // 目标窗口路由：合并快照里 iframe 元素的 ref 是全局编号（frameIndex*1000+局部 ref），
   // 先拆回 (frameId, 局部 ref) 再只发给那个窗口执行，避免全 frame 都收到、返回数组乱掉。
   // 非数字目标（read 页面/scroll/keypress 等）一律落在主窗口（frameId 0）。
@@ -2997,8 +3114,8 @@ async function runAction(t, a) {
       sendFrame = { frameId: frame.frameId };
       actionForFrame = { ...a, target: a.target % FRAME_REF_BASE };
     }
-  } else if (a.action === 'clickText' && typeof a.frame === 'number' && a.frame > 0) {
-    // clickText 没有 target ref，用 frame 字段指定子窗口（与【子窗口 N】编号一致）；不填默认主窗口
+  } else if (['clickText', 'clickSelector', 'uploadFile', 'pasteRich', 'readCss'].includes(a.action) && typeof a.frame === 'number' && a.frame > 0) {
+    // 这组动作没有 target ref，用 frame 字段指定子窗口（与【子窗口 N】编号一致）；不填默认主窗口
     const frame = (t.snapFrames || [])[a.frame];
     if (frame && frame.frameId != null) sendFrame = { frameId: frame.frameId };
   }
@@ -3024,14 +3141,27 @@ async function runAction(t, a) {
     return;
   }
 
-  // 点击的链接是 target="_blank"（会新开页面）→ content 已截获，改为后台打开并纳入 @T：
-  // 不抢浏览器焦点，且算 Agent 自开标签（本轮结束随分组一起清理）。
+  // pageInfo 跨域 iframe 补全：content 只能读到同源 iframe 的 url/title；跨域 iframe 只有 src 属性，
+  // 用 getAllFrames 的 frame url 交叉匹配把 url/title 补上（src 是绝对地址的跨域窗基本能匹配上，匹配不上就保留 src 原样）
+  if (res && res.ok && a.action === 'pageInfo' && res.info && Array.isArray(res.info.iframes)) {
+    const frames = await frameList(tabId);
+    for (const rec of res.info.iframes) {
+      if (rec.sameOrigin || !rec.src) continue;
+      const src = String(rec.src).slice(0, 120);
+      const m = frames.find((f) => f.frameId !== 0 && f.url && f.url.indexOf(src) !== -1);
+      if (m) { rec.url = m.url; rec.title = m.title || ''; }
+    }
+  }
+
+  // 点击的链接是 target="_blank"（会新开页面）→ content 已截获，改为 Agent 标签打开并纳入 @T：
+  // 前台模式切前台、后台模式不抢浏览器焦点，且算 Agent 自开标签（本轮结束随分组一起清理）。
   if (res.openTab) {
+    const lnkCfg = await getConfig();
     let resTab;
     const label = (res.label || '').trim();
     const display = label
-      ? ('点击「' + midTruncate(label, 32) + '」→ 后台打开 ' + shortUrl(res.openTab))
-      : ('点击 → 后台打开 ' + shortUrl(res.openTab));
+      ? ('点击「' + midTruncate(label, 32) + '」→ ' + (lnkCfg.backgroundExec ? '后台打开 ' : '打开 ') + shortUrl(res.openTab))
+      : ('点击 → ' + (lnkCfg.backgroundExec ? '后台打开 ' : '打开 ') + shortUrl(res.openTab));
     try {
       resTab = await openAgentTab(res.openTab, display, t);
     } catch (e) {
@@ -3042,7 +3172,7 @@ async function runAction(t, a) {
     t.failStreak = 0;
     const openedOrReused = resTab.reused
       ? '点击的链接目标已在 @' + resTab.entry.ref + ' 打开，直接切换过去（' + shortUrl(res.openTab) + '）'
-      : '点击的链接会新开页面，已在后台打开为 @' + resTab.entry.ref + '（' + shortUrl(res.openTab) + '），属 Agent 自开标签，本轮结束自动关闭';
+      : '点击的链接会新开页面，已' + (lnkCfg.backgroundExec ? '在后台打开' : '打开') + '为 @' + resTab.entry.ref + '（' + shortUrl(res.openTab) + '），属 Agent 自开标签，本轮结束自动关闭';
     t.history.push({ role: 'user', content: openedOrReused });
     // 彻底统一：操作后不等待——新页就绪由下一步读/操作前 ensureCurrentOpReady 承担
     nextStepOrBatch(t, myTurn);
@@ -3090,10 +3220,16 @@ async function runAction(t, a) {
       }
     }
   }
-  t.history.push({
-    role: 'user',
-    content: '动作结果：' + JSON.stringify(res).slice(0, 3000)
-  });
+  await finishRunAction(t, a, res, ms, sig, myTurn);
+}
+
+// runAction 收尾：动作结果写历史、面板日志、驱动下一步。广播动作（getJsErrors/clearJsErrors）与
+// pick 编排（uploadFile 弹窗）在中途也走这里，避免复制收尾逻辑。
+async function finishRunAction(t, a, res, ms, sig, myTurn) {
+  // 结果全量写历史（不再一律 3000 硬截断——那会连当前回合的大结果如 pageInfo html / readCss 都读不全）。
+  // 上下文控制改在发送侧 buildMessages：最近 RESULT_KEEP_ROUNDS 回合全量、更早的空壳化；压缩时 summarizeOnce 再按 1200/条摄入摘要。
+  // RESULT_MAX_STORE 只是存储软上限，防止极端超大结果把 saveTasks 序列化/配额撑爆。
+  t.history.push({ role: 'user', content: '动作结果：' + JSON.stringify(res).slice(0, RESULT_MAX_STORE) });
   t.failStreak = 0;
   // type 输入卡住提醒已随"操作后不等待"移除：type 不再返回 inputStuck，输入是否落地由下一个快照体现、模型据快照纠正
   if (!t._inBatch) {
@@ -3102,8 +3238,7 @@ async function runAction(t, a) {
   }
   addLog(t.sid, (t._batchPos != null ? '批' + t._batchPos + '/' + t._batchLen + ' ' : '') + friendlyAction(a, res, ms)); // 面板显示极简动作 + 耗时，如"点击 · 50ms"；批量标注开关打开时加"批N/M"前缀
   await saveTasks();
-  if (!stillCurrent(t, myTurn)) return;
-  nextStepOrBatch(t, myTurn);
+  if (stillCurrent(t, myTurn)) nextStepOrBatch(t, myTurn);
 }
 
 // 当前操作页面的标识（转人工/提醒时告诉使用者"哪个页面"）：
@@ -3151,16 +3286,22 @@ async function pushFailure(t, why, quiet, sig) {
     t.pageSnapCounts[pageKeyOf(cur.url)] = 0;
   }
   if (t.stuck >= STUCK_TEACH_LIMIT) {
-    await askUser(t, '我反复尝试了 ' + t.stuck + ' 次仍然没有进展。' + teachGoalNote(t) + '请你在当前页面上手把手演示一遍正确操作，我会记录学习后照着做。', 'teach');
+    await askUser(t, '我反复尝试了 ' + t.stuck + ' 次仍然没有进展。' + currentStepNote(t) + '请你在当前页面上手把手演示一遍正确操作，我会记录学习后照着做。', 'teach');
     return;
   }
   if (t.failStreak >= 3) {
     const site = currentSiteLabel(t);
     // quiet 失败是"内部纠错、不刷用户面板"——文案写给模型看（如"先 list_tabs"），使用者无法代模型执行，
-    // 拼进求助卡片只会让人困惑。升级转人工时这类失败不附原因，卡片只说明站点 + 求助意图。
+    // 拼进求助卡片只会让人困惑。升级转人工时这类失败不附原因。
     const plain = quiet ? '' : humanizeWhy(why);
-    // 卡片内消息具体讲清问题（站点+原因）；卡片外的活动日志行精简为一句求助
-    await askUser(t, '在 ' + site + ' 上连续操作失败' + (plain ? '：' + plain : ''), undefined, '遇到了问题，需要你帮忙');
+    // 卡片要讲清"卡在哪一步 + 请使用者帮什么"，而不是只报站点：
+    //  1) 当前步骤（t.plan 里第一个未完成的步骤，如"打开候选帖子详情页批量读取正文"）——使用者一眼知道该帮哪一步；
+    //  2) 失败原因（非 quiet 才有，humanizeWhy 已转成使用者能懂的话）；
+    //  3) 明确请使用者做什么（页面上操作完点继续 / 在对话里告诉 Agent 该怎么做）。
+    // 刻意不附"刚在尝试的哪个动作"：底层动作（如切换标签）对使用者没有意义，反而干扰判断，当前步骤已足够说明问题。
+    const stepNote = currentStepNote(t); // "当前步骤：xxx。"（优先具体步骤；步骤计划缺失才退大目标兜底）
+    const askNote = '请帮我看一眼当前页面：如果是需要你手动操作（登录/验证码/特别步骤），直接在页面上帮我完成，完成后点「我已操作完成，继续」；如果是我理解错了，告诉我该怎么操作，我会照做。';
+    await askUser(t, '在 ' + site + ' 上连续操作失败。' + stepNote + (plain ? '失败原因：' + plain + '。' : '') + askNote, undefined, '遇到了问题，需要你帮忙');
     return;
   }
   t.history.push({ role: 'user', content: '动作执行失败：' + why + '（先对照快照里的【本站操作技巧】调整做法再重试，别硬试同一招）' });
@@ -3169,8 +3310,19 @@ async function pushFailure(t, why, quiet, sig) {
   agentStep(t).catch((e) => fail(t, '运行异常：' + e.message));
 }
 
-// 教我求助卡里附一句当前目标：让使用者知道该演示哪一步（卡片正文讲清"教什么"）。
-// 只用于 Agent 主动求助的 teach 卡；使用者主动说"我教你"时 goal 是占位文案，不进卡片。
+// 求助卡里附一句"当前卡在哪一步"：从步骤计划（t.plan，[{text,done}]）取第一个未完成的步骤——
+// 比整句大目标具体得多，使用者一看就知道该帮哪一步（"当前步骤：点击「收藏」按钮"好过"总结网友意见"）。
+// 步骤计划缺失/没有未完成步骤时退回整句目标兜底；两者都无则空。
+// 只用于 Agent 主动求助的卡；使用者主动说"我教你"时 goal 是占位文案，不进卡片。
+function currentStepNote(t) {
+  if (t && Array.isArray(t.plan)) {
+    const cur = t.plan.find((s) => s && !s.done && s.text);
+    if (cur) return '当前步骤：' + cur.text + '。';
+  }
+  return teachGoalNote(t);
+}
+
+// 整句目标兜底（步骤计划缺失时用）："当前目标：xxx。"
 function teachGoalNote(t) {
   const g = String((t && t.goal) || '').trim();
   return g ? '当前目标：' + midTruncate(g, 44) + '。' : '';
@@ -3761,6 +3913,9 @@ async function processUserMessage(sid, text, tabId) {
     addLog(t.sid, '收到新指令，打断当前操作…');
   }
   // 任务计时：闲置时收到指令 = 新任务（清零重计）；执行中/等待中的补充指令 = 同一任务续跑（恢复计时）
+  // 步骤计划重置与计时同一边界：只有"新任务"（闲置时收到指令）才清掉旧计划让模型重新拆解；
+  // 执行中/等待中的补充指令（纠正做法、回答求助）保留已有计划，面板不退回"正在拆解"占位。
+  const freshTask = t.state === 'idle';
   if (t.state === 'idle') timerBegin(t); else timerResume(t);
   t.turnId++;
   t.state = 'working';
@@ -3783,8 +3938,10 @@ async function processUserMessage(sid, text, tabId) {
   if (!t.goal) t.goal = content; // 记下最初的原始目标，压缩/裁剪后仍能保留（中途补充说明不覆盖它）
   t.lastInstruction = content; // 最新一条指令/补充说明：注入上下文醒目强调、务必采纳（可能是改目标，也可能只是纠正做法的指导）
   t.history.push({ role: 'user', content });
-  t.plan = []; // 新指令重置步骤计划：模型本轮重新拆解
-  broadcast({ type: 'AGENT_PLAN', steps: [] }, t.sid); // 面板收起旧计划（后续 AGENT_STATUS working 会显示"拆解中"占位）
+  if (freshTask) {
+    t.plan = []; // 新任务才重置步骤计划：模型本轮重新拆解；补充指令保留旧计划（面板照常显示，模型随 actions 顺带更新覆盖）
+    broadcast({ type: 'AGENT_PLAN', steps: [] }, t.sid); // 面板收起旧计划（后续 AGENT_STATUS working 会显示"拆解中"占位）
+  }
 
   const bt0 = performance.now();
   const bookmarkCount = await refreshBookmarkIndex(); // 新指令重新载入书签索引（书签可能已变）
@@ -4020,7 +4177,8 @@ async function clearConversation(sid) {
   t.teachTabIds = [];
   t.teachEvents = [];
   removeLlmLogs(t.sid); // 清空本会话：大模型往返日志一并清零（独立存储）
-  t.history = [{ role: 'system', content: systemPrompt() }];
+  const sysCfg = await getConfig(); // 重置提示词时按当前执行模式措辞
+  t.history = [{ role: 'system', content: systemPrompt(sysCfg.backgroundExec) }];
   t.ctxSummary = null;
   t.ctxBoundary = 0;
   t.tokens = 0; // 清空本会话 = 重新开始，token 用量一并清零
@@ -4145,6 +4303,15 @@ async function handleMessage(msg, sender) {
   switch (msg.type) {
     case 'PING':
       return { pong: true };
+    case 'PICK_FILE_RESULT': { // 本地文件弹窗回传：选中文件 base64 与元信息（uploadFile pick:true 编排用）
+      const w = pickWaiters.get(msg.pickId);
+      if (w) {
+        if (msg.cancelled) w(null); // 使用者在弹窗里取消 → 走"弹窗被取消/超时"失败
+        else w({ base64: msg.base64, filename: msg.filename, mime: msg.mime, windowId: msg.windowId });
+        if (msg.windowId != null) { try { chrome.windows.remove(msg.windowId); } catch (e) {} }
+      }
+      return { ok: true };
+    }
     case 'GET_CONFIG':
       return { config: await getConfig() };
     case 'SAVE_CONFIG':

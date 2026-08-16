@@ -21,6 +21,35 @@
   const TEXT_LIMIT = 6000;   // 正文摘要长度上限
   const READ_LIMIT = 6000;   // read 动作单次返回文本上限
 
+  // ---- 新动作上限（向 chrome_do_action 学习后补的动作：uploadFile/pasteRich/pageInfo）----
+  const UPLOAD_MAX = 5 * 1024 * 1024; // uploadFile base64 上限 5MB：sendMessage 体积安全线，超了在注入前拦下（消息传递本身也会炸）
+  const PASTE_HTML_MAX = 20000;        // pasteRich 单次粘贴 HTML 上限（防模型塞整页模板进来把编辑器/历史撑爆）
+  const PAGE_INFO_PAGE_HTML_MAX = 20000; // pageInfo 顶层整页 HTML 上限（默认不带，只有显式要 html 才返回，截断是常态）
+  const PAGE_INFO_FRAME_HTML_MAX = 4000; // pageInfo 单个 iframe 的 HTML 上限（同源才取得到）
+  const PAGE_INFO_FRAMES_MAX = 20;       // pageInfo iframes 清单条数上限
+
+  // ---- JS 错误采集（getJsErrors / clearJsErrors 用）----
+  // 本窗口采集页面 JS 错误（window.onerror + 未处理的 Promise rejection），跨 frame 由 background 广播聚合。
+  // 缓冲固定上限：iframe 频繁报错时只留最新的 JS_ERRORS_MAX 条，防内存被刷爆。错误逐条呈现，不去重。
+  const JS_ERRORS_MAX = 50; // 单窗口错误缓冲上限，超出丢弃最旧
+  const jsErrorBuf = [];
+  window.addEventListener('error', (e) => {
+    const rec = {
+      message: (e && e.message) ? String(e.message).slice(0, 300) : 'unknown error',
+      source: (e && e.filename) ? String(e.filename).slice(0, 200) : '',
+      lineno: e && e.lineno ? e.lineno : 0
+    };
+    jsErrorBuf.push(rec);
+    if (jsErrorBuf.length > JS_ERRORS_MAX) jsErrorBuf.splice(0, jsErrorBuf.length - JS_ERRORS_MAX);
+  });
+  window.addEventListener('unhandledrejection', (e) => {
+    const reason = e && e.reason;
+    const msg = reason && reason.message ? String(reason.message) : (reason ? String(reason).slice(0, 200) : 'unhandled promise rejection');
+    const rec = { message: msg.slice(0, 300), source: '', lineno: 0 };
+    jsErrorBuf.push(rec);
+    if (jsErrorBuf.length > JS_ERRORS_MAX) jsErrorBuf.splice(0, jsErrorBuf.length - JS_ERRORS_MAX);
+  });
+
   // ---- 页脚税过滤 ----
   // 快照正文摘要 / read 默认去掉"站点恒定导航/页脚/法务备案"这类跨站噪音：它们每张快照都重复出现、
   // 信息量极低却白白吃掉上下文（如小红书超长 ICP 备案块一次 ~800 字符）。判断信号全通用、不特判站点：
@@ -803,6 +832,48 @@
     return cands.length ? cands[0].el : null; // 没有可见命中也退回最短匹配，兜底允许赌一把
   }
 
+  // 按选择器定位元素：支持 css: 前缀 / xpath: 前缀 / 裸 CSS（对齐 chrome_do_action findElement）。
+  // 供 clickSelector / uploadFile / pasteRich / readCss 在元素列表里没有合适 ref 时兜底精确定位。
+  function findBySelector(selector) {
+    const raw = String(selector || '').trim();
+    if (!raw || !document.body) return null;
+    try {
+      if (raw.indexOf('xpath:') === 0) {
+        const r = document.evaluate(raw.slice(6), document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null);
+        return r && r.singleNodeValue ? r.singleNodeValue : null;
+      }
+      return document.querySelector(raw.indexOf('css:') === 0 ? raw.slice(4) : raw);
+    } catch (e) {
+      return null;
+    }
+  }
+
+  // ---- uploadFile 辅助：文本 → utf8 base64（btoa 只认 latin1，先 TextEncoder 转码）、base64 → 字节数组 ----
+  function utf8ToB64(s) {
+    const bytes = new TextEncoder().encode(String(s));
+    let bin = '';
+    const CHUNK = 0x8000; // 分块拼接，避免超大字符串 apply 爆栈
+    for (let i = 0; i < bytes.length; i += CHUNK) bin += String.fromCharCode.apply(null, bytes.subarray(i, i + CHUNK));
+    return btoa(bin);
+  }
+  function b64ToBytes(b64) {
+    const bin = atob(b64);
+    const bytes = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+    return bytes;
+  }
+  // 按扩展名猜 MIME：模型没给 mime 时用这个兜底（上传框大多是服务端按扩展名认类型，mime 只影响少数严格校验）
+  function guessMime(filename) {
+    const ext = String(filename).toLowerCase().split('.').pop();
+    const map = {
+      csv: 'text/csv', txt: 'text/plain', json: 'application/json', md: 'text/markdown', html: 'text/html',
+      jpg: 'image/jpeg', jpeg: 'image/jpeg', png: 'image/png', gif: 'image/gif', webp: 'image/webp', svg: 'image/svg+xml',
+      pdf: 'application/pdf', xlsx: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', xls: 'application/vnd.ms-excel',
+      docx: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document', zip: 'application/zip'
+    };
+    return map[ext] || 'application/octet-stream';
+  }
+
   // 元素是否"像可点的"：语义可点标签 / 角色 / 绑了点击处理器 / 手型。供 clickText 从命中文字向上找可点元素。
   function isLikelyClickable(el) {
     if (!el || !el.tagName) return false;
@@ -1096,7 +1167,7 @@
   // 先 settlePage 一次（等渲染静）再读——替代原动作内部的固定 sleep（hover 600ms / show 200ms / type 350ms 等）。
   // 纯读动作（read）不进 MUTATING_ACTIONS；openTab 拦截未真动页面也不标记。
   let lastMutatingAt = 0; // 最近一次可变动作成功的时间戳（0=未标记）；读动作 settle 后清 0，避免每张快照重复等
-  const MUTATING_ACTIONS = new Set(['click', 'clickAt', 'dblclickAt', 'clickText', 'gotoCell', 'hover', 'show', 'hide', 'type', 'select', 'scroll', 'keypress']);
+  const MUTATING_ACTIONS = new Set(['click', 'clickAt', 'dblclickAt', 'clickText', 'clickSelector', 'uploadFile', 'pasteRich', 'gotoCell', 'hover', 'show', 'hide', 'type', 'select', 'scroll', 'keypress']);
   // 读动作读前等 DOM 静：上一步动过则 settle 一次并清标记（读到动作后的稳定状态）
   async function settleIfJustMutated() {
     if (!lastMutatingAt) return;
@@ -1457,7 +1528,13 @@
         await settleIfJustMutated();
         let el;
         if (a.target === 'page' || a.target == null) el = document.body;
-        else el = await findTargetOrWait(() => findTarget(a.target));
+        else if (a.selector) {
+          // selector 参数：模型可直接读指定元素下的全部内容，不必先经快照拿 ref（对齐 get_text 的 selector 用法）
+          el = await findTargetOrWait(() => findBySelector(a.selector));
+          if (!el) return { ok: false, message: '没找到选择器「' + String(a.selector).slice(0, 60) + '」对应的元素' };
+        } else {
+          el = await findTargetOrWait(() => findTarget(a.target));
+        }
         if (!el) return { ok: false, message: notFoundMsg(a.target) };
         const raw = a.raw === true;
         // 默认去页脚税；raw:true 只在核对页脚/备案等底部原文时用（会含页脚噪音）
@@ -1468,11 +1545,13 @@
         // 只有钩子捕获的画布文字有内容。只读缓冲不消费（不 flush/reset），下一张快照仍能取到。
         const canvasText = (!raw && el === document.body) ? canvasTextForRead() : '';
         const merged = canvasText ? (text ? text + '\n' : '') + canvasText : text;
+        // limit 参数让模型按需取段（只要开头 N 字符就能答的问题，不必全量）；省略=默认 READ_LIMIT
+        const limit = (typeof a.limit === 'number' && a.limit > 0) ? Math.floor(a.limit) : READ_LIMIT;
         return {
           ok: true,
-          text: merged.slice(0, READ_LIMIT),
+          text: merged.slice(0, limit),
           length: merged.length,
-          truncated: merged.length > READ_LIMIT
+          truncated: merged.length > limit
         };
       }
 
@@ -1490,6 +1569,210 @@
         const hasTarget = focused && focused !== document.body && focused !== document.documentElement;
         // 彻底统一：操作后不等待——Enter/Tab 等触发的跳转/重渲染由下一个读动作读前 settle 承担
         return { ok: true, label: hasTarget ? elementLabel(focused) : '' };
+      }
+
+      case 'clickSelector': { // 选择器点击：ref 之外用 CSS/XPath 兜底精确定位（元素列表没合适的、或 ref 已失效时的第三路）
+        const raw = String(a.selector || '').trim();
+        if (!raw) return { ok: false, message: 'clickSelector 缺少选择器 selector' };
+        // 等-动：目标出现再点（与 clickText 一致；真没有时最多等 TARGET_WAIT_MS 再报）
+        const el = await findTargetOrWait(() => findBySelector(raw));
+        if (!el) return { ok: false, message: '没找到选择器「' + raw.slice(0, 60) + '」对应的元素' };
+        // 从命中元素向上找最近"可点"祖先（与 clickText 一致）：选择器常命中内部文字/容器，真正可点是祖先按钮/链接
+        let target = el;
+        for (let d = 0; d < 6; d++) {
+          if (isLikelyClickable(target)) break;
+          target = target.parentElement;
+          if (!target || target === document.body) break;
+        }
+        if (!target || !target.tagName || target === document.body || target === document.documentElement) target = el;
+        // 命中"会新开页面"的链接同样截获，交给 background 后台打开（不抢焦点），与 click/clickText 一致
+        const anchor = target.closest ? target.closest('a') : null;
+        if (anchor) {
+          const tgt = String(anchor.target || anchor.getAttribute('target') || '').trim().toLowerCase();
+          const href = anchor.getAttribute('href');
+          if (tgt === '_blank' && href && /^(https?|file):/i.test(href)) {
+            return { ok: true, openTab: new URL(href, location.href).href, label: elementLabel(el) };
+          }
+        }
+        await humanClickGap(); // 拟人：随机 0.5s~2s，避免快速连点
+        try { target.scrollIntoView({ block: 'center' }); } catch (e) {}
+        fireClick(target);
+        focusEl(target);
+        // 彻底统一：操作后不等待——点击是否生效由下一个快照体现
+        return { ok: true, label: elementLabel(el), bySelector: true };
+      }
+
+      case 'uploadFile': { // 文件上传：base64 / 文本（自动 utf8 编码）/ 本地文件弹窗（background 编排补 base64 后进来）注入 input[type=file]
+        const t0 = performance.now();
+        // 定位：target ref（等-动）/ selector 兜底
+        let el = null;
+        if (a.target != null) {
+          el = await findTargetOrWait(() => findTarget(a.target));
+          if (!el) return { ok: false, message: notFoundMsg(a.target) };
+        } else if (a.selector) {
+          el = await findTargetOrWait(() => findBySelector(a.selector));
+          if (!el) return { ok: false, message: '没找到选择器「' + String(a.selector).slice(0, 60) + '」对应的文件上传框' };
+        } else {
+          return { ok: false, message: 'uploadFile 需要 target 或 selector 指定文件上传框' };
+        }
+        if (el.tagName !== 'INPUT' || String(el.type || '').toLowerCase() !== 'file') {
+          return { ok: false, message: '目标不是文件上传框（input[type=file]）：' + (el.tagName || '?') };
+        }
+        // 内容来源三选一：base64 原文 / 文本自动编码 / 都没有就报缺（pick 弹窗路径由 background 在发来前补齐 base64）
+        let b64 = String(a.base64 || '');
+        if (!b64 && a.content != null) {
+          try { b64 = utf8ToB64(String(a.content)); } catch (e) { return { ok: false, message: '文本编码失败：' + e.message }; }
+        }
+        if (!b64) return { ok: false, message: 'uploadFile 缺少文件内容（base64 或 content 或 pick 选文件）' };
+        let bytes;
+        try { bytes = b64ToBytes(b64); } catch (e) { return { ok: false, message: 'base64 解码失败：' + e.message }; }
+        if (bytes.length > UPLOAD_MAX) return { ok: false, message: '文件超过 ' + (UPLOAD_MAX / 1024 / 1024) + 'MB 上限' };
+        const filename = String(a.filename || 'file').slice(0, 200);
+        const mime = String(a.mime || '').trim() || guessMime(filename);
+        // DataTransfer 注入 files 属性（input.files 只读，只能整体赋值）+ 派发 change，触发上传框的监听
+        const file = new File([bytes], filename, { type: mime });
+        const dt = new DataTransfer();
+        dt.items.add(file);
+        try { el.files = dt.files; } catch (e) { return { ok: false, message: '注入文件失败：' + e.message }; }
+        el.dispatchEvent(new Event('change', { bubbles: true }));
+        // 彻底统一：操作后不等待——上传是否被接收/开始由下一个快照体现
+        return { ok: true, filename, size: bytes.length, label: elementLabel(el), ms: Math.round(performance.now() - t0) };
+      }
+
+      case 'pasteRich': { // 富文本粘贴：把带样式 HTML 粘进 contenteditable（对齐 chrome_do_action paste_rich：先清空再插入）
+        const html = String(a.html || '');
+        if (!html) return { ok: false, message: 'pasteRich 缺少要粘贴的 html' };
+        if (html.length > PASTE_HTML_MAX) return { ok: false, message: 'HTML 超过 ' + PASTE_HTML_MAX + ' 字符上限' };
+        const t0 = performance.now();
+        // 定位：target ref（等-动）/ selector 兜底
+        let el = null;
+        if (a.target != null) {
+          el = await findTargetOrWait(() => findTarget(a.target));
+          if (!el) return { ok: false, message: notFoundMsg(a.target) };
+        } else if (a.selector) {
+          el = await findTargetOrWait(() => findBySelector(a.selector));
+          if (!el) return { ok: false, message: '没找到选择器「' + String(a.selector).slice(0, 60) + '」对应的编辑器' };
+        } else {
+          return { ok: false, message: 'pasteRich 需要 target 或 selector 指定可编辑区' };
+        }
+        // 非 contenteditable 时退回内部可编辑子孙（同 type 的 inputEl/leaf 兜底：很多富文本编辑器宿主是普通 div）
+        let target = el;
+        if (!target.isContentEditable) {
+          const leaf = target.querySelector('[contenteditable], [role="textbox"], textarea');
+          if (leaf) target = leaf;
+        }
+        if (!target.isContentEditable) {
+          return { ok: false, message: '目标不是可编辑区（富文本粘贴要求 contenteditable），标签：' + (el.tagName || '?') };
+        }
+        try { target.scrollIntoView({ block: 'center' }); } catch (e) {}
+        target.focus();
+        // 粘贴语义：全选现有内容再插入（覆盖而非追加）
+        const sel = window.getSelection();
+        const range = document.createRange();
+        range.selectNodeContents(target);
+        sel.removeAllRanges();
+        sel.addRange(range);
+        let ok = false;
+        try { ok = document.execCommand('insertHTML', false, html); } catch (e) { ok = false; }
+        if (!ok) {
+          // 兜底：不认 execCommand 的编辑器，直接替换 innerHTML + 派发 input
+          try { target.innerHTML = html; } catch (e) { return { ok: false, message: '粘贴失败：' + e.message }; }
+          target.dispatchEvent(new InputEvent('input', { bubbles: true, data: html }));
+        }
+        // 彻底统一：操作后不等待——编辑器是否接收/重排由下一个快照体现
+        return { ok: true, label: elementLabel(el), pasted: html.length, ms: Math.round(performance.now() - t0) };
+      }
+
+      case 'readCss': { // 读计算样式：全量 getComputedStyle，重要属性排前（结果会被 background 历史 3000 字截断，关键样式最先可见）
+        const t0 = performance.now();
+        let el = null;
+        if (a.target != null) {
+          el = await findTargetOrWait(() => findTarget(a.target));
+          if (!el) return { ok: false, message: notFoundMsg(a.target) };
+        } else if (a.selector) {
+          el = await findTargetOrWait(() => findBySelector(a.selector));
+          if (!el) return { ok: false, message: '没找到选择器「' + String(a.selector).slice(0, 60) + '」对应的元素' };
+        } else {
+          return { ok: false, message: 'readCss 需要 target 或 selector 指定元素' };
+        }
+        let style = null;
+        try { style = getComputedStyle(el); } catch (e) { return { ok: false, message: '读不到计算样式：' + e.message }; }
+        const css = {};
+        const wantProps = Array.isArray(a.props) && a.props.length ? a.props.map((p) => String(p).toLowerCase()) : null;
+        if (wantProps) {
+          // props 参数：模型只要自己关心的几个属性（如 ["display","visibility","opacity"]），
+          // 源头上按需产出、不返回全量——答"为什么看不见/位置怪"这类问题根本不需要 300 个属性。
+          for (const p of wantProps) { try { css[p] = style.getPropertyValue(p); } catch (e) {} }
+        } else {
+          // 省略 props → 全量：重要属性排前（显隐/定位/盒模型/排版），模型判断"为什么看不见/位置怪"时优先读到这些
+          const important = ['display', 'visibility', 'opacity', 'position', 'z-index', 'pointer-events', 'overflow', 'overflow-x', 'overflow-y', 'box-sizing', 'width', 'height', 'min-width', 'min-height', 'max-width', 'max-height', 'padding-top', 'padding-right', 'padding-bottom', 'padding-left', 'margin-top', 'margin-right', 'margin-bottom', 'margin-left', 'border-top-width', 'border-right-width', 'border-bottom-width', 'border-left-width', 'font-size', 'font-weight', 'font-family', 'color', 'background-color', 'text-align', 'cursor', 'transform', 'transition'];
+          for (const p of important) { try { css[p] = style.getPropertyValue(p); } catch (e) {} }
+          // 其余全部计算属性（约 300 项）按字母序补全——全量返回
+          for (let i = 0; i < style.length; i++) {
+            const p = style.item(i);
+            if (css[p] === undefined) { try { css[p] = style.getPropertyValue(p); } catch (e) {} }
+          }
+        }
+        const r = el.getBoundingClientRect();
+        return {
+          ok: true,
+          tag: el.tagName,
+          label: elementLabel(el),
+          rect: { x: Math.round(r.x), y: Math.round(r.y), w: Math.round(r.width), h: Math.round(r.height), visible: !!(r.width || r.height) },
+          css,
+          count: Object.keys(css).length,
+          ms: Math.round(performance.now() - t0)
+        };
+      }
+
+      case 'pageInfo': { // 读页面信息：url/标题/加载状态/编码 + iframe 清单；field 过滤，顶层 html 只随显式请求返回（对齐 chrome_do_action get_page_info 的 _field 过滤）
+        const field = Array.isArray(a.field) ? a.field : null;
+        const want = (f) => !field || field.indexOf(f) !== -1;
+        // 整页/iframe 的 html 都只随显式请求返回（html:true 或 field 含 html）：默认不带，避免 HTML 吃掉历史配额
+        const wantHtml = a.html === true || (field && field.indexOf('html') !== -1);
+        const out = {};
+        if (want('url')) out.url = location.href;
+        if (want('title')) out.title = document.title;
+        if (want('readyState')) out.readyState = document.readyState;
+        if (want('charset')) out.charset = document.characterSet || '';
+        if (want('iframes')) {
+          const iframes = [];
+          const nodes = document.querySelectorAll('iframe');
+          for (let i = 0; i < nodes.length && iframes.length < PAGE_INFO_FRAMES_MAX; i++) {
+            const f = nodes[i];
+            const src = (f.getAttribute && f.getAttribute('src')) || f.src || '';
+            const rec = { index: i, src: String(src).slice(0, 200), sameOrigin: false };
+            try {
+              const d = f.contentDocument;
+              if (d) { // 同源：能直接读子文档的 url/title/html；跨域抛异常走 catch，只留 src 由 background 用 getAllFrames 补全
+                rec.sameOrigin = true;
+                if (want('url')) rec.url = (d.location && d.location.href) ? d.location.href : src;
+                if (want('title')) rec.title = d.title;
+                if (wantHtml) {
+                  try { rec.html = (d.documentElement ? d.documentElement.outerHTML : '').slice(0, PAGE_INFO_FRAME_HTML_MAX); } catch (e) { rec.html = ''; }
+                }
+              }
+            } catch (e) { rec.sameOrigin = false; }
+            iframes.push(rec);
+          }
+          out.iframes = iframes;
+        }
+        if (wantHtml) {
+          try { out.html = (document.documentElement ? document.documentElement.outerHTML : '').slice(0, PAGE_INFO_PAGE_HTML_MAX); } catch (e) { out.html = ''; }
+        }
+        return { ok: true, info: out };
+      }
+
+      case 'getJsErrors': { // 返回本窗口采集的 JS 错误（跨 frame 由 background 广播聚合后合并）
+        // limit 参数：模型只要最近 N 条即可（默认 JS_ERRORS_MAX=50，超出仍封顶防爆缓冲）
+        const limit = (typeof a.limit === 'number' && a.limit > 0) ? Math.min(Math.floor(a.limit), JS_ERRORS_MAX) : JS_ERRORS_MAX;
+        return { ok: true, errors: jsErrorBuf.slice(0, limit) };
+      }
+
+      case 'clearJsErrors': { // 清空本窗口错误缓冲（background 广播到所有 frame）
+        const cleared = jsErrorBuf.length;
+        jsErrorBuf.length = 0;
+        return { ok: true, cleared };
       }
 
       default:

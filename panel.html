@@ -46,11 +46,13 @@
       <input id="searchTemplate" placeholder="https://www.bing.com/search?q=">
     </label>
     <label class="check"><input id="batchEnabled" type="checkbox"> 熟悉页面批量执行动作（一次多个动作，更快；出错自动退回逐步执行）</label>
+    <label class="check"><input id="backgroundExec" type="checkbox"> 后台执行（Agent 打开/切换操作标签时不切到浏览器前台，保持当前浏览不被打扰；不勾选=前台执行，能实时看到 Agent 的操作）</label>
     <label class="check"><input id="batchMark" type="checkbox"> 日志标注批量执行动作（调试：活动日志里标出「批 N 步」与每步序号，验证批量策略时用）</label>
     <label>诊断（调试）
       <button id="diagBtn" class="ghost" title="把当前标签页 Agent 浏览侧看到的页面快照（可交互元素清单 + 正文摘要 + 子窗口）提取为 JSON 复制到剪贴板">诊断</button>
     </label>
-    <div class="hint">上下文窗口默认 1000000（DeepSeek V4 为 1M）；官方 /models 接口只返回模型 ID、不含窗口大小，所以这里需手动维护；上下文使用达到压缩阈值（默认 70%）时自动把中间历史压缩成摘要，保留原始目标与最近几步。模型下拉由服务端 /models 接口实时拉取：填写 API Key 或 Base URL（失焦）即重新拉取并验证连接，成功才填充可选模型，失败会显示原因。搜索模板含 {q} 时替换为关键词，否则直接拼接。诊断：把当前标签页 Agent 提取的页面快照复制到剪贴板，方便核对元素有没有被看到、role 描述对不对。Base URL 可换任意 OpenAI 兼容地址。</div>
+    <div class="hint">上下文窗口默认 1000000（DeepSeek V4 为 1M）；官方 /models 接口只返回模型 ID、不含窗口大小，所以这里需手动维护；上下文使用达到压缩阈值（默认 70%）时自动把中间历史压缩成摘要，保留原始目标与最近几步。模型下拉由服务端 /models 接口实时拉取：填写 API Key 或 Base URL（失焦）即重新拉取并验证连接，成功才填充可选模型，失败会显示原因。搜索模板含 {q} 时替换为关键词，否则直接拼接。执行模式：默认前台执行（Agent 打开/切换标签时切到浏览器前台，实时可见），勾选「后台执行」后不切前台、不打扰当前浏览。诊断：把当前标签页 Agent 提取的页面快照复制到剪贴板，方便核对元素有没有被看到、role 描述对不对。Base URL 可换任意 OpenAI 兼容地址。</div>
+    <div class="hint">版本 <span id="extVersion" title=""></span></div>
   </section>
 
   <section id="tipsPanel" hidden>
@@ -92,6 +94,7 @@
     </div>
   </footer>
 
+  <script src="version.js"></script>
   <script src="panel.js"></script>
 </body>
 </html>

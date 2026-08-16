@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>选择要上传的文件</title>
+<style>
+  body { font-family: system-ui, -apple-system, sans-serif; margin: 0; padding: 20px; background: #fff; color: #222; }
+  h1 { font-size: 15px; font-weight: 600; margin: 0 0 4px; }
+  p { font-size: 13px; color: #666; margin: 0 0 16px; }
+  .drop { display: block; border: 1.5px dashed #bbb; border-radius: 8px; padding: 26px 12px; text-align: center; cursor: pointer; }
+  .drop:hover { border-color: #888; }
+  .drop .btn { display: inline-block; background: #2563eb; color: #fff; border-radius: 6px; padding: 8px 18px; font-size: 14px; }
+  .file { display: none; }
+  .meta { margin-top: 12px; font-size: 12px; color: #444; min-height: 16px; }
+  .cancel { margin-top: 14px; width: 100%; background: #f1f3f5; border: 0; border-radius: 6px; padding: 7px 0; font-size: 13px; color: #333; cursor: pointer; }
+  .cancel:hover { background: #e6e8eb; }
+</style>
+</head>
+<body>
+  <h1>选择要上传的文件</h1>
+  <p>选中后自动注入页面，完成后窗口自动关闭</p>
+  <label class="drop">
+    <span class="btn">选择本地文件</span>
+    <div class="meta" id="meta">尚未选择文件</div>
+    <input class="file" type="file" id="file">
+  </label>
+  <button class="cancel" id="cancel">取消</button>
+  <script src="picker.js"></script>
+</body>
+</html>

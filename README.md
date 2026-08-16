@@ -57,11 +57,12 @@
 - `F2` 进入编辑、**双击就地编辑**（单击只是选中），填完自动读回验证写对了没有；
 - 按**通用格式**识别、不针对任何具体站点，换个表格站一样能用。
 
-### 4. 真·跨页面执行，全程不打扰你
+### 4. 真·跨页面执行，前台后台两种模式
 
-Agent 自己开后台标签、自己编排：
+Agent 自己开标签、自己编排，执行模式可在设置里切换：
 
-- 自开标签**后台打开、不抢焦点**，你在前台该干嘛干嘛；
+- **前台执行（默认）**：Agent 打开/切换操作标签时浏览器把它切到前台，你能**实时看着它操作**；
+- **后台执行（设置里勾选）**：自开标签后台打开、不抢焦点，你在前台该干嘛干嘛；
 - 自动归入「PageAgent N」标签分组统一管理，任务结束**一键清空**，不留垃圾标签；
 - **批量跨页一气呵成**：要"读 20 条再总结"这类任务，它一批新开多个详情页并行加载、逐个读取，批末一次性把所有内容汇总给你，不用逐条点开-返回；
 - 跨页任务自动等待新页就绪再继续，对话上下文跨标签保留。
@@ -84,9 +85,20 @@ Agent 自己开后台标签、自己编排：
 
 默认装下 DeepSeek V4 的 **1M token** 上下文，历史从最新往前装到放不下为止；用到 70% 阈值时自动把中间历史压缩成「已完成进展 / 踩过的坑 / 注意点」摘要，长任务可持续很多轮不断线。
 
+**上下文按板块分策略管理，不搞一刀切硬截断**：
+- 系统提示词、原始目标、最新指令——**无损**，永远完整呈现；
+- 工具结果——最近 `RESULT_KEEP_ROUNDS`（5）个回合**全量**保留，更早的回合降级为短空壳（保留开头摘要，占极小上下文）；写历史不再做"一律 3000 字符"的截断，只有 30000 字符/条的存储软上限兜底；
+- 模型自己的输出——无损记录，只在压缩时并入摘要。
+
+配套地，读类工具提供**按需取参**，让模型自己决定要多少数据，而不是被工具层硬截：
+- `read`：`selector`（直接读指定元素下的内容，不必先拿 ref）+ `limit`（只要开头 N 字符）；
+- `readCss`：`props`（只要几个计算属性，省略=全量）；
+- `pageInfo`：`field` + `html`（字段子集，省略=全量元信息）；
+- `getJsErrors`：`limit`（只要最近几条）。
+
 ### 9. 卡住会求助，绝不闷头瞎撞
 
-遇到验证码、登录墙、人机验证：请你**在页面上手动操作**（自动把相关标签切到前台），完成后点一下「继续」它接着做；需要账号、手机号等信息的直接在对话里回复；反复失败原地打转时，它会主动请你**手把手演示**，并把学到的沉淀下来——而不是反复重试浪费你的时间。
+遇到验证码、登录墙、人机验证：请你**在页面上手动操作**（自动把相关标签切到前台），完成后点一下「继续」它接着做；需要账号、手机号等信息的直接在对话里回复；反复失败原地打转时，它会主动请你**手把手演示**，并把学到的沉淀下来——而不是反复重试浪费你的时间。求助卡会讲清「当前卡在哪一步 + 失败原因（能说的）」，并明确请你做什么（页面上操作完点继续，或在对话里告诉它该怎么做），不会只甩一句"连续操作失败"让你自己猜——"当前步骤"取的是步骤计划里第一个未完成的步骤，比整句大目标具体。
 
 ### 10. 接到指令先拆解成步骤，实时划线给你看
 
@@ -121,7 +133,7 @@ Agent 自己开后台标签、自己编排：
 | 跨页执行 | 后台开标签、跨标签继续同一任务、上下文跨页保留 |
 | 批量执行 | 同页连续动作一批做完；批内可连续跨页，读/点前自动等页面就绪，单页加载不打断整批 |
 | 步骤计划 | 接到指令先拆解成步骤清单，状态栏下方悬浮展示，完成一步划线一步，实时看进度 |
-| 标签编排 | `@MAIN`/`@T`/`@U` 标签体系，自动分组「PageAgent N」、任务结束一键清理、不抢焦点 |
+| 标签编排 | `@MAIN`/`@T`/`@U` 标签体系，自动分组「PageAgent N」、任务结束一键清理；前台执行切到前台，后台执行不抢焦点 |
 | 多会话 | 最多 5 个并发会话，独立消息 / 标签分组 / 状态，顶部会话栏切换 |
 | 持续对话 | 完成任务后用 `finish` 给出答复并等待下一条指令，可追问、可打断 |
 | 教我模式 | 实时录制你的页面操作 → 复述确认 → 照做 → 沉淀为站点技巧 |
@@ -157,8 +169,11 @@ Agent 自己开后台标签、自己编排：
 | 上下文窗口 | 按 token 估算的输入上下文上限 | 1000000（DeepSeek V4 为 1M） |
 | 压缩阈值 | 上下文使用到该比例时自动压缩历史 | 70 |
 | 搜索模板 | 任务与当前页无关时，Agent 用它开搜索页 | `https://www.bing.com/search?q=` |
+| 后台执行 | 勾选后 Agent 打开/切换标签不切到浏览器前台、不抢焦点（不勾选=前台执行，实时可见） | 关（前台执行） |
 
 > 注：`deepseek-chat` / `deepseek-reasoner` 是 V3/R1 时代的旧别名，已于 2026-07-24 退役，请用 V4 新 ID。
+
+> **设置页版本号**：设置面板底部显示当前 git 提交号（如 `8e366c4`，带 `*` 表示工作区有未提交改动），悬停可见完整提交号与提交时间。由 `scripts/gen-version.js` 生成到 `version.js`（已 gitignore），`.githooks/` 的 post-commit / post-checkout / post-merge 钩子会在提交、切换分支、合并后自动刷新。新克隆/换机器后先执行一次 `git config core.hooksPath .githooks` 激活钩子（也可手动 `node scripts/gen-version.js`）。
 
 ## 使用要点
 
@@ -177,19 +192,20 @@ panel.html/js/css  侧边栏 UI（顶部会话栏、聊天消息流、设置、�
        │  chrome.runtime 消息
 background.js      Service Worker：Agent 循环（多会话）+ DeepSeek 调用 + 状态持久化
        │  tabs.sendMessage / tabs.update / scripting 注入
-content.js         页面快照（可交互元素 + 正文摘要）+ 动作执行（click/type/…）
+content.js         页面快照（可交互元素 + 正文摘要）+ 动作执行（click/type/上传/富文本/…）
 canvas-hook.js     画布文字钩子（document_start + MAIN world，拦截 fillText/strokeText）
+picker.html/js     uploadFile 本地文件选择弹窗（选文件 → base64 回传 background）
 ```
 
 **Agent 循环**：`GET_SNAPSHOT`（当前操作标签）→ 拼接快照消息（标签列表 + 书签索引 + 当前任务步骤计划 + 原始目标 + 本站操作技巧 + 尾部历史；上下文达阈值先自动压缩）→ 调 DeepSeek（`response_format: json_object`）→ 解析 `{actions, steps}`（动作 + 每轮随带的步骤计划）→ 执行 → 重复。`finish` 或失败后回到 `idle` 等待下一条指令，**不结束对话**；`maxSteps` 按每轮指令重置。首轮拆解出的步骤清单广播给面板悬浮展示，完成的步骤模型置 `done:true`、面板逐条划线。
 
-**多标签编排**：`@MAIN`（你的标签，不入分组）→ `@T1/@T2/...`（Agent 后台自开标签，`chrome.tabs.group` 归入本会话「PageAgent N」分组，任务结束删组一键清空）→ `@U1/@U2/...`（你已有的标签，`use_tab` 纳入任务）。自开标签一律 `active:false` 不抢焦点；每轮结束只清理本会话分组，你的 @MAIN/@U 永不自动关闭。
+**多标签编排**：`@MAIN`（你的标签，不入分组）→ `@T1/@T2/...`（Agent 自开标签，`chrome.tabs.group` 归入本会话「PageAgent N」分组，任务结束删组一键清空）→ `@U1/@U2/...`（你已有的标签，`use_tab` 纳入任务）。自开/切换标签的显隐由设置 `backgroundExec` 控制：后台执行 `active:false` 不抢焦点，前台执行（默认）`active:true` 切到浏览器前台；每轮结束只清理本会话分组，你的 @MAIN/@U 永不自动关闭。
 
 **跨页恢复**：跨页动作（`open_tab` / `search` / `navigate` / 点击新开页）**操作后一律不等待**——多个新页并行加载，页面就绪统一由**下一个**读取/操作动作执行前自动等（读快照前 `ensureCurrentOpReady`，上限 10s，超时按动作失败走原有自愈）。任务状态持久化到 `chrome.storage.session`，应对 MV3 service worker 被回收。**批内跨页**：`open_tab`/`navigate`/`switch_tab` 等不再打断整批，连续跨页之间不等，系统在真正读取/点击页面的动作前自动等当前操作标签就绪。
 
 **复盘**：`finish` 时并行做两件事——① 书签复盘：把本轮实际访问过的网站筛出有用的写入书签（新站收藏 / 已收藏合并改进标题，一律存网站根 URL）；② 技巧复盘：统计各站点的动作数 / 失败数，对「反复失败 ≥2 次或绕弯 ≥4 次」的站点总结成技巧，与既有技巧冲突去重合并后存储。
 
-**动作集**：标签 `open_tab` / `search` / `switch_tab` / `list_tabs` / `use_tab` / `close_tab`；页面 `click` / `hover` / `show` / `hide` / `type` / `select` / `scroll` / `read` / `wait` / `keypress` / `navigate` / `dblclickAt` / `gotoCell`；结果 `save_file`；书签 `bookmarks_read` / `bookmarks_write` / `bookmark_find`；求助 `ask_user`（`page` / `reply` / `teach` / `confirm`）；消息 `say`；结束 `finish`。
+**动作集**：标签 `open_tab` / `search` / `switch_tab` / `list_tabs` / `use_tab` / `close_tab`；页面 `click` / `clickText` / `clickSelector` / `clickAt` / `dblclickAt` / `hover` / `show` / `hide` / `type` / `select` / `scroll` / `read`（`selector` / `limit` 按需取段）/ `wait` / `keypress` / `navigate` / `gotoCell` / `uploadFile`（base64 / 文本自动编码 / 本地文件弹窗）/ `pasteRich`（富文本 HTML 粘贴）/ `readCss`（`props` 按需取属性，省略=全量计算样式）/ `pageInfo`（url / 标题 / iframe 清单，field 过滤）/ `getJsErrors` / `clearJsErrors`（跨窗口 JS 错误采集）；结果 `save_file`；书签 `bookmarks_read` / `bookmarks_write` / `bookmark_find`；求助 `ask_user`（`page` / `reply` / `teach` / `confirm`）；消息 `say`；结束 `finish`。
 
 > Agent 会**先判题**：当前页与任务无关时（如「搜索 DeepSeek 资讯并总结」），不会在当前页瞎操作，而是用 `search` 后台开搜索页或 `open_tab` 直接开站；只有任务确实发生在当前页时才在当前页操作。
 
@@ -203,7 +219,7 @@ canvas-hook.js     画布文字钩子（document_start + MAIN world，拦截 fil
 - **画布钩子**：`canvas-hook.js` 以 `world:"MAIN"` + `document_start` 注入页面自身环境，赶在任何页面脚本绘制前包一层 `fillText/strokeText`；坐标经当前 2D 变换换算成 canvas 设备坐标，去重 + 批量回传（120ms 节流），记录逻辑全 `try/catch`，原函数永远原样调用。未 armed 时零开销。
 - **元素定位**：优先用快照时的 live 元素引用（`ref`→元素），元素被重渲染替换后才回退 CSS 选择器（id/testid/位置，**不用 class**——动态 app 类名常带随机后缀不稳定）。
 - **表格通用识别**：按「格子号格式」（`D2` / `$A$1` / `E5:G8`）识别单元格名称框，不针对具体站点；`gotoCell` 输格号 + 回车 + 读回验证，`dblclickAt` 双击唤起就地编辑。
-- **非侵入运行**：自开标签 `active:false` 不抢焦点、`tabGroups` 分组管理、任务结束删组清理；`window.open` 新开的页面后台兜底把焦点还给用户。
+- **非侵入运行**：设置「后台执行」时自开标签 `active:false` 不抢焦点、`tabGroups` 分组管理、任务结束删组清理；`window.open` 新开的页面后台兜底把焦点还给用户。默认「前台执行」则 Agent 打开/切换的操作标签切到浏览器前台，实时可见。
 
 **文件说明**
 
@@ -211,13 +227,14 @@ canvas-hook.js     画布文字钩子（document_start + MAIN world，拦截 fil
 | --- | --- |
 | `manifest.json` | MV3 清单：权限、side panel、content script 注入 |
 | `background.js` | Agent 循环（多会话）、LLM 调用、会话状态、跨页恢复、广播 |
-| `content.js` | 页面快照生成、动作执行、AGENT_READY 上报 |
+| `content.js` | 页面快照生成、动作执行（含 JS 错误采集）、AGENT_READY 上报 |
 | `canvas-hook.js` | 画布文字钩子（拦截绘制、回传文字与坐标） |
+| `picker.html/js` | uploadFile 本地文件选择弹窗（base64 回传，长连接保活） |
 | `panel.html/css/js` | 侧边栏 UI |
 
 **开发调试**
 
-- 语法检查：`python3 -m json.tool manifest.json && for f in background.js content.js panel.js; do node --check $f; done`
+- 语法检查：`python3 -m json.tool manifest.json && for f in background.js content.js panel.js picker.js; do node --check $f; done`
 - 改动 content script 后需在 `chrome://extensions` 点击扩展的 **刷新** 按钮重新加载。
 - 查看 background 日志：`chrome://extensions` → 该扩展 → "Service Worker" 链接 → DevTools Console。
 

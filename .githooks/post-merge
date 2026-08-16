@@ -1,0 +1,3 @@
+#!/bin/sh
+# 合并后刷新 version.js
+node "$(git rev-parse --show-toplevel)/scripts/gen-version.js" >/dev/null 2>&1 || true
