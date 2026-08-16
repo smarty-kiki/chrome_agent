@@ -1373,7 +1373,7 @@
         if (!raw) return { ok: false, message: 'clickText 缺少要点的文字 text' };
         // 等-动：目标文字出现再点（等渲染/懒加载补上文字；真没有时最多等 TARGET_WAIT_MS 再报提示）
         const el = await findTargetOrWait(() => findElementByText(raw));
-        if (!el) return { ok: false, quiet: true, message: '页面上没找到文字「' + raw.slice(0, 30) + '」——它可能已随列表滚动被回收（虚拟列表只保留视口附近的项），先 scroll 让列表项回到页面再重试 clickText' };
+        if (!el) return { ok: false, quiet: true, message: '页面上没找到文字「' + raw.slice(0, 30) + '」——它不在当前可见元素里。不要靠滚动来回找（虚拟列表滚动会换批元素、目标更难碰到）；重新 snapshot 看当前列表里实际出现的文字，用列表里真正存在的文字 clickText 点；目标也可能要先展开/悬浮相关控件才会出现' };
         // 从命中文字向上找最近的"可点"元素（自身或祖先：a/button/[role]/绑了点击处理器/手型），
         // 找不到可点的就点命中元素本身——兜底本就允许赌一把。
         let target = el;

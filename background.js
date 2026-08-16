@@ -623,7 +623,7 @@ function systemPrompt(background) {
   return `你是 PageAgent，一个运行在用户浏览器里的智能助手，采用"持续对话"模式。
 
 使用者会持续给你下达指令（操作类：登录、搜索、填表、抓取；总结类：提炼要点；查资料类：搜索/开网页；保存类：写成文件下载）。每收到一条新指令：
-1. 先判题：判断 @MAIN 当前页面与这条指令是否相关。相关就在当前页操作；**不相关时不要在当前页瞎点**，直接用 search 搜索，或 open_tab 打开任务相关的网站/URL 来处理。
+1. 先判题：判断 @MAIN 当前页面与这条指令是否相关。相关就在当前页操作；**不相关时不要在当前页瞎点**，直接用 search 搜索，或 open_tab 打开任务相关的网站/URL 来处理。**指令点名了某网站/工具（如"打开我的网盘""在 XX 站里找资料"）时，要开的网址从【网站工具索引】按标题匹配拿、原样使用，不要凭印象猜域名**；索引没有就 bookmark_find，再没有才 search。
 2. 逐步执行：观察 → 决策 → 执行 → 再观察，直到完成这条指令。
 3. 用 finish 给出这条指令的回答，然后**等待使用者下一条指令**（不要结束对话，不要关闭标签）。
 
@@ -658,7 +658,7 @@ function systemPrompt(background) {
    {"action":"hide","target":<可选 ref>}                   还原 show 强制显示的元素：带 target 只还原那个元素及其父容器，不带则还原本窗口全部被 show 的元素。show 过的页面离开/刷新会自动复原，但同页继续操作时建议顺手 hide，避免菜单常驻影响后续点击
    {"action":"type","target":<ref>,"text":"..."}           输入文本（覆盖原有内容）
    {"action":"select","target":<ref>,"value":"..."}        下拉框选择
-   {"action":"scroll","direction":"down|up","amount":<像素,可选>}  滚动页面
+   {"action":"scroll","direction":"down|up","amount":<像素,可选>}  滚动页面（只在目标元素当前快照里没有、需要翻动/加载出新内容时用；目标已在元素列表/正文摘要里就不要再滚）
    {"action":"snapshot","offset":<100 的倍数>}             翻到下一批元素窗口：快照标注"还有下一批"且目标不在列表时用（offset 取快照提示里的值；回第一批用 0）
    {"action":"read","target":<ref 或 "page">,"selector":<可选，"css:#id 或 xpath:// 或 直接 CSS">,"limit":<可选字符数>,"raw":<可选 true>}  读取某元素/整页/指定选择器元素的文本（用于总结）。默认已滤掉页面恒定导航/页脚/法务备案等噪音（页脚税），且已并入画布渲染的正文——读内容/文档/表格直接 read 整页即可，**不要加 raw**；"raw":true 只在需要核对页脚/备案/许可这类底部原文时用（会带页脚噪音）；只想读页面某一块（如某篇文章/某个列表）时用 selector 直接指定该元素，不必先经快照拿 ref；只要开头一小段就够回答的问题加 "limit":<字符数> 按需取段
    {"action":"wait","ms":<毫秒>}                           等待页面/动画/网络
@@ -696,7 +696,9 @@ function systemPrompt(background) {
 - 使用者在任务执行中发来的补充说明，务必重视并采纳：它可能是纠正你当前做法的指导（照它调整具体操作、继续推进原始目标），也可能就是明确改变目标的新指令（以它为准切换目标）。无论如何都不要无视它，也不要一收到就盲目放弃原始目标。
 - 严格只输出一个 JSON 对象，不要输出解释、代码块或其它文字。
 - 元素 ref 是数字；标签 ref 带 @ 前缀。绝不臆造，找不到就先 scroll/read/switch_tab 再观察。
+- **先看快照再决定要不要滚**：快照元素列表里已出现的元素就是当前可见可操作的，目标文字已在元素列表或正文摘要里时直接点（click/clickText），**不要为了"确认可见"或"找位置"先 scroll**——滚一下要换一批元素、重等快照，目标没变时就是纯绕路；一次滚动后没翻出新目标，就回到滚动前的思路推进，别上下来回滚。
 - 点击后看下一个快照：URL / 可交互元素 / 正文都没变化说明这次点击没生效——不要重复点同一元素，也不要对几乎相同的 URL 反复 navigate（同样多半不生效）；换一种做法推进（clickText 按文字点、hover 出悬浮项、read 读当前状态再判断）。
+- 点击类动作的结果带 label（实际点到元素的描述）。当结果的 label 与你标注的意图 / 快照里该 ref 的描述对不上时（如你想点『全选』、结果 label 却是『邮箱』），说明 ref 已漂移（发动作时 DOM 变了，同编号元素已不是同一个）——**不要按旧 ref 继续点**，重新 snapshot 后用 clickText 按当前列表里实际出现的文字点。
 - 目标是"读 N 条"（逐条读完列表/多篇内容再总结，如"读 20 条后分类总结"）时，**用批量跨页读法，不要逐条点开-返回**：列表快照里每个链接元素都带 →地址，那就是详情页地址。①攒出若干条【未读】条目的详情地址 → ②一批输出：open_tab 逐个新开详情页（可一次先开 10~15 个、让它们并行加载），再逐个 switch_tab 到某页 + read 读正文（系统会在 read 前自动等该页就绪，单页加载不打断整批）→ ③这一批读到的正文批末一次性全部返回给你，当场记下每条要点 → ④switch_tab 回列表看【已读】标记与【已读清单】，挑下一批【未读】继续，直到读够 N 条。判断"这条读过没"只看列表上的【已读】标记和【已读清单】，绝不重复读清单里已有的标题——列表里没读的条目多的是，别在一条上反复点。
 - 同一列表点出来的子页面（同级的详情/条目页）结构基本一样——**先研究透一个子页要做的操作**（元素怎么定位、点什么、输什么、怎么提交），确认可行后，对剩下的同级子页**批量复用同一套做法**（open_tab 攒 URL 批量新开 → 逐个 switch_tab + 同样的动作序列，必要时再 read 校验），**不要每页从头摸索**；只有个别页面结构确实不同时才单独处理。
 - **总结只许写你实际点开读过正文的条目**：只看到标题/摘要（没打开正文）的条目，最多只列它的标题（可加列表里就有的作者/时间），**绝不能编造正文内容或主观评价**。没读够目标条数就继续读、不要提前收尾；收尾时说明"实际点开读了 N 条 / 目标 M 条"。
@@ -718,7 +720,7 @@ function systemPrompt(background) {
 - 目标是"总结/摘要"时：按上面"读 N 条"的批量跨页读法批量读取，然后 finish 输出简洁、结构化的中文总结。
 - 目标要求"保存为文件/导出/下载"时：用 save_file 把总结或抓取结果写成文件（文件名带合适的扩展名），保存后再 finish 告知使用者文件路径。
 - 任务涉及"我的书签/收藏"时：查询/盘点用 bookmarks_read（可指定 folder 只看某个文件夹）；要把某网址加入收藏用 bookmarks_write（folder 填目标文件夹名，不填就放"其他书签"）。
-- 任务涉及某个已知网站/工具（如"打开我的网盘""在知乎搜 XX"），或指令要做的场景能在【网站工具索引】里匹配到能干这事的网站（如"压缩图片""查论文"）时：先查【网站工具索引】（书签，标题即用途），凭标题匹配网址直接用 open_tab 打开；索引里没找到就 bookmark_find 搜书签，再没有才用 search 网页搜索。
+- 任务涉及某个已知网站/工具（如"打开我的网盘""在知乎搜 XX"），或指令要做的场景能在【网站工具索引】里匹配到能干这事的网站（如"压缩图片""查论文"）时：先查【网站工具索引】（书签，标题即用途），按标题匹配到条目后，**原样用该条目给出的网址** open_tab 打开——指令点名了哪个站，就取索引里标题指向那个站的那条网址，**不要凭印象猜域名、不要自己改拼索引里的网址**；索引里没找到就 bookmark_find 搜书签，再没有才用 search 网页搜索。
 - 目标是"操作"时：逐步执行直到达成，最后 finish 输出操作结果。
 - 遇到验证码、登录墙、人机验证弹窗，或某动作反复失败无法推进时，用 ask_user（mode=page）请使用者在【页面上】手动操作（把需要做什么写清楚）；需要使用者提供信息/补充说明时，用 ask_user（mode=reply）请使用者在【对话中】直接回复。某个动作反复尝试仍无进展（连续好几次同样的操作或失败）时，主动用 ask_user（mode=teach）请使用者在当前页面上手把手演示正确操作来学习——系统也会在你重复多次后自动弹出教学请求。**不要无限重试浪费时间**。
 - type 会覆盖输入框原有内容；填表前先 click 聚焦。
@@ -903,7 +905,7 @@ async function buildMessages(t) {
   if (bookmarkIndexCache) {
     msgs.push({
       role: 'system',
-      content: '【你的网站工具索引：来自浏览器书签，标题即用途】每条为"文件夹/标题 — 网址"，标题写明了网站能干什么。指令点名某网站/工具、或指令要做的场景能在标题的用途描述里匹配到对应网站（如"压缩图片""查论文"）时，直接 open_tab 打开该网址；索引匹配不到再用 bookmark_find 按关键词精确查找。\n' + bookmarkIndexCache
+      content: '【你的网站工具索引：来自浏览器书签，标题即用途】每条为"文件夹/标题 — 网址"，标题写明了网站能干什么。指令点名某网站/工具、或指令要做的场景能在标题的用途描述里匹配到对应网站（如"压缩图片""查论文"）时，直接 open_tab 打开该网址（**原样使用条目给出的网址，不要自己改拼、不要猜域名**）；索引匹配不到再用 bookmark_find 按关键词精确查找。\n' + bookmarkIndexCache
     });
   }
   // 当前任务步骤计划：每轮注入让模型看到进度并据实际执行更新 done（面板同源展示划线进度）
@@ -1621,7 +1623,7 @@ function buildSnapshotMessage(snap, tipsBlock, t, batchHint) {
   lines.push('【当前页面】URL: ' + snap.url);
   lines.push('标题: ' + snap.title);
   if (snap.restricted) {
-    lines.push('当前页是【受限页面】（chrome://、about:、扩展管理页、新标签页等），无法注入内容脚本，你无法在此页观察或操作。任务需要在网页上完成时，请直接用 open_tab 打开对应网址（如腾讯文档用 https://docs.qq.com），或用 search 搜索；不要在受限页上反复尝试，也不要用 navigate 跳到受限地址。');
+    lines.push('当前页是【受限页面】（chrome://、about:、扩展管理页、新标签页等），无法注入内容脚本，你无法在此页观察或操作。任务需要在网页上完成时，请直接用 open_tab 打开对应网址（任务点名的网站：从【网站工具索引】按标题匹配拿网址原样打开），或用 search 搜索；不要在受限页上反复尝试，也不要用 navigate 跳到受限地址。');
   }
   if (tipsBlock) lines.push(tipsBlock);
   if (batchHint) lines.push(batchHint);
@@ -1926,6 +1928,7 @@ async function agentStepInner(t) {
   const pageKey = pageKeyOf(snap.url);
   t.snapElements = Array.isArray(snap.elements) ? snap.elements : []; // 供已读清单记录解析点击目标文字（点击结果 label 是通用"标题"，ref 要回查快照元素取标题）
   t.snapUrl = snap.url || ''; // 已读清单的页面归属：动作发出时所在的页面
+  t.snapTitle = snap.title || ''; // 供重复点击计数判断"页面是否真的跳走/推进"（url/标题一变即视为进展）
   // ---- 已读正文采集：刚点开的详情页快照（页面 key 与点开前不同）→ 把正文摘要附到对应已读条目上。
   // 上下文压缩会把历史里这些正文并入(有损)摘要甚至删掉，而 readList 独立存于任务对象不受压缩影响——总结时靠这里保真。
   // 匹配：从最新往回找"还没采到正文、且不在点开前页面(列表页)"的条目，只认详情页标题含条目标题（或互为前缀）。
@@ -2472,6 +2475,21 @@ function friendlyAction(a, res, ms) {
 
 // 无进展计数（t.stuck）阈值：连续失败 / 反复执行同一动作 / 空等累计到此值 → 主动请使用者手把手演示（ask_user mode=teach）
 const STUCK_TEACH_LIMIT = 5;
+
+// 同一目标重复点击检测（改4）的上限：与 stuck 互补——stuck 只抓"连续两步完全相同"，这里抓"跨多步反复点到同一个
+// （动作+结果 label）且页面 url/标题没变"。达到 REPEAT_ACTION_LIMIT 次提醒换招；翻倍到 REPEAT_TEACH_LIMIT 次仍无变化
+// 则主动请使用者手把手演示（不再无限重试，口径与 stuck 转教我一制）。
+const REPEAT_ACTION_LIMIT = 3;   // 同一目标重复且结果 label 不变累计到此值 → 提醒换招（"强制换招"的提醒点）
+const REPEAT_TEACH_LIMIT = 6;    // 同一目标重复到此时（结果仍无变化）→ 升级为请使用者手把手演示
+
+// 功能型通用 label（elementLabel 对无文字元素退回"按钮/链接/搜索框"这类功能名）：
+// 它们不构成 ref 漂移证据，label 比对时排除，避免正常点击被误报。
+const GENERIC_LABELS = new Set(['按钮', '链接', '搜索框', '输入框', '下拉框', '复选框', '单选框', '开关', '滑块', '标签页', '菜单项', '选项', '单元格名称框', '上传', '日期', '时间', '数字输入框', '密码输入框', '邮箱输入框', '手机号输入框', '网址输入框', '文本框', '编辑区', '空编辑区']);
+
+// 重复点击计数是否被"页面跳走了"打断：url/标题一变就是真的在推进（翻页/进详情），同一目标的计数作废重来。
+function repeatPageMoved(t, prev) {
+  return !prev || String(t.snapUrl || '') !== String(prev.url || '') || String(t.snapTitle || '') !== String(prev.title || '');
+}
 
 // 页面动作签名：用于识别"假装人类停顿后又重复执行同一个动作"的无进展循环（如连续两次 click 同一 ref）
 function sigOf(a) {
@@ -3137,7 +3155,7 @@ async function runAction(t, a) {
   if (!res || res.ok === false) {
     const why = (res && (res.message || res.error)) || '动作执行失败';
     console.warn('[PageAgent] 动作执行失败 tab=' + tabId + ' → ' + why);
-    await pushFailure(t, why, !!(res && res.quiet), sig); // 失败也记入 lastActSig；content 标 quiet 的失败（如"没找到文字，滚动重试"）只喂模型、不进面板，由后续 scroll 行体现修正
+    await pushFailure(t, why, !!(res && res.quiet), sig); // 失败也记入 lastActSig；content 标 quiet 的失败（如"没找到文字，重新快照"）只喂模型、不进面板，由后续动作体现修正
     return;
   }
 
@@ -3230,6 +3248,44 @@ async function finishRunAction(t, a, res, ms, sig, myTurn) {
   // 上下文控制改在发送侧 buildMessages：最近 RESULT_KEEP_ROUNDS 回合全量、更早的空壳化；压缩时 summarizeOnce 再按 1200/条摄入摘要。
   // RESULT_MAX_STORE 只是存储软上限，防止极端超大结果把 saveTasks 序列化/配额撑爆。
   t.history.push({ role: 'user', content: '动作结果：' + JSON.stringify(res).slice(0, RESULT_MAX_STORE) });
+  // ---- ref 漂移警示：结果 label 与模型标注的意图 label 对不上 → DOM 在执行前变了，同编号元素已不是同一个。
+  // 系统提示里已有"点击后看下一个快照"规则，但那是让模型自己对比两轮快照；这里把漂移直接点破，
+  // 避免它继续按旧 ref 硬点（02:30 会话连点 19 次『邮箱』就是没人点破"你点错了"）。
+  // 只在单步模式判断（批内动作是规划好的连续序列，ref 批内本就不该用，批头已约束用 clickText）。
+  // 排除"按钮/链接/搜索框"这类功能型通用 label：它们不构成漂移证据（elementLabel 对无文字元素会退回功能名），
+  // 避免正常点击被误报。只拿"意图与实点都是具体文字"的不符当漂移信号。
+  if (!t._inBatch && (a.action === 'click' || a.action === 'hover' || a.action === 'show' || a.action === 'dblclickAt' || a.action === 'clickAt') && a.label && res && res.ok && res.label) {
+    const intent = normTxt(String(a.label)).toLowerCase().slice(0, 30);
+    const actual = normTxt(String(res.label)).toLowerCase().slice(0, 30);
+    if (intent && actual && !GENERIC_LABELS.has(intent) && !GENERIC_LABELS.has(actual) &&
+        intent !== actual && !intent.includes(actual) && !actual.includes(intent)) {
+      t.history.push({ role: 'user', content: '注意：你标注要点的目标「' + a.label + '」，动作结果 label 是「' + res.label + '」——两者对不上，说明发动作时 DOM 已经变了、ref 漂移（这个编号现在指向的是另一个元素）。**不要按这个 ref 继续点**。重新 snapshot 看当前列表实际状态，改用 clickText 按列表里真正出现的文字点击目标，或点别的元素。' });
+      addLog(t.sid, 'ref 漂移警示：意图「' + midTruncate(a.label, 12) + '」≠ 实点「' + midTruncate(res.label, 12) + '」', true);
+    }
+  }
+  // ---- 同一目标重复点击检测（加强）：与 lastActSig 的"连续两步完全相同"判重互补——
+  // 这里是跨多步的"同一个（动作+结果 label）反复出现、且页面 url/标题没变"，中间夹 scroll/别的动作也照样累计。
+  // 典型场景：ref 漂移后反复点到同一个错误元素（想点『全选』结果反复点到『邮箱』），每次结果都是 ok 且 label 相同，
+  // 之前的判重因页面有滚动变化被绕过；这里按"结果 label 不变"直接抓，跨过阈值强制换招。
+  if (!t._inBatch && (a.action === 'click' || a.action === 'clickText' || a.action === 'hover' || a.action === 'show' || a.action === 'clickAt' || a.action === 'dblclickAt')) {
+    const rlabel = res && res.ok && typeof res.label === 'string' ? normTxt(res.label) : '';
+    if (rlabel) {
+      t.sigRepeat = t.sigRepeat || new Map();
+      const key = a.action + ':' + rlabel;
+      const prev = t.sigRepeat.get(key);
+      if (prev && !repeatPageMoved(t, prev)) prev.n++;
+      else t.sigRepeat.set(key, { n: 1, url: t.snapUrl || '', title: t.snapTitle || '' });
+      const cur = t.sigRepeat.get(key);
+      if (cur.n === REPEAT_ACTION_LIMIT) {
+        t.history.push({ role: 'user', content: '注意：你已经在同一目标上执行 ' + a.action + ' ' + cur.n + ' 次，每次结果 label 都是「' + rlabel + '」，页面没有变化——这通常意味着 ref 已漂移（你反复点到的是同一个错误元素）、或这个元素点了不生效。**不要再按同一 ref/文字点它**。重新 snapshot 看当前列表实际状态，改用 clickText 按列表里真正出现的文字点击，或点别的元素 / 换一种做法。（如果是分步推进、每步页面确实在变，可忽略此条继续。）' });
+        addLog(t.sid, '重复目标警示：' + a.action + ' ×' + cur.n + ' label「' + midTruncate(rlabel, 16) + '」未变，提醒换招', true);
+      } else if (cur.n >= REPEAT_TEACH_LIMIT && cur.n % REPEAT_TEACH_LIMIT === 0) {
+        // 翻倍仍无变化：升级为请使用者手把手演示，不再无限重试（口径与 stuck 转教我一制）。
+        // 用 t._pendingTeach 记下"本条执行完请演示"，让公共收尾（面板日志等）照常走完，再转演示、不驱动下一步。
+        t._pendingTeach = '我在同一目标上反复执行 ' + a.action + ' ' + cur.n + ' 次、结果 label 始终是「' + rlabel + '」，没有任何进展。' + currentStepNote(t) + '请你在当前页面上手把手演示一遍正确操作，我会记录学习后照着做。';
+      }
+    }
+  }
   t.failStreak = 0;
   // type 输入卡住提醒已随"操作后不等待"移除：type 不再返回 inputStuck，输入是否落地由下一个快照体现、模型据快照纠正
   if (!t._inBatch) {
@@ -3238,6 +3294,12 @@ async function finishRunAction(t, a, res, ms, sig, myTurn) {
   }
   addLog(t.sid, (t._batchPos != null ? '批' + t._batchPos + '/' + t._batchLen + ' ' : '') + friendlyAction(a, res, ms)); // 面板显示极简动作 + 耗时，如"点击 · 50ms"；批量标注开关打开时加"批N/M"前缀
   await saveTasks();
+  if (t._pendingTeach) {
+    const msg = t._pendingTeach;
+    t._pendingTeach = null;
+    await askUser(t, msg, 'teach');
+    return;
+  }
   if (stillCurrent(t, myTurn)) nextStepOrBatch(t, myTurn);
 }
 
@@ -3445,6 +3507,14 @@ async function saveSiteTips(host, tips, sid) {
   if (sid != null) broadcast({ type: 'TIPS_CHANGED', count: await totalTipCount() }, sid);
 }
 
+// 最终结果里自认未完成的强信号：明说要重做（重新下载/重新操作）、明确没做到/漏了/没拿到。
+// 只匹配"自己承认没达成"的最强表述——避免把"已完成 + 顺带提一句可选的后续优化"（如"如需按月份分文件夹整理可告诉我"）
+// 误判成失败。命中就整轮跳过技巧沉淀，防止把错误操作的轨迹当成正确路径写进技巧库。
+function selfReportedFailure(result) {
+  const s = String(result || '');
+  return /未能|没能|没(?:有)?(?:完成|成功|做到|下载到|拿到|办到)|无法(?:完成|做到|下载)|漏了|遗漏|重新(?:下载|操作|做|来|点|筛选)/.test(s);
+}
+
 // 复盘入口（与书签复盘并列，都在 finish 时跑）：把本轮"反复失败 / 绕了弯路多点了很多次"
 // 的操作沉淀成"该网站的操作技巧"（只记域名），并带上该站既有技巧做冲突去重合并，持续全量优化。
 async function reviewAndLearnTips(t, force, pinnedTurn) {
@@ -3452,6 +3522,13 @@ async function reviewAndLearnTips(t, force, pinnedTurn) {
   // force：停止后复盘用（state 已回 idle，仍要跑复盘）；正常 finish 复盘时 force 为空，保持"仅 working 时复盘"
   if (!force && t.state !== 'working') return;
   const myTurn = (pinnedTurn != null) ? pinnedTurn : t.turnId; // 钉住停止那一刻的回合号，中途新指令会打断复盘
+  // 任务结果自检：最终结果是否自认"没做到 / 需要重做"。
+  // 失败轮次沉淀的技巧会把错误操作（ref 漂移的无效点击、滚动来回找）当成"成功路径"照搬进技巧库，
+  // 跨会话传染同样的绕路（这就是"点全选前先滚动"这类坏技巧的由来）——这类轮次直接跳过沉淀，宁可少沉淀、不要沉淀错的。
+  if (selfReportedFailure(t.result)) {
+    addLog(t.sid, '复盘技巧跳过：本轮最终结果自认未完成，错误操作不沉淀为技巧', true);
+    return;
+  }
   const report = collectDifficultyReport(t);
   if (!report) return;
   const cfg = await getConfig();
@@ -3463,11 +3540,12 @@ async function reviewAndLearnTips(t, force, pinnedTurn) {
   const msgs = [
     {
       role: 'system',
-      content: '你是 PageAgent 的"网站操作技巧沉淀"助手。使用者一次任务里在某些网站反复失败、或绕了弯路多点了很多次。请为这些网站总结出【下次该怎么操作才更顺】的简短技巧。报告里既有失败原因、也有最终走通的成功操作轨迹（如 click(发布)→type(关键词)），两者结合提炼——成功轨迹通常是"正确做法"的线索。技巧要提炼成该网站**可复用的操作/交互规律**（比如：搜索框输入关键词后必须从下拉候选里点选、不能直接回车；这个页面要先点开下拉框再选择；登录入口在页面右下角）。要求：① 一句话一条、具体可执行；② 只讲该网站的通用操作习惯，**禁止照搬本轮一次性内容**——不要出现具体搜索词、地点名、用户名、页面元素文本（如"点击『湖南郴州裕后街』"这种），要抽象成"输入框/下拉/按钮/列表"这类功能操作的规律；③ 忽略纯网络/服务端问题（页面打不开、超时、接口报错）；④ 已有技巧里讲过的别重复。'
+      content: '你是 PageAgent 的"网站操作技巧沉淀"助手。使用者一次任务里在某些网站反复失败、或绕了弯路多点了很多次。请为这些网站总结出【下次该怎么操作才更顺】的简短技巧。报告里既有失败原因、也有最终走通的成功操作轨迹（如 click(发布)→type(关键词)），两者结合提炼——成功轨迹通常是"正确做法"的线索。技巧要提炼成该网站**可复用的操作/交互规律**（比如：搜索框输入关键词后必须从下拉候选里点选、不能直接回车；这个页面要先点开下拉框再选择；登录入口在页面右下角）。要求：① 一句话一条、具体可执行；② 只讲该网站的通用操作习惯，**禁止照搬本轮一次性内容**——不要出现具体搜索词、地点名、用户名、页面元素文本（如"点击『湖南郴州裕后街』"这种），要抽象成"输入框/下拉/按钮/列表"这类功能操作的规律；③ 忽略纯网络/服务端问题（页面打不开、超时、接口报错）；④ 已有技巧里讲过的别重复。另外，报告里的"成功操作"只表示动作执行返回 ok，**不代表点对了**——ref 漂移时可能点到无关元素（如想点『全选』结果点成了『邮箱』）。哪些是正确做法，要以【最终结果】是否达成目标来定；拿不准的宁可不写，不要沉淀"按某编号元素点"这类依赖快照编号、换页即失效的做法。'
     },
     {
       role: 'user',
       content: '本轮操作困难报告：\n' + report.text +
+        '\n\n本轮任务目标：' + String(t.goal || '（无）').slice(0, 200) + '\n最终结果：' + String(t.result || '（无）').slice(0, 300) +
         '\n\n这些域名已有的操作技巧（避免重复）：\n' + report.domains.map((h) => h + '：' + (oldByHost[h] || '（无）')).join('\n') +
         '\n\n只输出 JSON：{"tips":[{"domain":"域名","tip":"一句话技巧"}]}。每条 tip 的 domain 必须是上面报告里出现的域名；最多 ' + TIPS_MAX_NEW + ' 条；某网站不需要新增技巧就输出 {"tips":[]}。'
     }
@@ -3622,6 +3700,7 @@ function awaitNav(t, tabId) {
   t.awaitingNavAt = Date.now();
   t.waitTabId = tabId;
   t.lastActSig = ''; // 换了操作页面上下文，上一页的动作签名作废
+  if (t.sigRepeat) t.sigRepeat.clear(); // 换页后 ref 重排、编号语义全变，同一目标重复计数作废
   const entry = findTabEntryByTabId(tabId, t);
   t.navWaitIdx = true; // 标记"打开页面"行已显示，就绪后合并成一行
   t.navWaitUrl = null; // awaitNav 无具体地址（点击/切页后等就绪），合并时按无地址行文
@@ -3928,6 +4007,8 @@ async function processUserMessage(sid, text, tabId) {
   t.consecWaits = 0;   // 新回合重置"连续 wait 空转"计数
   t.lastActSig = '';   // 新回合重置"重复动作"识别
   t.stuck = 0;         // 新回合重置"无进展计数"
+  t.sigRepeat = new Map(); // 新回合重置"同一目标重复点击"计数（改4）
+  t._pendingTeach = null;  // 新回合清除遗留的"本条执行完转演示"标记（正常应在同轮耗尽）
   t.readList = [];     // 新回合重置"已读清单"：上一轮读过的条目不再拦截，新任务从零记录
   t.lastActiveAt = Date.now();
   t.lastTipsHost = ''; // 新回合重置"技巧加载提示"去重
