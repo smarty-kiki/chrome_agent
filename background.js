@@ -892,6 +892,61 @@ function normalizePlan(steps) {
   return out.length ? out : null;
 }
 
+// 步骤计划合并（替代整表替换）：模型本轮重发的新计划与旧计划融合——
+//   * 新计划与旧计划文本一致/相近的步骤：done 取"旧或新"（模型漏标 done、或只是措辞微调，都不会撤销已划线的步骤）；
+//   * 旧计划独有步骤保留（含已划线的，模型按约定不删已定步骤）；新计划新增步骤追加到末尾；
+//   * 步数上限 12，文本宽度截断 40。
+// 注意：一旦某步被划线（模型置 done），后续模型重发只要该步文本还认得出来就不会被撤销；
+// 模型若真想纠正（如误划线），需改该步骤的文字使其成为"新步骤"。
+function mergePlan(oldPlan, newSteps) {
+  if (!Array.isArray(newSteps) || !newSteps.length) return Array.isArray(oldPlan) && oldPlan.length ? oldPlan : null;
+  const norm = (s) => String(s.text || s.name || '').replace(/\s+/g, ' ').trim();
+  const newList = newSteps
+    .map((s) => ({ text: midTruncate(norm(s), 40), done: !!s.done }))
+    .filter((s) => s.text);
+  const out = [];
+  const usedNew = new Set();
+  for (const old of Array.isArray(oldPlan) ? oldPlan : []) {
+    const o = norm(old);
+    if (!o) continue;
+    const idx = newList.findIndex((n, i) => !usedNew.has(i) && planStepsSimilar(o, n.text));
+    if (idx >= 0) {
+      usedNew.add(idx);
+      out.push({ text: newList[idx].text, done: !!(old.done || newList[idx].done) }); // 旧 done 或新 done：一旦划线不因模型漏标/漂移而撤销
+    } else {
+      out.push({ text: midTruncate(o, 40), done: !!old.done }); // 旧计划独有步骤保留（含已划线）
+    }
+  }
+  for (let i = 0; i < newList.length; i++) if (!usedNew.has(i)) out.push(newList[i]); // 新计划新增步骤追尾
+  return out.length ? out.slice(0, 12) : null;
+}
+
+// 两步文字是否"同一件事"：完全相等 / 互含（一方是另一方子串）/ 长公共子串 ≥4（措辞微调、换序都算同一步）。
+// 上限：步骤文字 ≤40 字符，LCS 矩阵 ≤40×40，微不足道。
+function planStepsSimilar(a, b) {
+  if (!a || !b) return false;
+  if (a === b) return true;
+  if (a.includes(b) || b.includes(a)) return Math.max(a.length, b.length) >= 4; // 互含且长者 ≥4 才算（防单字/短词误配）
+  return lcsLen(a, b) >= 4;
+}
+function lcsLen(a, b) {
+  const m = a.length, n = b.length;
+  if (!m || !n) return 0;
+  const dp = new Array(m + 1).fill(0).map(() => new Array(n + 1).fill(0));
+  let best = 0;
+  for (let i = 1; i <= m; i++) {
+    for (let j = 1; j <= n; j++) {
+      if (a[i - 1] === b[j - 1]) {
+        dp[i][j] = dp[i - 1][j - 1] + 1;
+        if (dp[i][j] > best) best = dp[i][j];
+      } else {
+        dp[i][j] = 0; // 连续公共子串（非子序列），防单字跨句拼凑出虚假公共段
+      }
+    }
+  }
+  return best;
+}
+
 // 组装发给 LLM 的消息：
 //   system + 书签索引 + 压缩摘要（如果有） + 原始目标 + 尾部历史窗口
 // 充分使用大上下文：尾部历史从最新往前一直装到放不下为止；历史过长时由 maybeCompress()
@@ -1929,6 +1984,29 @@ async function agentStepInner(t) {
   t.snapElements = Array.isArray(snap.elements) ? snap.elements : []; // 供已读清单记录解析点击目标文字（点击结果 label 是通用"标题"，ref 要回查快照元素取标题）
   t.snapUrl = snap.url || ''; // 已读清单的页面归属：动作发出时所在的页面
   t.snapTitle = snap.title || ''; // 供重复点击计数判断"页面是否真的跳走/推进"（url/标题一变即视为进展）
+
+  // ---- 轮级"无进展"计数（改）：stuck 只抓连续两步完全相同、sigRepeat 只抓同一(动作,label)反复，都漏掉
+  // "每轮换动作、动作全成功、但页面/计划纹丝不动"的静默空转。信号纯通用：上一轮页面指纹没变 + 无失败 → +1。
+  // （"计划是否推进"的清零放在本轮收尾做——那里 merge 完才知道计划动没动；页面指纹也存好供下一轮比对。）
+  const pageChangedRound = !!(t.curPageSig && t._prevRoundSig && t.curPageSig !== t._prevRoundSig);
+  t._roundUnDoneStart = (t.plan || []).filter((s) => !s.done).length; // 本轮起始未完成步数（上轮最终计划），收尾对照判断"计划是否推进"
+  // 只统计"上一轮试过改页面"的轮：纯读/滚/hover 是观察性轮，中性不计；动作轮页面/计划纹丝不动才累计。
+  if (t._lastRoundMutated) {
+    if (pageChangedRound || t.failStreak > 0) {
+      t.unprodStreak = 0;
+    } else {
+      t.unprodStreak = (t.unprodStreak || 0) + 1;
+      // 只在刚 +1 的这轮检查阈值（否则 streak 停在阈值时来一轮纯读轮会重复触发提醒）
+      if (t.unprodStreak === UNPROD_REMIND_LIMIT) {
+        t.history.push({ role: 'user', content: '注意：你已经连续 ' + t.unprodStreak + ' 轮在这个页面上操作，页面状态和步骤计划都没有任何推进（动作都成功执行了、结果却不变）。不要再重复相似操作。先 read 看当前页面实际状态、对照快照里的【本站操作技巧】找正确做法、用 clickText 按列表里真正出现的文字点，或换一条完全不同的路径；实在不知道怎么继续，用 ask_user（mode=teach）请使用者手把手演示。' });
+        addLog(t.sid, '无进展警示：连续 ' + t.unprodStreak + ' 轮页面与计划均无推进，提醒换招', true);
+      } else if (t.unprodStreak >= UNPROD_TEACH_LIMIT) {
+        await askUser(t, '我连续 ' + t.unprodStreak + ' 轮在这个页面上反复操作，页面状态和步骤计划都没有任何推进（动作都成功了但结果不变）。' + currentStepNote(t) + '请你在当前页面上手把手演示一遍正确操作，我会记录学习后照着做。', 'teach');
+        return;
+      }
+    }
+  }
+
   // ---- 已读正文采集：刚点开的详情页快照（页面 key 与点开前不同）→ 把正文摘要附到对应已读条目上。
   // 上下文压缩会把历史里这些正文并入(有损)摘要甚至删掉，而 readList 独立存于任务对象不受压缩影响——总结时靠这里保真。
   // 匹配：从最新往回找"还没采到正文、且不在点开前页面(列表页)"的条目，只认详情页标题含条目标题（或互为前缀）。
@@ -2020,13 +2098,29 @@ async function agentStepInner(t) {
   }
   if (!stillCurrent(t, myTurn)) return;
 
-  // 步骤计划：模型每轮随 actions 顺带输出 steps（首轮拆解、后续轮更新 done），面板实时划线；无变化不重复广播
-  const plan = normalizePlan(stepsIn);
-  if (plan && JSON.stringify(plan) !== JSON.stringify(t.plan)) {
-    t.plan = plan;
+  // 步骤计划：模型每轮随 actions 顺带输出 steps（首轮拆解、后续轮更新 done），面板实时划线；无变化不重复广播。
+  // 用 mergePlan 合并而非整表替换：模型重发时文本小漂移/漏标 done 不会撤销已划线的步骤。
+  if (stepsIn) t._stepsOmitStreak = 0; // 模型带了 steps：连续省略计数清零
+  const mergedPlan = mergePlan(t.plan, stepsIn);
+  if (mergedPlan && JSON.stringify(mergedPlan) !== JSON.stringify(t.plan)) {
+    t.plan = mergedPlan;
     broadcast({ type: 'AGENT_PLAN', steps: t.plan }, t.sid);
     await saveTasks();
+  } else if (t.plan && t.plan.length && !stepsIn && t.plan.some((s) => !s.done)) {
+    // 模型省略了 steps 更新（计划还远未完成）：轻提醒一次，别让它把步骤进度丢了——面板划线全靠它置 done。
+    // 节流：首丢立即提醒、之后每 3 轮再提醒一次，避免每轮都打断。
+    t._stepsOmitStreak = (t._stepsOmitStreak || 0) + 1;
+    if (t._stepsOmitStreak === 1 || t._stepsOmitStreak % 3 === 0) {
+      t.history.push({ role: 'user', content: '（提醒：你上一轮没有随动作输出 steps 更新步骤计划。若已完成某步，请在本轮 steps 里把对应项 done 置 true，面板才会划线；不要省略 steps。步骤文本保持本轮清单不变、只改 done 即可。）' });
+      addLog(t.sid, '步骤计划提醒：模型本轮省略 steps，已提示补报完成进度');
+    }
   }
+
+  // 本轮收尾：记下页面指纹 + 未完成步数 + 是否试过改页面，供下一轮"有无进展"判定；计划比本轮开始更短 = 真推进，清零无进展计数。
+  t._prevRoundSig = t.curPageSig;
+  t._lastRoundMutated = actions.some((a) => MUTATE_ACTIONS.has(a.action));
+  const unDoneNow = (t.plan || []).filter((s) => !s.done).length;
+  if (unDoneNow < (t._roundUnDoneStart || 0)) t.unprodStreak = 0;
 
   // 决策完成：给"思考下一步…"那行补上耗时（面板改写最后一条 activity 行；决策期间无其他 activity 插入，安全）
   updateLog(t.sid, null, '思考下一步… ' + Math.round(performance.now() - thinkT0) + 'ms');
@@ -2482,9 +2576,20 @@ const STUCK_TEACH_LIMIT = 5;
 const REPEAT_ACTION_LIMIT = 3;   // 同一目标重复且结果 label 不变累计到此值 → 提醒换招（"强制换招"的提醒点）
 const REPEAT_TEACH_LIMIT = 6;    // 同一目标重复到此时（结果仍无变化）→ 升级为请使用者手把手演示
 
+// 轮级"无进展"计数（t.unprodStreak）：与 stuck / sigRepeat 互补——stuck 只抓"连续两步动作签名完全相同"、
+// sigRepeat 只抓"同一（动作+结果label）反复出现"，两者都漏掉"每轮换动作、动作全部成功、但页面状态和步骤计划
+// 纹丝不动"的静默空转（08-17 会话 63 轮里 30+ 轮在 全选→下载→本月→hover 之间轮转、一次进展都没有就属这种）。
+// 这里按"轮"累计：上一轮页面指纹没变 + 无失败 → +1；页面变 / 计划推进 / 失败 / 请使用者 → 清零。
+const UNPROD_REMIND_LIMIT = 3;   // 连续 N 轮"无可见进展" → 把提醒写进历史（本轮模型能看到），强制换招
+const UNPROD_TEACH_LIMIT = 6;    // 翻倍仍无进展 → 升级为请使用者手把手演示（硬停，不再空转，口径与 stuck 转教我一制）
+
+// "试过改变页面"的动作族：只有这类动作的轮才计入轮级无进展（静默空转的特征是"动了但没变化"）。
+// 纯观察轮（read/scroll/pageInfo/hover/wait 等）不计数——长页阅读任务页面指纹同样不变，误计会把正常阅读当卡死。
+const MUTATE_ACTIONS = new Set(['click', 'clickAt', 'dblclickAt', 'clickText', 'clickSelector', 'type', 'select', 'keypress', 'gotoCell', 'uploadFile', 'pasteRich', 'show', 'hide']);
+
 // 功能型通用 label（elementLabel 对无文字元素退回"按钮/链接/搜索框"这类功能名）：
 // 它们不构成 ref 漂移证据，label 比对时排除，避免正常点击被误报。
-const GENERIC_LABELS = new Set(['按钮', '链接', '搜索框', '输入框', '下拉框', '复选框', '单选框', '开关', '滑块', '标签页', '菜单项', '选项', '单元格名称框', '上传', '日期', '时间', '数字输入框', '密码输入框', '邮箱输入框', '手机号输入框', '网址输入框', '文本框', '编辑区', '空编辑区']);
+const GENERIC_LABELS = new Set(['按钮', '链接', '搜索框', '输入框', '下拉框', '复选框', '单选框', '开关', '滑块', '标签页', '菜单项', '菜单', '选项', '单元格名称框', '上传', '日期', '时间', '数字输入框', '密码输入框', '邮箱输入框', '手机号输入框', '网址输入框', '文本框', '编辑区', '空编辑区']);
 
 // 重复点击计数是否被"页面跳走了"打断：url/标题一变就是真的在推进（翻页/进详情），同一目标的计数作废重来。
 function repeatPageMoved(t, prev) {
@@ -3254,13 +3359,31 @@ async function finishRunAction(t, a, res, ms, sig, myTurn) {
   // 只在单步模式判断（批内动作是规划好的连续序列，ref 批内本就不该用，批头已约束用 clickText）。
   // 排除"按钮/链接/搜索框"这类功能型通用 label：它们不构成漂移证据（elementLabel 对无文字元素会退回功能名），
   // 避免正常点击被误报。只拿"意图与实点都是具体文字"的不符当漂移信号。
-  if (!t._inBatch && (a.action === 'click' || a.action === 'hover' || a.action === 'show' || a.action === 'dblclickAt' || a.action === 'clickAt') && a.label && res && res.ok && res.label) {
-    const intent = normTxt(String(a.label)).toLowerCase().slice(0, 30);
+  if (!t._inBatch && (a.action === 'click' || a.action === 'hover' || a.action === 'show' || a.action === 'dblclickAt' || a.action === 'clickAt') && res && res.ok && res.label) {
+    // 意图：优先用模型自标 a.label；模型没标（08-17 日志里 click 15 就只给 target 不给 label）就按 ref 回查快照
+    // 元素文字当意图——这样"快照里是「全选」、实际却点到了「邮箱」"这类漂移也能被点破，不依赖模型自觉补 label。
+    let intent = '';
+    let intentTxt = ''; // 意图原始文字（日志展示用）
+    let intentSrc = ''; // 意图来源的描述（警示文案用）
+    if (a.label) {
+      intent = normTxt(String(a.label));
+      intentTxt = String(a.label);
+      intentSrc = '你标注要点的目标「' + a.label + '」';
+    } else if ((a.action === 'click' || a.action === 'hover') && (typeof a.target === 'number' || typeof a.target === 'string')) {
+      const el = (t.snapElements || []).find((e) => String(e.ref) === String(a.target));
+      if (el) {
+        const elTxt = String(el.text || el.hint || el.value || '');
+        intent = normTxt(elTxt);
+        intentTxt = elTxt;
+        intentSrc = '你点的 ref ' + a.target + ' 在快照里对应「' + midTruncate(elTxt, 12) + '」';
+      }
+    }
     const actual = normTxt(String(res.label)).toLowerCase().slice(0, 30);
+    intent = intent.toLowerCase().slice(0, 30);
     if (intent && actual && !GENERIC_LABELS.has(intent) && !GENERIC_LABELS.has(actual) &&
         intent !== actual && !intent.includes(actual) && !actual.includes(intent)) {
-      t.history.push({ role: 'user', content: '注意：你标注要点的目标「' + a.label + '」，动作结果 label 是「' + res.label + '」——两者对不上，说明发动作时 DOM 已经变了、ref 漂移（这个编号现在指向的是另一个元素）。**不要按这个 ref 继续点**。重新 snapshot 看当前列表实际状态，改用 clickText 按列表里真正出现的文字点击目标，或点别的元素。' });
-      addLog(t.sid, 'ref 漂移警示：意图「' + midTruncate(a.label, 12) + '」≠ 实点「' + midTruncate(res.label, 12) + '」', true);
+      t.history.push({ role: 'user', content: '注意：' + intentSrc + '，动作结果 label 是「' + res.label + '」——两者对不上，说明发动作时 DOM 已经变了、ref 漂移（这个编号现在指向的是另一个元素）。**不要按这个 ref 继续点**。重新 snapshot 看当前列表实际状态，改用 clickText 按列表里真正出现的文字点击目标，或点别的元素。' });
+      addLog(t.sid, 'ref 漂移警示：意图「' + midTruncate(intentTxt, 12) + '」≠ 实点「' + midTruncate(res.label, 12) + '」', true);
     }
   }
   // ---- 同一目标重复点击检测（加强）：与 lastActSig 的"连续两步完全相同"判重互补——
@@ -3339,6 +3462,7 @@ async function pushFailure(t, why, quiet, sig) {
   if (t._inBatch) t._batchFailed = true; // 批量执行中失败：runActionBatch 据此结束本批，走重读页重规划，不在批内硬续
   t.failStreak = (t.failStreak || 0) + 1;
   t.stuck = (t.stuck || 0) + 1; // 失败也是"无进展"，计入 stuck（配合 runAction 的重复识别，累计到阈值转教我）
+  t.unprodStreak = 0; // 失败由 failStreak/stuck 自带的转教我处理，不再计入"轮级无进展"（避免两套计数叠加双倍计）
   if (sig) t.lastActSig = sig; // 失败的动作也算"最近尝试"，这样反复重试同一个失败动作也会被识别为重复
   if (t.curPageSig) t.actionPageSig = t.curPageSig; // 失败也算一次"动作"，记录其时的页面状态
   // 失败清零"当前页"熟悉度：该页从批量模式退回谨慎模式（每步读页、一次一个动作），连续成功几步后再放开
@@ -3414,6 +3538,7 @@ async function askUser(t, msg, mode, logMsg) {
   t.waitTabId = null;
   t.failStreak = 0;
   t.stuck = 0; // 任何一次请使用者协助都是一个检查点，无进展计数清零
+  t.unprodStreak = 0; // 同上：请使用者协助后轮级无进展计数也清零
   if (isTeach) {
     t.teachTabId = tabId;
     t.teachTabIds = []; // 教我模式监听【任务下所有 tab】（不只当前标签），逐个挂上录制
@@ -3862,6 +3987,7 @@ async function enterTeachMode(t, content, tabId) {
   t.askText = null;
   t.failStreak = 0;
   t.stuck = 0;
+  t.unprodStreak = 0;
   t.lastActiveAt = Date.now();
   t.conversation.push({ role: 'user', text: content, t: Date.now() });
   if (t.conversation.length > MAX_CONVERSATION) t.conversation = t.conversation.slice(-MAX_CONVERSATION);
@@ -3910,6 +4036,7 @@ async function processUserMessage(sid, text, tabId) {
       t.turnSteps = 0;
       t.failStreak = 0;
       t.stuck = 0;
+      t.unprodStreak = 0;
       t.lastActiveAt = Date.now();
       t.conversation.push({ role: 'user', text: content, t: Date.now() });
       if (t.conversation.length > MAX_CONVERSATION) t.conversation = t.conversation.slice(-MAX_CONVERSATION);
@@ -3945,6 +4072,7 @@ async function processUserMessage(sid, text, tabId) {
     t.turnSteps = 0;
     t.failStreak = 0;
     t.stuck = 0;
+    t.unprodStreak = 0;
     t.lastActiveAt = Date.now();
     t.conversation.push({ role: 'user', text: content, t: Date.now() });
     if (t.conversation.length > MAX_CONVERSATION) t.conversation = t.conversation.slice(-MAX_CONVERSATION);
@@ -3976,6 +4104,7 @@ async function processUserMessage(sid, text, tabId) {
     t.turnSteps = 0;
     t.failStreak = 0;
     t.stuck = 0;
+    t.unprodStreak = 0;
     t.lastActiveAt = Date.now();
     t.history.push({ role: 'user', content: '使用者回复：' + content });
     t.conversation.push({ role: 'user', text: content, t: Date.now() });
@@ -4009,6 +4138,11 @@ async function processUserMessage(sid, text, tabId) {
   t.stuck = 0;         // 新回合重置"无进展计数"
   t.sigRepeat = new Map(); // 新回合重置"同一目标重复点击"计数（改4）
   t._pendingTeach = null;  // 新回合清除遗留的"本条执行完转演示"标记（正常应在同轮耗尽）
+  t._stepsOmitStreak = 0;  // 新回合重置"连续省略 steps"计数（步骤计划提醒节流用）
+  t.unprodStreak = 0;   // 新回合重置"轮级无进展"计数
+  t._prevRoundSig = ''; // 新回合重置"上一轮页面指纹"（轮级无进展判定用）
+  t._roundUnDoneStart = 0; // 新回合重置"本轮起始未完成步数"（轮级无进展判定用）
+  t._lastRoundMutated = false; // 新回合重置"上一轮是否试过改页面"（轮级无进展判定用）
   t.readList = [];     // 新回合重置"已读清单"：上一轮读过的条目不再拦截，新任务从零记录
   t.lastActiveAt = Date.now();
   t.lastTipsHost = ''; // 新回合重置"技巧加载提示"去重
@@ -4249,6 +4383,7 @@ async function clearConversation(sid) {
   t.turnSteps = 0;
   t.failStreak = 0;
   t.stuck = 0;
+  t.unprodStreak = 0;
   t.consecWaits = 0;
   t.lastActSig = '';
   t.askText = null;
