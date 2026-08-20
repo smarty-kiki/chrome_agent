@@ -1513,6 +1513,7 @@ async function addToGroup(tabId, t) {
 // 页面动作触发的"新开标签"（window.open 等，content.js 截获不到的）纳入 Agent 自开 @T：
 // 页面动作算 Agent 的行为，新开的页面也归 Agent（本轮结束随分组一起清理），不能算使用者的。
 async function adoptOpenedTab(tabId, t) {
+  const t0 = performance.now();
   if (!t || t.state !== 'working') return;
   if (findTabEntryByTabId(tabId, t)) return; // 已在任务里（如 openAgentTab 已注册）
   const tab = await getTab(tabId);
@@ -1529,7 +1530,7 @@ async function adoptOpenedTab(tabId, t) {
     role: 'user',
     content: '页面动作新开的页面已' + (advCfg.backgroundExec ? '在后台打开' : '打开') + '并纳入任务：@' + ref + '（' + (tab.title || shortUrl(tab.url || '')) + '），属 Agent 自开，本轮结束自动关闭'
   });
-  addLog(t.sid, '页面新开 → ' + (advCfg.backgroundExec ? '后台打开 ' : '打开 ') + shortUrl(tab.url || '新页面'));
+  addLog(t.sid, '发现页面 ' + tailTruncate(tab.url || '新页面', 32) + ' · ' + Math.round(performance.now() - t0) + 'ms');
 }
 
 // 教我模式：使用者演示时切到/新开一个标签 → 纳入任务（@U 使用者标签）并挂上录制。
@@ -2395,7 +2396,7 @@ async function reviewAndBookmark(t, force, pinnedTurn, reviewSteps) {
     }
   }
   if (added > 0) addLog(t.sid, '复盘：收藏了 ' + added + ' 个网站');
-  if (updated > 0) addLog(t.sid, '复盘：改进了 ' + updated + ' 个书签的使用技巧');
+  if (updated > 0) addLog(t.sid, '复盘书签：改进了 ' + updated + ' 个书签的使用技巧');
 }
 
 // 收集本轮任务中实际访问过的站点（按域名归并）：
@@ -3900,17 +3901,6 @@ async function reviewAndLearnExperiences(t, force, pinnedTurn) {
         '\n\n只输出 JSON：{"experiences":[{"domain":"域名","scene":"场景简述","params":[{"name":"参数名","desc":"传什么值/示例"}],"code":"JS 代码"}]}。每条 experience 的 domain 必须是上面报告里出现的域名；最多 ' + EXP_MAX_NEW + ' 条；某站点没有可复用操作就不写它，全都没有就输出 {"experiences":[]}。'
     }
   ];
-  // 生成前先留一行"正在沉淀"标记：LLM 调用可能耗时较长（超时 240s），
-  // 中途导出的日志也看得出复盘正在进行、而不是没跑（否则"复盘中…"之后一片空白，像功能挂了）。
-  // 尽量与书签复盘那行"复盘网站：筛选出 N 个有用站点"合并成一行（用户反馈"筛选写了两行"太啰嗦）：
-  // 书签复盘后没插别的行（末条即筛选行）就原地改写它、追加"总结网站用法…"；否则退回独立候选行。
-  const actLast = (getTask(t.sid) || {}).activities || [];
-  const lastText = actLast.length ? String(actLast[actLast.length - 1].text || '') : '';
-  if (lastText.indexOf('复盘网站：筛选出') === 0) {
-    updateLog(t.sid, null, lastText + '，总结网站用法…');
-  } else {
-    addLog(t.sid, '复盘网站：候选站点 ' + report.domains.length + ' 个（' + midTruncate(report.domains.join('、'), 40) + '），总结网站用法…');
-  }
   let arr = [];
   let raw = ''; // 复盘返回原文：LLM 调用失败时为空，JSON 解析失败时保留原文供诊断
   try {
@@ -3946,7 +3936,7 @@ async function reviewAndLearnExperiences(t, force, pinnedTurn) {
       if (!merged || !merged.length) continue;
       await saveSiteExperiences(h, merged, t.sid);
       // 每个站一行即最终沉淀结果，不再另报"总结了 N 个"总数（用户反馈"沉淀写了两行"太啰嗦；各站新增条数已够）
-      addLog(t.sid, '复盘：沉淀 ' + h + ' 的操作经验（新增 ' + newExp.length + ' 条）'); // 面板可见 + 进导出日志⑤
+      addLog(t.sid, '复盘经验：沉淀 ' + h + ' 的操作经验（新增 ' + newExp.length + ' 条）'); // 面板可见 + 进导出日志⑤
     } catch (e) {
       console.error('[PageAgent] 复盘经验保存失败：' + h, e);
       addLog(t.sid, '复盘经验保存失败：' + h + ' → ' + e.message);
