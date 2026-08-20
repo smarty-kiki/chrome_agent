@@ -815,84 +815,116 @@ async function onLogExport() {
   }
 }
 
-// ---------------- 网站操作技巧管理 ----------------
-// 技巧按钮角标数字：全站技巧总条数（init / 后台广播 TIPS_CHANGED 时刷新）
-async function updateTipsBtn() {
+// ---------------- 网站操作经验管理 ----------------
+// 经验按钮角标数字：全站经验总条数（init / 后台广播 EXP_CHANGED 时刷新）
+async function updateExpBtn() {
   try {
-    const { tips } = await chrome.runtime.sendMessage({ type: 'GET_TIPS' });
-    setTipsBtnCount(tips || {});
+    const { exps } = await chrome.runtime.sendMessage({ type: 'GET_EXP' });
+    setExpBtnCount(exps || {});
   } catch (e) { /* 后台未就绪时保持原样 */ }
 }
-function setTipsBtnCount(store) {
+function setExpBtnCount(store) {
   const n = Object.values(store || {}).reduce((s, arr) => s + (Array.isArray(arr) ? arr.length : 0), 0);
-  $('#tipsBtn').textContent = '技巧 ' + n;
+  $('#expBtn').textContent = '经验 ' + n;
 }
 
-// 打开技巧面板：读取全部站点技巧并渲染（查看 / 编辑 / 删除）
-async function openTipsPanel() {
+// 打开经验面板：读取全部站点经验并渲染（查看 / 编辑 / 删除）
+async function openExpPanel() {
   try {
-    const { tips } = await chrome.runtime.sendMessage({ type: 'GET_TIPS' });
-    renderTips(tips || {});
-    $('#tipsPanel').hidden = false;
+    const { exps } = await chrome.runtime.sendMessage({ type: 'GET_EXP' });
+    renderExp(exps || {});
+    $('#expPanel').hidden = false;
   } catch (e) {
-    setStatus('读取技巧失败：' + (e.message || e), 'fail');
+    setStatus('读取经验失败：' + (e.message || e), 'fail');
   }
 }
 
-function renderTips(store) {
-  const list = $('#tipsList');
+function renderExp(store) {
+  const list = $('#expList');
   list.innerHTML = '';
   const domains = Object.keys(store).sort();
-  const countEl = $('#tipsCount');
+  const countEl = $('#expCount');
   const total = domains.reduce((n, d) => n + (store[d] || []).length, 0);
-  countEl.textContent = domains.length ? total + ' 条 · ' + domains.length + ' 个站点' : '（暂无技巧）';
-  setTipsBtnCount(store); // 手动编辑/删除后技巧按钮的数字同步
+  countEl.textContent = domains.length ? total + ' 条 · ' + domains.length + ' 个站点' : '（暂无经验）';
+  setExpBtnCount(store); // 手动编辑/删除后经验按钮的数字同步
   for (const d of domains) {
-    const tips = store[d] || [];
+    const exps = store[d] || [];
     const box = document.createElement('div');
-    box.className = 'tip-domain';
+    box.className = 'exp-domain';
 
     const head = document.createElement('div');
-    head.className = 'tip-domain-head';
+    head.className = 'exp-domain-head';
     const name = document.createElement('span');
-    name.className = 'tip-domain-name';
+    name.className = 'exp-domain-name';
     name.textContent = d;
     const delDomain = document.createElement('button');
-    delDomain.className = 'ghost tip-del-domain';
+    delDomain.className = 'ghost exp-del-domain';
     delDomain.textContent = '删除站点';
-    delDomain.title = '删除该站点的全部技巧';
+    delDomain.title = '删除该站点的全部经验';
     delDomain.addEventListener('click', async () => {
-      if (!confirm('删除站点 ' + d + ' 的全部技巧？')) return;
-      await chrome.runtime.sendMessage({ type: 'SAVE_TIPS', domain: d, tips: [] });
-      openTipsPanel(); // 重渲染即反馈（站点从列表消失），不再顶掉会话顶部状态栏
+      if (!confirm('删除站点 ' + d + ' 的全部经验？')) return;
+      await chrome.runtime.sendMessage({ type: 'SAVE_EXP', domain: d, exps: [] });
+      openExpPanel(); // 重渲染即反馈（站点从列表消失），不再顶掉会话顶部状态栏
     });
     head.appendChild(name);
     head.appendChild(delDomain);
     box.appendChild(head);
 
     const items = document.createElement('div');
-    items.className = 'tip-items';
-    tips.forEach((tip, i) => items.appendChild(buildTipItem(d, i, tip)));
+    items.className = 'exp-items';
+    exps.forEach((exp, i) => items.appendChild(buildExpItem(d, i, exp)));
     box.appendChild(items);
 
     list.appendChild(box);
   }
 }
 
-// 单条技巧：默认一行紧凑展示（文本 + 编辑/删除），点"编辑"才展开 textarea 修改。
-// 不提供"添加技巧"入口——技巧只由复盘自动沉淀，避免人工乱加。
-function buildTipItem(domain, index, text) {
+// 单条经验：默认紧凑展示（场景行 + 参数说明 + 可展开的代码 + 编辑/删除），点"编辑"展开 场景/参数/代码 三个 textarea 修改。
+// 不提供"添加经验"入口——经验只由复盘自动沉淀，避免人工乱加（面板只负责查看、编辑、删除）。
+function buildExpItem(domain, index, exp) {
+  // 兼容旧数据：string 直接当场景（正常路径 background 的 getExpStore 已归一化成 {scene,params,code}）
+  if (typeof exp === 'string') exp = { scene: exp, params: [], code: '' };
   const item = document.createElement('div');
-  item.className = 'tip-item';
+  item.className = 'exp-item';
 
-  // 显示行：一行文本 + 操作按钮
+  // 显示行：内容列（场景 + 参数 + 代码展开）+ 操作按钮
   const row = document.createElement('div');
-  row.className = 'tip-row';
-  const txt = document.createElement('span');
-  txt.className = 'tip-row-text';
-  txt.textContent = text;
+  row.className = 'exp-row';
+  const body = document.createElement('div');
+  body.className = 'exp-row-text';
+  const scene = document.createElement('div');
+  scene.textContent = exp.scene || '';
+  body.appendChild(scene);
+  const params = (Array.isArray(exp.params) ? exp.params : []).filter((p) => p && p.name);
+  if (params.length) {
+    const pWrap = document.createElement('div');
+    pWrap.className = 'exp-params';
+    for (const p of params) {
+      const pLine = document.createElement('div');
+      pLine.className = 'exp-param';
+      pLine.textContent = p.name + '：' + (p.desc || '');
+      pWrap.appendChild(pLine);
+    }
+    body.appendChild(pWrap);
+  }
+  const code = String(exp.code || '').trim();
+  if (code) {
+    const codeToggle = document.createElement('button');
+    codeToggle.className = 'ghost exp-code-toggle';
+    codeToggle.textContent = '代码';
+    const pre = document.createElement('pre');
+    pre.className = 'exp-code';
+    pre.hidden = true;
+    pre.textContent = code;
+    codeToggle.addEventListener('click', () => {
+      pre.hidden = !pre.hidden;
+      codeToggle.textContent = pre.hidden ? '代码' : '收起代码';
+    });
+    body.appendChild(codeToggle);
+    body.appendChild(pre);
+  }
   const acts = document.createElement('span');
-  acts.className = 'tip-item-actions';
+  acts.className = 'exp-item-actions';
   const editBtn = document.createElement('button');
   editBtn.className = 'ghost';
   editBtn.textContent = '编辑';
@@ -901,51 +933,73 @@ function buildTipItem(domain, index, text) {
   delBtn.textContent = '删除';
   acts.appendChild(editBtn);
   acts.appendChild(delBtn);
-  row.appendChild(txt);
+  row.appendChild(body);
   row.appendChild(acts);
   item.appendChild(row);
 
-  // 编辑模式（默认隐藏）：textarea + 保存/取消
+  // 编辑模式（默认隐藏）：场景 / 参数 / 代码 三个 textarea + 保存/取消
   const editor = document.createElement('div');
-  editor.className = 'tip-editor';
+  editor.className = 'exp-editor';
   editor.hidden = true;
-  const ta = document.createElement('textarea');
-  ta.className = 'tip-text';
-  ta.rows = 2;
-  ta.placeholder = '一句话技巧：具体、可执行…';
-  ta.value = text;
+  const sceneTa = document.createElement('textarea');
+  sceneTa.className = 'exp-text';
+  sceneTa.rows = 2;
+  sceneTa.placeholder = '场景简述（120 字内）：一句话描述适用场景（哪个页面/哪类操作，通用化，不含一次性内容）';
+  sceneTa.value = exp.scene || '';
+  const paramsTa = document.createElement('textarea');
+  paramsTa.className = 'exp-text';
+  paramsTa.rows = 2;
+  paramsTa.placeholder = '参数：每行一条 name=desc（最多 8 个；desc 说明传什么值并附示例）';
+  paramsTa.value = params.map((p) => p.name + '=' + (p.desc || '')).join('\n');
+  const codeTa = document.createElement('textarea');
+  codeTa.className = 'exp-text';
+  codeTa.rows = 4;
+  codeTa.placeholder = 'JS 代码（10000 字内，可空）：async function(args){...} 的函数体，用 args.<参数名> 取调用时传的值；只操作页面 DOM，禁网络/存储/跳转/弹窗';
+  codeTa.value = code;
   const edAct = document.createElement('div');
-  edAct.className = 'tip-item-actions';
+  edAct.className = 'exp-item-actions';
   const saveBtn = document.createElement('button');
-  saveBtn.className = 'ghost tip-save';
+  saveBtn.className = 'ghost exp-save';
   saveBtn.textContent = '保存';
   const cancelBtn = document.createElement('button');
   cancelBtn.className = 'ghost';
   cancelBtn.textContent = '取消';
   edAct.appendChild(saveBtn);
   edAct.appendChild(cancelBtn);
-  editor.appendChild(ta);
+  editor.appendChild(sceneTa);
+  editor.appendChild(paramsTa);
+  editor.appendChild(codeTa);
   editor.appendChild(edAct);
   item.appendChild(editor);
 
-  editBtn.addEventListener('click', () => { editor.hidden = false; ta.focus(); });
+  editBtn.addEventListener('click', () => { editor.hidden = false; sceneTa.focus(); });
   cancelBtn.addEventListener('click', () => { editor.hidden = true; });
   saveBtn.addEventListener('click', async () => {
-    const v = ta.value.trim();
-    if (!v) { setStatus('技巧内容为空', 'fail'); return; }
-    const { tips } = await chrome.runtime.sendMessage({ type: 'GET_TIPS' });
-    const list = (tips && tips[domain]) ? tips[domain].slice() : [];
-    if (index != null && index < list.length) list[index] = v;
-    await chrome.runtime.sendMessage({ type: 'SAVE_TIPS', domain, tips: list });
-    openTipsPanel(); // 重渲染即反馈（保存后的文本展示在列表里），不顶掉会话顶部状态栏
+    const sceneVal = sceneTa.value.trim();
+    if (!sceneVal) { setStatus('场景简述不能为空', 'fail'); return; }
+    const paramsVal = [];
+    for (const line of paramsTa.value.split('\n')) {
+      const s = line.trim();
+      if (!s) continue;
+      const eq = s.indexOf('=');
+      const name = (eq === -1 ? s : s.slice(0, eq)).trim();
+      const desc = (eq === -1 ? '' : s.slice(eq + 1)).trim();
+      if (!name) continue;
+      paramsVal.push({ name, desc });
+    }
+    const { exps } = await chrome.runtime.sendMessage({ type: 'GET_EXP' });
+    const list = (exps && exps[domain]) ? exps[domain].slice() : [];
+    if (index != null && index < list.length) list[index] = { scene: sceneVal, params: paramsVal, code: codeTa.value.trim() };
+    await chrome.runtime.sendMessage({ type: 'SAVE_EXP', domain, exps: list });
+    openExpPanel(); // 重渲染即反馈（保存后的场景行展示在列表里），不顶掉会话顶部状态栏
   });
   delBtn.addEventListener('click', async () => {
-    if (!confirm('删除这条技巧？')) return;
-    const { tips } = await chrome.runtime.sendMessage({ type: 'GET_TIPS' });
-    const list = (tips && tips[domain]) ? tips[domain].slice() : [];
+    if (!confirm('删除这条经验？')) return;
+    const { exps } = await chrome.runtime.sendMessage({ type: 'GET_EXP' });
+    const list = (exps && exps[domain]) ? exps[domain].slice() : [];
     if (index != null && index < list.length) list.splice(index, 1);
-    await chrome.runtime.sendMessage({ type: 'SAVE_TIPS', domain, tips: list });
-    openTipsPanel(); // 重渲染即反馈（该条从列表消失），不再顶掉会话顶部状态栏
+    await chrome.runtime.sendMessage({ type: 'SAVE_EXP', domain, exps: list });
+    openExpPanel(); // 重渲染即反馈（该条从列表消失），不再顶掉会话顶部状态栏
   });
   return item;
 }
@@ -1028,14 +1082,14 @@ async function init() {
   $('#stopBtn').addEventListener('click', onStop);
   $('#diagBtn').addEventListener('click', onDiag);
   $('#logToggle').addEventListener('click', onLogExport);
-  // 技巧按钮可切换：开着再点收起，关着点开（重开时刷新列表）
-  $('#tipsBtn').addEventListener('click', () => {
-    const p = $('#tipsPanel');
-    if (p.hidden) openTipsPanel();
+  // 经验按钮可切换：开着再点收起，关着点开（重开时刷新列表）
+  $('#expBtn').addEventListener('click', () => {
+    const p = $('#expPanel');
+    if (p.hidden) openExpPanel();
     else p.hidden = true;
   });
-  $('#tipsClose').addEventListener('click', () => { $('#tipsPanel').hidden = true; });
-  updateTipsBtn(); // 顶栏技巧按钮显示当前全站技巧总数
+  $('#expClose').addEventListener('click', () => { $('#expPanel').hidden = true; });
+  updateExpBtn(); // 顶栏经验按钮显示当前全站经验总数
   $('#clearBtn').addEventListener('click', onClear);
 
   // 广播消息：按 msg.sid 路由到所属会话；非当前会话只更新缓存与会话栏状态点，不碰 DOM
@@ -1116,9 +1170,9 @@ async function init() {
       case 'AGENT_CLEARED': // 后台清空某会话（CLEAR）
         resetSessionUI(sid);
         break;
-      case 'TIPS_CHANGED': // 后台复盘/教我沉淀了新技巧：刷新技巧按钮数字；面板开着时顺带刷新列表
-        updateTipsBtn();
-        if (!$('#tipsPanel').hidden) openTipsPanel();
+      case 'EXP_CHANGED': // 后台复盘/教我沉淀了新经验：刷新经验按钮数字；面板开着时顺带刷新列表
+        updateExpBtn();
+        if (!$('#expPanel').hidden) openExpPanel();
         break;
       default:
         break;

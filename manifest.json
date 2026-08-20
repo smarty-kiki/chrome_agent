@@ -13,7 +13,8 @@
     "tabGroups",
     "downloads",
     "bookmarks",
-    "webNavigation"
+    "webNavigation",
+    "userScripts"
   ],
   "host_permissions": [
     "<all_urls>"

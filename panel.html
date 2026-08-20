@@ -10,7 +10,7 @@
   <header>
     <div class="logo">PageAgent<span id="tokenTotal" class="logo-tokens" title="">Token 0</span></div>
     <div class="header-actions">
-      <button id="tipsBtn" class="ghost" title="查看 / 编辑 / 删除各网站的操作技巧">技巧</button>
+      <button id="expBtn" class="ghost" title="查看 / 编辑 / 删除各网站的操作经验">经验</button>
       <button id="toggleSettings" class="ghost" title="设置">设置</button>
     </div>
   </header>
@@ -55,14 +55,14 @@
     <div class="hint">版本 <span id="extVersion" title=""></span></div>
   </section>
 
-  <section id="tipsPanel" hidden>
-    <div class="tips-head">
-      <span>网站操作技巧</span>
-      <span id="tipsCount" class="hint"></span>
-      <button id="tipsClose" class="ghost">✕ 收起</button>
+  <section id="expPanel" hidden>
+    <div class="exp-head">
+      <span>网站操作经验</span>
+      <span id="expCount" class="hint"></span>
+      <button id="expClose" class="ghost">✕ 收起</button>
     </div>
-    <div id="tipsList"></div>
-    <div class="hint">技巧按网站域名记录（不带路径）。Agent 操作这些网站时会自动加载【本站操作技巧】并放在快照最前优先遵循；卡住或反复失败时会提示对照技巧调整做法。复盘时自动沉淀"反复失败/绕弯路"的新技巧，与既有技巧冲突会自动合并。这里可手动查看、编辑、删除。</div>
+    <div id="expList"></div>
+    <div class="hint">经验按网站域名记录（不带路径），每条 = 场景简述 + 参数说明 + 可执行 JS 代码。复盘时把"未来值得复用"的操作沉淀成可直接执行的代码（绕弯纠正后的正确做法、一路顺利但通用的操作都算）：依赖任务具体值的部分声明成参数，之后 Agent 在同站遇到相符场景就执行这段代码并传入参数一步完成（快照里按 [经验N] 编号用 exec_code 引用）。Agent 操作这些网站时会自动加载【本站操作经验】并放在快照最前优先遵循。这里可手动查看、编辑、删除。</div>
   </section>
 
   <section id="sessionBar"></section>

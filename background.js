@@ -173,7 +173,7 @@ async function createSession(tabId) {
     consecWaits: 0,   // 连续 wait 次数（无真实动作插入时累计，防"假装人类"空转）
     lastActSig: '',   // 最近一次执行（成功或失败）的页面动作签名，识别"反复执行同一个动作"的无进展循环
     stuck: 0,         // 无进展计数：连续失败/重复同一动作/空等累计，换新动作清零，>=STUCK_TEACH_LIMIT 转教我
-    lastTipsHost: '',  // 本会话已显示"加载该网站的技巧 x 条"的站点（同一站点只提示一次，避免刷屏）
+    lastExpHost: '',  // 本会话已显示"加载该网站的经验 x 条"的站点（同一站点只提示一次，避免刷屏）
     pageSnapCounts: {}, // 页面熟悉度：pageKey(host+pathname) → 成功快照次数；动作失败会清零该页计数（恢复谨慎模式）
     snapOffset: 0,      // 元素窗口翻页偏移（每批 REF_WINDOW_SIZE 个）；snapshot 动作改写，URL 变化自动回第一批
     snapOffsetUrl: '',  // snapOffset 所属页面 URL：换页/导航/切标签后 offset 失效重置为 0
@@ -380,9 +380,10 @@ async function logLLMExchange(t, msgs, raw, label) {
 }
 
 // 导出本会话全量日志（面板「日志」按钮 → 下载文件）：排查"任务为什么执行乱"用，内容完整、不截断。
-// 四个部分对应：①发给大模型什么（系统提示 + 网站工具索引 + 压缩摘要 + 原始目标/最新指令 + 完整对话历史，
+// 五个部分对应：①发给大模型什么（系统提示 + 网站工具索引 + 压缩摘要 + 原始目标/最新指令 + 完整对话历史，
 // 历史就是每步请求的消息本体）；②大模型返回什么（每步完整原始返回）；③插件在浏览器里操作了什么（动作序列）；
-// ④拿到了什么（动作结果 / 失败原因，与③在操作序列里成对出现）。
+// ④拿到了什么（动作结果 / 失败原因，与③在操作序列里成对出现）；⑤面板活动轨迹（addLog 可见行：
+// 含动作痕迹 + 复盘收藏/经验沉淀的过程与结果——复盘失败这类只闷在 SW console 的行，导出里也要看得见）。
 async function exportSessionLog(t) {
   if (!t) return '';
   const L = [];
@@ -445,6 +446,14 @@ async function exportSessionLog(t) {
     }
   }
   push(seq.length ? seq.join('\n') : '（无动作记录）');
+  push('');
+  push('==================== ⑤ 面板活动轨迹（addLog 可见行：动作痕迹 + 复盘收藏/经验沉淀过程与结果） ====================');
+  const acts = t.activities || [];
+  if (acts.length) {
+    for (const e of acts) push('  ' + ts(e.t) + '  ' + String(e.text || ''));
+  } else {
+    push('（无活动日志）');
+  }
   push('');
   push('==================== ② 大模型返回了什么 —— 每步完整原始返回（共 ' + logs.length + ' 次） ====================');
   for (let i = 0; i < logs.length; i++) {
@@ -593,7 +602,20 @@ chrome.alarms.onAlarm.addListener(async (al) => {
   let anyBusy = false;
   for (const sid of Object.keys(tasks)) {
     const t = tasks[sid];
-    if (!t || t.state === 'idle' || t.state === 'done' || t.state === 'waiting_user') continue;
+    if (!t) continue;
+    // 复盘未完成标记（finish/停止后的后台复盘，MV3 worker 可能被回收打断）：
+    // 按持久化标记补跑，避免"书签筛选跑完了、经验沉淀没来得及发请求"这类复盘无声丢失。
+    // 标记回合号没变（没来新指令）才补跑；已来新指令则让位，旧标记由 reviewAfterTurnEnd 收尾时清掉。
+    if (t._reviewPending) {
+      // 复盘待办（无论正在跑还是待补跑）都算忙：alarm 保持心跳，不因 state=idle 被清
+      anyBusy = true;
+      if (!reviewRunning[sid]) {
+        const p = t._reviewPending;
+        reviewAfterTurnEnd(t, p.turnId, p.reviewSteps || 0).catch((e) => console.warn('[PageAgent] 复盘恢复失败 ' + sid + ' → ' + (e && e.message)));
+      }
+      continue;
+    }
+    if (t.state === 'idle' || t.state === 'done' || t.state === 'waiting_user') continue;
     anyBusy = true;
     if (t.state === 'awaiting_nav') {
       const waited = Date.now() - (t.awaitingNavAt || 0);
@@ -631,7 +653,7 @@ function systemPrompt(background) {
 
 你拥有"任务标签页"：@MAIN 是使用者交给你的标签（属于使用者，不要随便关）；@T1/@T2/... 是你自己新开的${bg ? '后台' : ''}标签（自动归入本会话 PageAgent N 分组${bg ? '、不抢焦点' : ''}；点"新开页面"链接也会自动变成${bg ? '后台 ' : ' '}@T）；@U1/@U2/... 是你用 use_tab 纳入的使用者已有标签（同样不要随便关）。${bg ? '' : '当前为前台执行模式：你切换/打开操作标签时，浏览器会把它切到前台展示，使用者能实时看到你的操作。'}
 你通过"页面快照"感知当前操作标签的网页：包括标签页列表、URL、标题、可交互元素列表（[ref] 类型 文本 值 选择器）和正文摘要。正文摘要默认滤掉站点恒定导航/页脚/法务备案等噪音（页脚税）、并入画布渲染的正文，只留内容主体——读取正文、确认内容不必每次重复 read 整页（那是冗余往返）；但快照摘要/元素列表里**没出现**目标正文时（如正文还在加载、正文在图片上、只见推荐/相关列表），说明快照没抓到正文，必须 read 整页（target:"page"）去拿，**点开不等于读到**；read 用于读摘要没覆盖的局部（如某元素/弹窗内单独文字，target 填那个 ref）。read 整页的页脚税过滤与 raw 细节见动作说明。页面可能含内嵌 iframe 子窗口（弹窗/新建流程），其元素并进快照、用【子窗口 N】分组标出，正文摘要附其内容，可正常点击/读取。快照提示有未读取成功的内嵌窗口时，先 wait 等加载完再观察，别一时看不到就乱点。刚点击后快照出现新的【子窗口 N】分组或元素变多，说明弹窗已打开，目标在这个新窗口里找——**别重复点击刚才那个按钮**（可能把弹窗又关掉），直接在弹窗里继续操作。
-快照开头的【本站操作技巧】是该网站历史沉淀的操作经验（如"搜索要直接点第一条结果"）。**每次选元素、定动作前先对照它**——与技巧不符的做法多半在绕弯路，优先按技巧来；反复失败、找不到元素、或动作与技巧不一致时先回头对照调整，别硬试同一招；某条技巧与当前页面明显冲突（页面已改版）说明已过期，跳过它、以当前页为准。
+快照开头的【本站操作经验】是该网站历史沉淀的操作经验（如"搜索要直接点第一条结果"）。**每次选元素、定动作前先对照它**——与经验不符的做法多半在绕弯路，优先按经验来；反复失败、找不到元素、或动作与经验不一致时先回头对照调整，别硬试同一招；某条经验与当前页面明显冲突（页面已改版）说明已过期，跳过它、以当前页为准。
 
 每收到一个快照，你必须输出 JSON 动作。接到新指令的首轮先拆解：把达成这条指令要做的事分成 3~8 步（按大事件/阶段分，不是单个动作），随本轮 actions 一起输出 steps 字段 {"steps":[{"text":"...","done":false},...],"actions":[...]}；之后每轮随 actions 顺带输出更新后的 steps（已完成的 done 置 true），面板会实时划线展示进度，全部完成才 finish。**默认倾向批量输出**：把多个**连续、下一步不必看中间结果**的动作合在一起输出 {"actions":[{...},{...},...]}（最多 ${MAX_BATCH} 个），系统连续执行、大幅减少往返。逐条勾选、连续填表、列表内翻页、逐行操作这类重复循环，**务必合成一批，别单动作空转**；快照标【批量模式】（本页已熟悉）时更要尽量多合批，标【谨慎模式】（本页不熟悉/刚出错）时才退回一次一个动作。**多 tab 是默认工作方式**：任务需要（读多条详情、跨页对比、并行处理）时用 open_tab 开多个${bg ? '后台' : ''}标签放进同一批执行，而不是只盯一个 tab。**例外——输出单个动作**：必须看到本步结果才能决定下一步、拿不准、或要结束本轮（finish）。批量规则：
 - **批内顺序依赖要弱**：某个动作执行后才出现的元素，后续动作**不能用它的 ref**（ref 来自旧快照，执行时会失效），要用 clickText 按文字 / clickAt·dblclickAt 按坐标 / gotoCell 按格号来定位；
@@ -671,6 +693,7 @@ function systemPrompt(background) {
    {"action":"pageInfo","field":<可选数组，"url"/"title"/"iframes"/"html" 子集>,"html":<可选 true>}   读页面信息：url/标题/加载状态/iframe 清单；默认不含整页 HTML，需要整页 HTML 时才加 "html":true
    {"action":"getJsErrors","limit":<可选条数>}   读页面累计的 JS 错误（跨所有窗口聚合，错误标注来源窗口）；排查页面报错用，只要最近几条就够时加 "limit":<条数> 按需取
    {"action":"clearJsErrors"}   清空页面已采集的 JS 错误缓冲
+   {"action":"exec_code","idx":<编号>,"args":{参数名:值}}   执行当前快照【本站操作经验】里编号 idx 那条经验写好的 JS：场景相符、且"这一步就该这么做"时用它一步完成（省得再一步步绕），args 按该经验的参数说明传（如 {"keyword":"AI 趋势"}；无参数可不带 args）。一次一条，idx 必须是快照里出现过的编号，代码只在当前页面执行
 
 2. 结果保存：
    {"action":"save_file","filename":"总结.md","content":"文件内容"}  将结果保存为文件下载到本地（支持 md/txt/json/csv/html 等）
@@ -713,7 +736,7 @@ function systemPrompt(background) {
 - 仅当要沿用当前标签的登录会话/上下文（如已登录站点）时才用 navigate。
 - 教我模式：收到使用者演示的操作记录后，先用 say 动作向使用者复述你学到的操作步骤，再用 ask_user（mode=confirm）请他确认——他点「没问题」按钮或回复「没问题/确认」等确认后，就严格按演示步骤继续完成原始目标；页面状态与演示时不同（如已登录、元素变化）则灵活适配、按演示意图完成；有出入时按使用者的纠正调整。
 - 教我模式的复述确认阶段是个**确认循环**：使用者在对话里回复纠正或问题（如"不对""少了一步""第三步不是这样"）时，你要重新理解他的纠正、修正你对步骤的理解，再用 say 复述修正后的步骤、用 ask_user（mode=confirm）再次请他确认——循环会一直持续，直到他明确说「没问题/确认」放行，或说「不教了/算了」「你先去做吧/你自己来」终止教学（终止后按你当前理解的自行继续完成原始目标），或说「重新演示」要求重开演示。不要未经再次确认就擅自继续执行，也不要自行猜测调整步骤。
-- 教我模式记录到的输入值（账号、密码等）仅用于本轮复现使用者的演示，不要写入技巧库。
+- 教我模式记录到的输入值（账号、密码等）仅用于本轮复现使用者的演示，不要写入经验库。
 - 同一网址你已经在任务里打开过（list_tabs 里能看到）时，再次需要它直接 switch_tab 切过去复用，不要重复 open_tab 新开同一个页面——重复打开同一网址系统会直接切到已有标签。
 - 使用者问"我现在正在看哪个页面/我打开了哪些标签/在我已打开的某个标签里做 XX"时，先用 list_tabs 查看浏览器全部标签，再按需 use_tab 纳入并操作，不要新开标签重复打开使用者已有的页面。
 - 已用完、确认后续不会再用的标签 close_tab 关掉它，保持整洁（如一次性搜索结果页、只读一次的临时页）；拿不准还会不会用就先留着——同一网址再次需要时能直接切回已开标签，但关掉重开会丢失页面上的状态。不要关闭 @MAIN/@U 等使用者的标签。
@@ -858,7 +881,7 @@ function parseAction(text) {
   let t = String(text || '').trim();
   t = t.replace(/^```(?:json)?/i, '').replace(/```$/i, '').trim();
   const obj = JSON.parse(t);
-  const ALLOWED = new Set(['open_tab', 'switch_tab', 'use_tab', 'list_tabs', 'close_tab', 'search', 'save_file', 'bookmarks_read', 'bookmarks_write', 'bookmark_find', 'ask_user', 'say', 'click', 'clickAt', 'dblclickAt', 'gotoCell', 'clickText', 'hover', 'show', 'hide', 'type', 'select', 'scroll', 'read', 'wait', 'keypress', 'navigate', 'snapshot', 'finish']);
+  const ALLOWED = new Set(['open_tab', 'switch_tab', 'use_tab', 'list_tabs', 'close_tab', 'search', 'save_file', 'bookmarks_read', 'bookmarks_write', 'bookmark_find', 'ask_user', 'say', 'click', 'clickAt', 'dblclickAt', 'gotoCell', 'clickText', 'clickSelector', 'hover', 'show', 'hide', 'type', 'select', 'scroll', 'read', 'readCss', 'wait', 'keypress', 'navigate', 'snapshot', 'pageInfo', 'getJsErrors', 'clearJsErrors', 'uploadFile', 'pasteRich', 'exec_code', 'finish']);
   let list = [];
   if (Array.isArray(obj)) {
     list = obj;
@@ -1665,9 +1688,9 @@ function readListForPage(t, snap) {
 }
 
 // ---------------- 快照消息构建 ----------------
-// tipsBlock（可选）：本站操作技巧块。放在 URL/标题与受限页提示之后、元素列表【之前】——
-// LLM 要先读到历史经验再扫元素，避免技巧沉在快照末尾被 90 个元素淹没（否则"加载了但没怎么用"）。
-function buildSnapshotMessage(snap, tipsBlock, t, batchHint) {
+// expBlock（可选）：本站操作经验块。放在 URL/标题与受限页提示之后、元素列表【之前】——
+// LLM 要先读到历史经验再扫元素，避免经验沉在快照末尾被 90 个元素淹没（否则"加载了但没怎么用"）。
+function buildSnapshotMessage(snap, expBlock, t, batchHint) {
   const lines = [];
   lines.push('【任务标签页】共 ' + t.tabs.length + ' 个');
   for (const e of t.tabs) {
@@ -1680,7 +1703,7 @@ function buildSnapshotMessage(snap, tipsBlock, t, batchHint) {
   if (snap.restricted) {
     lines.push('当前页是【受限页面】（chrome://、about:、扩展管理页、新标签页等），无法注入内容脚本，你无法在此页观察或操作。任务需要在网页上完成时，请直接用 open_tab 打开对应网址（任务点名的网站：从【网站工具索引】按标题匹配拿网址原样打开），或用 search 搜索；不要在受限页上反复尝试，也不要用 navigate 跳到受限地址。');
   }
-  if (tipsBlock) lines.push(tipsBlock);
+  if (expBlock) lines.push(expBlock);
   if (batchHint) lines.push(batchHint);
   // 已读清单块：本页（通常是列表页）里已实际点开读过的条目，放在元素列表【之前】让 LLM 先看到"哪些已读、别重复点"
   const readList = readListForPage(t, snap);
@@ -1899,6 +1922,7 @@ async function readSnapshotWithFrames(tabId, offset = 0) {
 // 否则心跳会误判停滞、跑出双份 LLM 请求和双份动作执行。深度计数而非 bool：外层 agentStep
 // 里会链式再调 agentStep（nextStepOrBatch 续步 / runActionBatch 批完重读页），两者是同一逻辑链。
 const agentStepDepth = {}; // sid → 栈深度（外层 step + 链式续步）
+const reviewRunning = {};  // sid → true（后台复盘进行中；内存态，SW 重启后自然清空，供 alarm 恢复路径防并发起跑）
 
 async function agentStep(t) {
   if (!t || t.state !== 'working') return;
@@ -1998,7 +2022,7 @@ async function agentStepInner(t) {
       t.unprodStreak = (t.unprodStreak || 0) + 1;
       // 只在刚 +1 的这轮检查阈值（否则 streak 停在阈值时来一轮纯读轮会重复触发提醒）
       if (t.unprodStreak === UNPROD_REMIND_LIMIT) {
-        t.history.push({ role: 'user', content: '注意：你已经连续 ' + t.unprodStreak + ' 轮在这个页面上操作，页面状态和步骤计划都没有任何推进（动作都成功执行了、结果却不变）。不要再重复相似操作。先 read 看当前页面实际状态、对照快照里的【本站操作技巧】找正确做法、用 clickText 按列表里真正出现的文字点，或换一条完全不同的路径；实在不知道怎么继续，用 ask_user（mode=teach）请使用者手把手演示。' });
+        t.history.push({ role: 'user', content: '注意：你已经连续 ' + t.unprodStreak + ' 轮在这个页面上操作，页面状态和步骤计划都没有任何推进（动作都成功执行了、结果却不变）。不要再重复相似操作。先 read 看当前页面实际状态、对照快照里的【本站操作经验】找正确做法、用 clickText 按列表里真正出现的文字点，或换一条完全不同的路径；实在不知道怎么继续，用 ask_user（mode=teach）请使用者手把手演示。' });
         addLog(t.sid, '无进展警示：连续 ' + t.unprodStreak + ' 轮页面与计划均无推进，提醒换招', true);
       } else if (t.unprodStreak >= UNPROD_TEACH_LIMIT) {
         await askUser(t, '我连续 ' + t.unprodStreak + ' 轮在这个页面上反复操作，页面状态和步骤计划都没有任何推进（动作都成功了但结果不变）。' + currentStepNote(t) + '请你在当前页面上手把手演示一遍正确操作，我会记录学习后照着做。', 'teach');
@@ -2030,21 +2054,23 @@ async function agentStepInner(t) {
   t.pageSnapCounts = t.pageSnapCounts || {};
   t.pageSnapCounts[pageKey] = (t.pageSnapCounts[pageKey] || 0) + 1;
   const batchReady = cfg.batchEnabled !== false && t.pageSnapCounts[pageKey] >= BATCH_FAMILIAR_THRESHOLD;
-  // 本站操作技巧：每次操作某网站相关的动作前，先加载该网站沉淀过的技巧。
-  // 以 tipsBlock 传入 buildSnapshotMessage，插在元素列表【之前】，让 LLM 先读到历史经验再扫元素，
-  // 避免技巧沉在快照末尾被元素列表淹没（"加载了但没怎么用"的主因）。
-  let tipsBlock = '';
-  let tipsCount = 0;
+  // 本站操作经验：每次操作某网站相关的动作前，先加载该网站沉淀过的经验。
+  // 以 expBlock 传入 buildSnapshotMessage，插在元素列表【之前】，让 LLM 先读到历史经验再扫元素，
+  // 避免经验沉在快照末尾被元素列表淹没（"加载了但没怎么用"的主因）。
+  let expBlock = '';
+  let expCount = 0;
   const snapHost = hostOf(snap.url);
   if (snapHost) {
     const tt0 = performance.now();
-    const tips = await getSiteTips(snapHost);
-    tipsCount = tips.length;
-    if (tipsCount) {
-      tipsBlock = '【本站操作技巧】（该网站历史操作经验，持续有效：决策前先对照再选元素，避免绕弯路；若某条与当前页面明显冲突/已改版，说明已过期，跳过它、以当前页面为准）\n' + tips.map((x) => '· ' + x).join('\n');
-      if (snapHost !== t.lastTipsHost) { // 同一站点每会话只在首次进入时显示一次加载提示
-        t.lastTipsHost = snapHost;
-        addLog(t.sid, '加载该网站的技巧 ' + tipsCount + ' 条 ' + Math.round(performance.now() - tt0) + 'ms');
+    const exps = await getSiteExperiences(snapHost);
+    expCount = exps.length;
+    // 记住本页加载的经验指纹：exec_code 新鲜度闸门靠它判断"快照里的经验编号"是否仍与当前库一致
+    t._expRef = { host: snapHost, sig: expSig(exps) };
+    if (expCount) {
+      expBlock = '【本站操作经验】（该网站历史操作经验，持续有效：决策前先对照再选元素，避免绕弯路；若某条与当前页面明显冲突/已改版，说明已过期，跳过它、以当前页面为准；[经验N] 是该条在本次快照里的编号，可用动作 {"action":"exec_code","idx":N,"args":{参数名:值}} 直接执行它写好的代码一步完成）\n' + exps.map((x, i) => expSnapLine(i, x)).join('\n');
+      if (snapHost !== t.lastExpHost) { // 同一站点每会话只在首次进入时显示一次加载提示
+        t.lastExpHost = snapHost;
+        addLog(t.sid, '加载该网站的经验 ' + expCount + ' 条 ' + Math.round(performance.now() - tt0) + 'ms');
       }
     }
   }
@@ -2057,7 +2083,7 @@ async function agentStepInner(t) {
   const batchHint = batchReady
     ? '【批量模式】本页你已经熟悉（历史操作稳定成功），默认就该批量输出。请尽量**往大了合**：本步一次给出最多 ' + MAX_BATCH + ' 个连续动作（{"actions":[{...},{...},...]}）。重复性循环（逐条勾选、连续填表、列表内翻页、读多条详情、逐行操作这类同构步骤）务必合成一批，别再一步步单动作空转——**能确定的动作不要只合两三个就收手**。**读多条详情页**（读 N 条/读多页再总结）用批量跨页读法：从列表快照链接元素的 →地址 攒 URL，一批 open_tab 逐个新开详情页（可先一次开好几个、再逐个 switch_tab + read，让几个页面并行加载），系统会在真正 read 前自动等页面就绪、单页加载不打断整批，这一批读到的所有正文批末一次性返回给你——**别逐条点开-返回**。仅当下一步必须看到本步结果才能决定时才输出单个动作。批内约束：动作执行后才出现的元素不能用 ref 引用（ref 来自当前快照、执行时可能已失效），要用 clickText 按文字 / clickAt·dblclickAt 按坐标 / gotoCell 按格号定位；snapshot、finish、ask_user 放批尾（执行到它们本批收尾），open_tab/search/navigate/switch_tab/use_tab/close_tab 可在批内任意位置（系统会跨页自动等就绪）。确认生效用短读（read 的 target 指向批内动作涉及的具体元素）或依赖下一张快照回显；点开条目/翻页后，正文通常已由下一张快照的正文摘要提供（含画布文字），此时批内不必整页 read；但若正文摘要/元素列表里**没出现**目标正文（如正文仍在加载、正文在图片上、只见推荐/相关列表），说明快照没抓到正文，**就必须整页 read**（target:"page"）——点了不等于读了。'
     : '【谨慎模式】本页你还不熟悉（首次进入或刚出过错），一次只输出一个动作，系统会重新观察页面后再继续。';
-  let snapMsg = buildSnapshotMessage(snap, tipsBlock, t, batchHint);
+  let snapMsg = buildSnapshotMessage(snap, expBlock, t, batchHint);
   t.history.push({ role: 'user', content: snapMsg, kind: 'snapshot' }); // kind 标记快照，buildMessages 只发最近 MAX_SNAPSHOT_KEEP 次
   await saveTasks();
   if (!stillCurrent(t, myTurn)) return;
@@ -2112,7 +2138,9 @@ async function agentStepInner(t) {
     t._stepsOmitStreak = (t._stepsOmitStreak || 0) + 1;
     if (t._stepsOmitStreak === 1 || t._stepsOmitStreak % 3 === 0) {
       t.history.push({ role: 'user', content: '（提醒：你上一轮没有随动作输出 steps 更新步骤计划。若已完成某步，请在本轮 steps 里把对应项 done 置 true，面板才会划线；不要省略 steps。步骤文本保持本轮清单不变、只改 done 即可。）' });
-      addLog(t.sid, '步骤计划提醒：模型本轮省略 steps，已提示补报完成进度');
+      // 提醒行不在这里打：决策收尾的 updateLog 会改写"最后一条 activity 行"来给"思考下一步…"补耗时，
+      // 若这行先插入，"思考下一步…"那行会被挤到倒数第二条、永远不带 ms，还多出一个被改写成"思考下一步… XXms"的重复行。
+      t._stepsReminderLog = true;
     }
   }
 
@@ -2124,6 +2152,9 @@ async function agentStepInner(t) {
 
   // 决策完成：给"思考下一步…"那行补上耗时（面板改写最后一条 activity 行；决策期间无其他 activity 插入，安全）
   updateLog(t.sid, null, '思考下一步… ' + Math.round(performance.now() - thinkT0) + 'ms');
+  // 步骤省略提醒行补打：必须在 updateLog 之后（见上面标记处说明），让"思考下一步…"那行稳定带耗时。
+  // quiet：喂模型的提醒（history 里那行）才是真正起作用的，面板这行是内部过程噪音、用户不需要看
+  if (t._stepsReminderLog) { t._stepsReminderLog = false; addLog(t.sid, '步骤计划提醒：模型本轮省略 steps，已提示补报完成进度', true); }
 
   // 单动作存对象（兼容 isReadAction 的历史配对压缩），批量存数组
   const stored = actions.length === 1 ? actions[0] : actions;
@@ -2346,12 +2377,12 @@ async function reviewAndBookmark(t, force, pinnedTurn, reviewSteps) {
   const myTurn = (pinnedTurn != null) ? pinnedTurn : t.turnId; // 钉住停止那一刻的回合号，中途新指令会打断复盘
   const sites = collectVisitedSites(t);
   if (!sites.length) return;
-  // 进度行：只是"正在复盘"的动作提示（非成果），用「本次…复盘中…」与结果行的「复盘：」前缀区分开
+  // 进度行：只是"正在复盘"的动作提示（非成果），用「本次…复盘中…」与结果行的「复盘网站：」前缀区分开
   addLog(t.sid, '本次访问过 ' + sites.length + ' 个网站，完成 ' + (reviewSteps || 0) + ' 步动作，复盘中…');
   const picks = await pickBookmarks(t, sites);
   if (!stillCurrent(t, myTurn, force)) return; // 筛选期间被新指令打断
   if (!picks.length) return;
-  addLog(t.sid, '复盘：筛选出 ' + picks.length + ' 个有用站点'); // 成果：LLM 从访问过的网站里筛出值得收藏的
+  addLog(t.sid, '复盘网站：筛选出 ' + picks.length + ' 个有用站点'); // 成果：LLM 从访问过的网站里筛出值得收藏的
   let added = 0, updated = 0;
   for (const p of picks) {
     if (!stillCurrent(t, myTurn, force)) break; // 复盘期间被新指令打断
@@ -2562,6 +2593,7 @@ function friendlyAction(a, res, ms) {
     case 'list_tabs': return T('列出标签');
     case 'use_tab': return T('纳入标签');
     case 'close_tab': return T('关闭标签');
+    case 'exec_code': return T('复用经验「' + short(a._scene || ('经验' + (a.idx != null ? a.idx : '?'))) + '」');
     case 'wait': return '假装人类发呆 ' + (a.ms || 0) + 'ms';
     default: return (a.action || '') + msTxt;
   }
@@ -2585,7 +2617,7 @@ const UNPROD_TEACH_LIMIT = 6;    // 翻倍仍无进展 → 升级为请使用者
 
 // "试过改变页面"的动作族：只有这类动作的轮才计入轮级无进展（静默空转的特征是"动了但没变化"）。
 // 纯观察轮（read/scroll/pageInfo/hover/wait 等）不计数——长页阅读任务页面指纹同样不变，误计会把正常阅读当卡死。
-const MUTATE_ACTIONS = new Set(['click', 'clickAt', 'dblclickAt', 'clickText', 'clickSelector', 'type', 'select', 'keypress', 'gotoCell', 'uploadFile', 'pasteRich', 'show', 'hide']);
+const MUTATE_ACTIONS = new Set(['click', 'clickAt', 'dblclickAt', 'clickText', 'clickSelector', 'type', 'select', 'keypress', 'gotoCell', 'uploadFile', 'pasteRich', 'show', 'hide', 'exec_code']);
 
 // 功能型通用 label（elementLabel 对无文字元素退回"按钮/链接/搜索框"这类功能名）：
 // 它们不构成 ref 漂移证据，label 比对时排除，避免正常点击被误报。
@@ -2628,7 +2660,7 @@ function pageKeyOf(url) {
 // 连续跨页动作之间不等，让多个新页并行加载，直到要用它之前才等（高效利用加载时间）。
 function actionNeedsLivePage(a) {
   if (!a || !a.action) return false;
-  return ['read', 'click', 'clickAt', 'dblclickAt', 'gotoCell', 'clickText', 'clickSelector', 'uploadFile', 'pasteRich', 'readCss', 'pageInfo', 'getJsErrors', 'clearJsErrors', 'hover', 'show', 'hide', 'type', 'select', 'scroll', 'keypress'].includes(a.action);
+  return ['read', 'click', 'clickAt', 'dblclickAt', 'gotoCell', 'clickText', 'clickSelector', 'uploadFile', 'pasteRich', 'readCss', 'pageInfo', 'getJsErrors', 'clearJsErrors', 'hover', 'show', 'hide', 'type', 'select', 'scroll', 'keypress', 'exec_code'].includes(a.action);
 }
 
 // 确保当前操作标签的页面就绪（内容脚本能响应 PING 且 tab status=complete）。
@@ -3141,13 +3173,13 @@ async function runAction(t, a) {
         // "等待后又重复同一个动作"：上个真实动作后只隔了 wait、页面没变化，现在又要执行一模一样的动作 → 提醒 LLM 换别的
         t.history.push({
           role: 'user',
-          content: '注意：你要执行的动作和上一步刚做完的完全一样（' + sig + '），而中间只有 wait、页面没有变化，重复执行不会有新结果。请改做别的动作（先 read 看页面、scroll 看更多、点别的元素），或对照快照里的【本站操作技巧】看看是否该按技巧来，或 finish 结束本轮。'
+          content: '注意：你要执行的动作和上一步刚做完的完全一样（' + sig + '），而中间只有 wait、页面没有变化，重复执行不会有新结果。请改做别的动作（先 read 看页面、scroll 看更多、点别的元素），或对照快照里的【本站操作经验】看看是否该按经验来，或 finish 结束本轮。'
         });
       } else if (t.stuck === 0) {
         // 第一次发现连续重复（中间没有 wait）：先轻提示一次让它自己换招；仍无进展会继续累计到阈值请使用者演示
         t.history.push({
           role: 'user',
-          content: '注意：动作（' + sig + '）你刚刚已经执行过，如果它没能推进任务，重复执行不会有新结果。请先 read 看看当前页面状态，或对照快照里的【本站操作技巧】调整做法，或换别的动作 / 滚动查看更多 / 点击别的元素；实在不知道怎么继续，可以用 ask_user（mode=teach）请使用者手把手演示。'
+          content: '注意：动作（' + sig + '）你刚刚已经执行过，如果它没能推进任务，重复执行不会有新结果。请先 read 看看当前页面状态，或对照快照里的【本站操作经验】调整做法，或换别的动作 / 滚动查看更多 / 点击别的元素；实在不知道怎么继续，可以用 ask_user（mode=teach）请使用者手把手演示。'
         });
       }
       t.stuck = (t.stuck || 0) + 1;
@@ -3222,6 +3254,94 @@ async function runAction(t, a) {
       res = { ok: true, cleared };
     }
     await finishRunAction(t, a, res, Math.round(performance.now() - t0), sig, myTurn);
+    return;
+  }
+
+  // ---- exec_code：执行快照里某条经验写好的 JS（Agent 只传编号+参数，不抄代码）。
+  // 编号来自【本站操作经验】的 [经验N]，必须与当前快照那批一致（新鲜度闸门），经验列表在快照后变过就得重新 snapshot。
+  if (a.action === 'exec_code') {
+    const idx = a.idx;
+    if (!Number.isInteger(idx) || idx < 0) {
+      await pushFailure(t, 'exec_code 的 idx 必须是非负整数，你给的是：' + JSON.stringify(idx) + '。先重新 snapshot 看【本站操作经验】里的 [经验N] 编号再调。', true);
+      return;
+    }
+    const argsRaw = (a.args == null) ? {} : a.args;
+    if (typeof argsRaw !== 'object' || Array.isArray(argsRaw)) {
+      await pushFailure(t, 'exec_code 的 args 必须是对象（参数名:值），你给的是：' + JSON.stringify(argsRaw), true);
+      return;
+    }
+    // 新鲜度闸门（对齐 use_tab/list_tabs）：只认"当前快照那次加载的经验"。页面换过 / 库变过 → 编号已不可靠
+    const ref = t._expRef || null;
+    if (!ref || ref.host !== hostOf(t.snapUrl || '')) {
+      await pushFailure(t, 'exec_code 需要当前快照里的经验编号，但当前页面没有可用的经验快照。请先重新 snapshot 拿到【本站操作经验】编号再调。', true);
+      return;
+    }
+    const fresh = await getSiteExperiences(ref.host);
+    if (expSig(fresh) !== ref.sig) {
+      await pushFailure(t, '该网站的操作经验库在快照后发生了变化，编号可能已漂移。请先重新 snapshot 拿到最新【本站操作经验】编号再调 exec_code。', true);
+      return;
+    }
+    const item = normExp(fresh[idx]);
+    if (!item || !item.code) {
+      await pushFailure(t, '经验 ' + idx + '（' + (item ? item.scene : '不存在') + '）没有可执行代码，无法 exec_code。请按场景描述手动操作。', true);
+      return;
+    }
+    // 仅面板展示用（friendlyAction 的 exec_code 行显示场景名）；a 不会喂回模型 / 落历史，加下划线字段安全
+    a._scene = item.scene;
+    // 参数白名单：只透传该经验声明的参数名（防 Agent 传错键名把无关数据塞进代码）；未传的用 undefined，代码可自行判断
+    const declared = new Set(item.params.map((p) => p.name));
+    const args = {};
+    for (const k of Object.keys(argsRaw)) if (declared.has(k)) args[k] = argsRaw[k];
+    // 发到主窗口 / 指定子窗口执行，走统一收尾喂回模型（a.frame 用法同 clickText/readCss）
+    let execFrame = { frameId: 0 };
+    if (typeof a.frame === 'number' && a.frame > 0) {
+      const frame = (t.snapFrames || [])[a.frame];
+      if (frame && frame.frameId != null) execFrame = { frameId: frame.frameId };
+    }
+    let execRes = null;
+    let execErr = null;
+    try {
+      execRes = await chrome.tabs.sendMessage(tabId, { type: 'EXECUTE_ACTION', action: { action: 'exec_code', code: item.code, args } }, execFrame);
+    } catch (e) {
+      execErr = e;
+    }
+    const execMs = Math.round(performance.now() - t0);
+    if (execErr) {
+      // sendMessage 抛错 ≈ 页面正在加载/跳转、content 上下文失效
+      const tab = await getTab(tabId);
+      console.warn('[PageAgent] exec_code 连接失败 tab=' + tabId + ' ' + (tab ? tab.url : '(标签不存在)') + ' → ' + execErr.message);
+      addLog(t.sid, '经验代码执行连接失败（可能页面正在跳转/未加载完成）', true);
+      awaitNav(t, tabId);
+      return;
+    }
+    if (!stillCurrent(t, myTurn)) return;
+    if (!execRes || execRes.ok === false) {
+      const why = (execRes && (execRes.message || execRes.error)) || '经验代码执行失败';
+      // 技术细节（语法/CSP/沙箱/超时等）只进控制台排查，不显示给用户（用户反馈"太复杂"）；
+      // 删除 + 耗时合并成一行面板消息，报错原文与"经验不可用"都不再刷面板
+      console.warn('[PageAgent] exec_code 执行失败 tab=' + tabId + ' → ' + why);
+      // 基础设施类失败（userScripts 开关没开/API 不可用）要让人知道怎么修，不压成"经验不可用"，也不删经验
+      if (execRes && execRes.infra) {
+        await pushFailure(t, why, false, sig);
+      } else {
+        // 非基础设施失败 = 经验代码本身的问题（元素找不到/报错/超时/业务失败）：立即删掉这条经验，
+        // 别让 Agent 在同站反复撞同一招；同时记下失败原因，本次复盘喂给 LLM 避免再生成同类代码。
+        const fh = ref.host;
+        const fscene = (item && item.scene) || ('经验' + idx);
+        try {
+          await saveSiteExperiences(fh, (fresh || []).filter((_, i) => i !== idx), t.sid);
+          addLog(t.sid, '经验已删除：' + fscene + ' · ' + execMs + 'ms');
+        } catch (e) {
+          console.warn('[PageAgent] 删除失败经验出错 ' + fh + ' → ' + e.message);
+        }
+        if (!t._expFailures) t._expFailures = [];
+        t._expFailures.push({ host: fh, scene: fscene, reason: why });
+        t._expRef = null; // 库已变：旧快照的经验编号作废，下一次 snapshot 自然带出最新列表
+        await pushFailure(t, '经验不可用，请按场景描述手动操作', true, sig); // quiet：只喂模型纠错，不刷面板
+      }
+      return;
+    }
+    await finishRunAction(t, a, execRes, execMs, sig, myTurn);
     return;
   }
 
@@ -3490,7 +3610,7 @@ async function pushFailure(t, why, quiet, sig) {
     await askUser(t, '在 ' + site + ' 上连续操作失败。' + stepNote + (plain ? '失败原因：' + plain + '。' : '') + askNote, undefined, '遇到了问题，需要你帮忙');
     return;
   }
-  t.history.push({ role: 'user', content: '动作执行失败：' + why + '（先对照快照里的【本站操作技巧】调整做法再重试，别硬试同一招）' });
+  t.history.push({ role: 'user', content: '动作执行失败：' + why + '（先对照快照里的【本站操作经验】调整做法再重试，别硬试同一招）' });
   addLog(t.sid, why, quiet); // quiet=true 只进 SW console，不刷用户面板——内部纠错类失败（如切到不存在的标签 ref），使用者无需看原始 ref/tabId
   await saveTasks();
   agentStep(t).catch((e) => fail(t, '运行异常：' + e.message));
@@ -3586,13 +3706,20 @@ function nudgeUser(t, text) {
   addLog(t.sid, '提示：' + text);
 }
 
-// ---------------- 站点操作技巧库（复盘沉淀，操作时加载） ----------------
+// ---------------- 站点操作经验库（复盘沉淀，操作时加载） ----------------
 
-const TIPS_KEY = 'siteTips';         // storage.local 键：{ [host]: string[] }
-// 技巧条数不设硬性上限：每次沉淀合并时都判断"重复/相近"并合并，数量会自然收敛，无需人为截断
-const TIPS_ACTION_THRESHOLD = 3;     // 单站点动作数 ≥ 此值视为"绕了弯路/多点了很多次"
-const TIPS_FAIL_THRESHOLD = 2;       // 单站点失败数 ≥ 此值视为"反复失败"
-const TIPS_MAX_NEW = 10;             // 每次复盘最多新增的技巧条数
+const EXP_KEY = 'siteExperiences';   // storage.local 键：{ [host]: {scene, params, code}[] }（旧 string 数据在 getExpStore 一次性归一化）
+const LEGACY_TIPS_KEY = 'siteTips';  // 旧版"技巧"键：改名"经验"后一次性迁移到 EXP_KEY
+// 经验条数不设硬性上限：每次沉淀合并时都判断"重复/相近"并合并，数量会自然收敛，无需人为截断
+const EXP_ACTION_THRESHOLD = 3;      // 单站点动作数 ≥ 此值 → 候选站点（动作多，通常有可复用的操作值得沉淀）
+const EXP_FAIL_THRESHOLD = 2;        // 单站点失败数 ≥ 此值 → 候选站点（失败多，沉淀绕弯后的正确做法）
+const EXP_MAX_NEW = 10;              // 每次复盘最多新增的经验条数
+// 单条经验 = {scene, params, code}。以下上限随实现逐条列出（截断/停止/数量限制）：
+const EXP_SCENE_MAX = 120;           // 场景简述最大字符数
+const EXP_CODE_MAX = 10000;          // 单条经验代码最大字符数
+const EXP_PARAMS_MAX = 8;            // 单条经验最多参数个数
+const EXP_PARAM_NAME_MAX = 24;       // 参数名最大字符数
+const EXP_PARAM_DESC_MAX = 100;      // 参数说明最大字符数
 
 // 域名 = host（只记录域名，不带协议/路径/查询）；入参可能是完整 URL 也可能是裸域名，都能解析
 function hostOf(url) {
@@ -3604,161 +3731,286 @@ function hostOf(url) {
   } catch (e) { return ''; }
 }
 
-async function getTipStore() {
-  const obj = await chrome.storage.local.get(TIPS_KEY);
-  return (obj && obj[TIPS_KEY]) || {};
+// 单条经验归一化：兼容旧 string（"技巧"时期/旧版）与新 {scene, params, code} 对象，幂等。
+// scene 为空返回 null（丢弃）；code 去 CR 并截断；params 逐项归一化（name 空则丢该项，超出 EXP_PARAMS_MAX 只留前 N 条）。
+function normExp(item) {
+  if (typeof item === 'string') item = { scene: item };
+  if (!item || typeof item !== 'object') return null;
+  const scene = String(item.scene || '').replace(/\s+/g, ' ').trim().slice(0, EXP_SCENE_MAX);
+  if (!scene) return null;
+  const code = String(item.code || '').replace(/\r/g, '').trim().slice(0, EXP_CODE_MAX);
+  const params = [];
+  if (Array.isArray(item.params)) {
+    for (const p of item.params) {
+      if (!p || typeof p !== 'object') continue;
+      const name = String(p.name || '').trim().slice(0, EXP_PARAM_NAME_MAX);
+      if (!name) continue;
+      const desc = String(p.desc || '').replace(/\s+/g, ' ').trim().slice(0, EXP_PARAM_DESC_MAX);
+      params.push({ name, desc });
+      if (params.length >= EXP_PARAMS_MAX) break;
+    }
+  }
+  return { scene, params, code };
 }
 
-// 取某站点的操作技巧（无则返回空数组）
-async function getSiteTips(host) {
+// 经验列表指纹：归一化后各条 scene/code/params 序列化的哈希。exec_code 的新鲜度闸门用它判断
+// "快照时加载的经验编号"是否仍与当前库一致（经验在快照后增删/编辑过，编号就漂移了，得重新 snapshot）。
+function expSig(list) {
+  let s = '';
+  for (const x of (list || [])) {
+    const e = normExp(x);
+    if (e) s += e.scene + '\n' + e.code + '\n' + e.params.map((p) => p.name + '=' + p.desc).join(',') + '\n';
+  }
+  let h = 0;
+  for (let i = 0; i < s.length; i++) h = (h * 31 + s.charCodeAt(i)) | 0;
+  return String(h);
+}
+
+// 经验对象 → 展示用文本（喂 LLM 判断"已有哪些经验"时用；代码不展开、只标"有可执行代码"）
+function expTextOf(item) {
+  if (typeof item === 'string') return item;
+  if (!item || typeof item !== 'object') return '';
+  let s = String(item.scene || '').trim();
+  if (Array.isArray(item.params) && item.params.length) {
+    s += '（参数 ' + item.params.map((p) => p.name + '=' + (p.desc || '')).join('；') + '）';
+  }
+  if (String(item.code || '').trim()) s += '（有可执行代码）';
+  return s;
+}
+
+// 快照经验行：带编号；有可执行代码标「可执行」；有参数附传参说明（Agent 调 exec_code 时知道传什么）
+function expSnapLine(idx, item) {
+  const e = normExp(item);
+  if (!e) return '';
+  let s = '· [经验' + idx + ']' + (e.code ? '（可执行）' : '') + ' ' + e.scene;
+  if (e.params.length) s += '（exec_code 时 args 传：' + e.params.map((p) => p.name + '=' + p.desc).join('；') + '）';
+  return s;
+}
+
+// 经验对象 → 合并用完整文本（含完整代码，供 LLM 合并时对照去重/取舍）
+function expFullText(item) {
+  if (typeof item === 'string') return item;
+  if (!item || typeof item !== 'object') return '';
+  const parts = ['场景：' + String(item.scene || '').trim()];
+  if (Array.isArray(item.params) && item.params.length) {
+    parts.push('参数：' + item.params.map((p) => p.name + '（' + (p.desc || '') + '）').join('；'));
+  }
+  const code = String(item.code || '').trim();
+  if (code) parts.push('代码：\n' + code);
+  return parts.join('\n');
+}
+
+async function getExpStore() {
+  const obj = await chrome.storage.local.get([EXP_KEY, LEGACY_TIPS_KEY]);
+  const store = (obj && obj[EXP_KEY]) || {};
+  // 一次性迁移：旧键 siteTips（"技巧"时期）→ siteExperiences，迁移后删旧键
+  if (obj && obj[LEGACY_TIPS_KEY] && !Object.keys(store).length) {
+    const legacy = obj[LEGACY_TIPS_KEY];
+    if (legacy && typeof legacy === 'object') {
+      for (const h of Object.keys(legacy)) if (Array.isArray(legacy[h]) && legacy[h].length) store[h] = legacy[h];
+    }
+    await chrome.storage.local.set({ [EXP_KEY]: store });
+    await chrome.storage.local.remove(LEGACY_TIPS_KEY);
+  }
+  // 归一化：旧 string / 缺字段对象 → {scene, params, code}，幂等；有变化才写回存储（只此一次，之后读走干净数据）
+  let changed = false;
+  for (const h of Object.keys(store)) {
+    if (!Array.isArray(store[h])) { delete store[h]; changed = true; continue; }
+    if (store[h].some((x) => typeof x === 'string' || !x || typeof x !== 'object' || !Array.isArray(x.params))) {
+      store[h] = store[h].map(normExp).filter(Boolean);
+      changed = true;
+    }
+  }
+  if (changed) await chrome.storage.local.set({ [EXP_KEY]: store });
+  return store;
+}
+
+// 取某站点的操作经验（无则返回空数组）
+async function getSiteExperiences(host) {
   if (!host) return [];
-  const store = await getTipStore();
+  const store = await getExpStore();
   return store[host] || [];
 }
 
-// 全站技巧总条数（面板技巧按钮的角标数字）
-async function totalTipCount() {
-  const store = await getTipStore();
+// 全站经验总条数（面板经验按钮的角标数字）
+async function totalExpCount() {
+  const store = await getExpStore();
   return Object.values(store).reduce((n, arr) => n + (Array.isArray(arr) ? arr.length : 0), 0);
 }
 
-async function saveSiteTips(host, tips, sid) {
-  const store = await getTipStore();
-  store[host] = (tips || [])
-    .map((s) => String(s).replace(/\s+/g, ' ').trim().slice(0, 120))
-    .filter(Boolean);
-  await chrome.storage.local.set({ [TIPS_KEY]: store });
-  // 复盘/教我沉淀了新技巧后，广播新总数让面板技巧按钮的数字跟着变（带来源会话 sid，面板按会话路由也能收到）
-  if (sid != null) broadcast({ type: 'TIPS_CHANGED', count: await totalTipCount() }, sid);
+async function saveSiteExperiences(host, experiences, sid) {
+  const store = await getExpStore();
+  const cleaned = (experiences || []).map(normExp).filter(Boolean);
+  // 删空连站点一起删：站点下没经验了就不留空数组占位（面板按键列出站点，空键只会制造"没经验却在列表里"的站点行）
+  if (cleaned.length) store[host] = cleaned;
+  else delete store[host];
+  await chrome.storage.local.set({ [EXP_KEY]: store });
+  // 复盘/教我沉淀了新经验后，广播新总数让面板经验按钮的数字跟着变（带来源会话 sid，面板按会话路由也能收到）
+  if (sid != null) broadcast({ type: 'EXP_CHANGED', count: await totalExpCount() }, sid);
 }
 
 // 最终结果里自认未完成的强信号：明说要重做（重新下载/重新操作）、明确没做到/漏了/没拿到。
 // 只匹配"自己承认没达成"的最强表述——避免把"已完成 + 顺带提一句可选的后续优化"（如"如需按月份分文件夹整理可告诉我"）
-// 误判成失败。命中就整轮跳过技巧沉淀，防止把错误操作的轨迹当成正确路径写进技巧库。
+// 误判成失败。命中就整轮跳过经验沉淀，防止把错误操作的轨迹当成正确路径写进经验库。
 function selfReportedFailure(result) {
   const s = String(result || '');
   return /未能|没能|没(?:有)?(?:完成|成功|做到|下载到|拿到|办到)|无法(?:完成|做到|下载)|漏了|遗漏|重新(?:下载|操作|做|来|点|筛选)/.test(s);
 }
 
-// 复盘入口（与书签复盘并列，都在 finish 时跑）：把本轮"反复失败 / 绕了弯路多点了很多次"
-// 的操作沉淀成"该网站的操作技巧"（只记域名），并带上该站既有技巧做冲突去重合并，持续全量优化。
-async function reviewAndLearnTips(t, force, pinnedTurn) {
+// 复盘入口（与书签复盘并列，都在 finish 时跑）：把本轮"做过可复用操作 / 反复失败 / 动作多"
+// 的站点列为候选，把实际操作轨迹交给 LLM 判断哪些操作**未来值得复用**——不要求必须绕了弯路，
+// 一路顺利但通用（下次还会再做）的操作同样沉淀为经验（只记域名），并带上该站既有经验做冲突去重合并，持续全量优化。
+async function reviewAndLearnExperiences(t, force, pinnedTurn) {
   if (!t) return;
   // force：停止后复盘用（state 已回 idle，仍要跑复盘）；正常 finish 复盘时 force 为空，保持"仅 working 时复盘"
   if (!force && t.state !== 'working') return;
   const myTurn = (pinnedTurn != null) ? pinnedTurn : t.turnId; // 钉住停止那一刻的回合号，中途新指令会打断复盘
   // 任务结果自检：最终结果是否自认"没做到 / 需要重做"。
-  // 失败轮次沉淀的技巧会把错误操作（ref 漂移的无效点击、滚动来回找）当成"成功路径"照搬进技巧库，
-  // 跨会话传染同样的绕路（这就是"点全选前先滚动"这类坏技巧的由来）——这类轮次直接跳过沉淀，宁可少沉淀、不要沉淀错的。
+  // 失败轮次沉淀的经验会把错误操作（ref 漂移的无效点击、滚动来回找）当成"成功路径"照搬进经验库，
+  // 跨会话传染同样的绕路（这就是"点全选前先滚动"这类坏经验）——这类轮次直接跳过沉淀，宁可少沉淀、不要沉淀错的。
   if (selfReportedFailure(t.result)) {
-    addLog(t.sid, '复盘技巧跳过：本轮最终结果自认未完成，错误操作不沉淀为技巧', true);
+    addLog(t.sid, '复盘经验跳过：本轮最终结果自认未完成，错误操作不沉淀为经验'); // 面板可见 + 进导出日志⑤：跳沉淀也要让使用者看得见原因
     return;
   }
   const report = collectDifficultyReport(t);
-  if (!report) return;
+  if (!report) { addLog(t.sid, '复盘经验：本轮无候选站点（无失败/无困难操作），不沉淀经验'); return; }
   const cfg = await getConfig();
-  if (!cfg.apiKey) return;
-  if (!stillCurrent(t, myTurn, force)) return;
-  const store = await getTipStore();
+  if (!cfg.apiKey) { addLog(t.sid, '复盘经验：未配置 API Key，跳过沉淀'); return; }
+  if (!stillCurrent(t, myTurn, force)) { addLog(t.sid, '复盘经验：复盘期间来了新指令，本次沉淀跳过'); return; }
+  const store = await getExpStore();
   const oldByHost = {};
-  for (const h of report.domains) oldByHost[h] = (store[h] || []).join('\n');
+  for (const h of report.domains) oldByHost[h] = (store[h] || []); // 对象数组：展示用 expTextOf，合并时整份交给 merge
+  // 本轮 exec_code 失败并已删除的经验：把失败原因喂给 LLM，生成/合并同站经验时参考，避免再犯同类错误
+  const expFailures = (t._expFailures || []).filter((f) => f && report.domains.includes(f.host));
+  const expFailText = expFailures.length
+    ? '\n\n本轮有几条【既有经验】的代码执行失败（已删除），失败原因如下——若本次为同站同类操作生成/合并经验，请对照这些原因检查新代码，避免再生成同样会失败的选择器或逻辑（例如选择器不匹配当前页真实元素、只匹配 input 却漏了 textarea、硬编码了本轮才有的路径/值等）：\n' +
+      expFailures.map((f) => '- ' + f.host + '「' + f.scene + '」失败原因：' + (f.reason || '未说明')).join('\n')
+    : '';
   const msgs = [
     {
       role: 'system',
-      content: '你是 PageAgent 的"网站操作技巧沉淀"助手。使用者一次任务里在某些网站反复失败、或绕了弯路多点了很多次。请为这些网站总结出【下次该怎么操作才更顺】的简短技巧。报告里既有失败原因、也有最终走通的成功操作轨迹（如 click(发布)→type(关键词)），两者结合提炼——成功轨迹通常是"正确做法"的线索。技巧要提炼成该网站**可复用的操作/交互规律**（比如：搜索框输入关键词后必须从下拉候选里点选、不能直接回车；这个页面要先点开下拉框再选择；登录入口在页面右下角）。要求：① 一句话一条、具体可执行；② 只讲该网站的通用操作习惯，**禁止照搬本轮一次性内容**——不要出现具体搜索词、地点名、用户名、页面元素文本（如"点击『湖南郴州裕后街』"这种），要抽象成"输入框/下拉/按钮/列表"这类功能操作的规律；③ 忽略纯网络/服务端问题（页面打不开、超时、接口报错）；④ 已有技巧里讲过的别重复。另外，报告里的"成功操作"只表示动作执行返回 ok，**不代表点对了**——ref 漂移时可能点到无关元素（如想点『全选』结果点成了『邮箱』）。哪些是正确做法，要以【最终结果】是否达成目标来定；拿不准的宁可不写，不要沉淀"按某编号元素点"这类依赖快照编号、换页即失效的做法。'
+      content: '你是 PageAgent 的"网站操作经验沉淀"助手。本次任务里 Agent 在某些网站做了操作，其中可能有绕弯路的部分（点错后纠正、操作失败后换招、重复点击同一处、滚动来回找、做了多余无效步骤才最终做对），也可能一路顺利。请逐个候选站点看它的实际操作轨迹，判断该站的哪些操作**未来在同类任务里值得复用**——**不要求这轮必须绕了弯路**：只要是在该站会重复遇到的通用操作（搜索、筛选、翻页、下载、提交表单、批量处理、跳转固定入口等），就算一路顺利也值得沉淀成经验。沉淀什么就写什么：要么是绕弯纠正后的正确做法，要么是顺利完成的通用操作；**没有复用价值的就不写**——纯阅读无交互、明显一次性/专属本轮、纯网络/服务端问题（页面打不开、超时、接口报错）、已有经验里讲过的（含已写过的代码）。每条经验的内容要写：**怎么做才是对且省事的**——即最正确、最省事的做法（比如"不用先滚动，直接点『全选』就行""搜索后要直接点下拉候选里的第一条，不能直接回车"），并把它**实现成一段可在该页面执行的 JS**。要求：① 只讲该网站的通用操作习惯，**禁止照搬本轮一次性内容**——不要出现具体搜索词、地点名、用户名、页面元素文本（如"点击『湖南郴州裕后街』"这种），要抽象成"输入框/下拉/按钮/列表"这类功能操作的规律。另外，报告里的"成功操作"只表示动作执行返回 ok，**不代表点对了**——ref 漂移时可能点到无关元素（如想点『全选』结果点成了『邮箱』）。哪些是正确做法，要以【最终结果】是否达成目标来定；拿不准的宁可不写，不要沉淀"按某编号元素点"这类依赖快照编号、换页即失效的做法。宁可少沉淀，不要沉淀明显一次性的。\n\n每条经验是对象 {scene, params, code}：**scene** 一句话描述适用场景（哪个页面/哪类操作，通用化，不含本轮一次性内容）；**code** 是把正确做法写成的、可在该页面 DOM 里执行的 JS——自包含、元素缺失要优雅返回 {ok:false,message}、末尾 return 结果对象；定位元素用通用稳定信号（按钮文字如『全选』『删除』、placeholder、name、data-testid、结构类名）；**禁止把本轮的搜索词/地点/用户名/页面文本硬编码进代码**——正确做法里依赖任务具体值的地方声明成参数：**params** 里给 name + desc（desc 说明传什么值并附示例，如"要搜索的关键词，如\\"AI 趋势\\""），code 里用 args.<参数名> 取（如输入搜索词就是 `input.value=args.keyword` 之类），这样 Agent 下次在同站传新值就能复用；没有可变值则 params 留空数组。禁止 fetch/XMLHttpRequest/WebSocket/本地存储/新开窗口/页面跳转/alert 弹窗/死循环；确实写不出通用代码时 code 留空字符串、只保留 scene 当提示。'
     },
     {
       role: 'user',
-      content: '本轮操作困难报告：\n' + report.text +
+      content: '本轮操作报告：\n' + report.text +
         '\n\n本轮任务目标：' + String(t.goal || '（无）').slice(0, 200) + '\n最终结果：' + String(t.result || '（无）').slice(0, 300) +
-        '\n\n这些域名已有的操作技巧（避免重复）：\n' + report.domains.map((h) => h + '：' + (oldByHost[h] || '（无）')).join('\n') +
-        '\n\n只输出 JSON：{"tips":[{"domain":"域名","tip":"一句话技巧"}]}。每条 tip 的 domain 必须是上面报告里出现的域名；最多 ' + TIPS_MAX_NEW + ' 条；某网站不需要新增技巧就输出 {"tips":[]}。'
+        expFailText +
+        '\n\n这些域名已有的操作经验（避免重复）：\n' + report.domains.map((h) => h + '：' + ((oldByHost[h] || []).map(expTextOf).join('\n') || '（无）')).join('\n') +
+        '\n\n只输出 JSON：{"experiences":[{"domain":"域名","scene":"场景简述","params":[{"name":"参数名","desc":"传什么值/示例"}],"code":"JS 代码"}]}。每条 experience 的 domain 必须是上面报告里出现的域名；最多 ' + EXP_MAX_NEW + ' 条；某站点没有可复用操作就不写它，全都没有就输出 {"experiences":[]}。'
     }
   ];
+  // 生成前先留一行"正在沉淀"标记：LLM 调用可能耗时较长（超时 240s），
+  // 中途导出的日志也看得出复盘正在进行、而不是没跑（否则"复盘中…"之后一片空白，像功能挂了）。
+  // 尽量与书签复盘那行"复盘网站：筛选出 N 个有用站点"合并成一行（用户反馈"筛选写了两行"太啰嗦）：
+  // 书签复盘后没插别的行（末条即筛选行）就原地改写它、追加"总结网站用法…"；否则退回独立候选行。
+  const actLast = (getTask(t.sid) || {}).activities || [];
+  const lastText = actLast.length ? String(actLast[actLast.length - 1].text || '') : '';
+  if (lastText.indexOf('复盘网站：筛选出') === 0) {
+    updateLog(t.sid, null, lastText + '，总结网站用法…');
+  } else {
+    addLog(t.sid, '复盘网站：候选站点 ' + report.domains.length + ' 个（' + midTruncate(report.domains.join('、'), 40) + '），总结网站用法…');
+  }
   let arr = [];
+  let raw = ''; // 复盘返回原文：LLM 调用失败时为空，JSON 解析失败时保留原文供诊断
   try {
-    const raw = await callLLM(msgs, undefined, t);
-    await logLLMExchange(t, msgs, raw, '复盘·技巧沉淀'); // 复盘的过程也要进导出日志（② 大模型返回节）：沉淀了哪些站的哪些技巧
+    raw = await callLLM(msgs, undefined, t);
+    await logLLMExchange(t, msgs, raw, '复盘·经验沉淀'); // 复盘的过程也要进导出日志（② 大模型返回节）：沉淀了哪些站的哪些经验
     const obj = JSON.parse(raw.replace(/^```(?:json)?/i, '').replace(/```$/i, '').trim());
-    arr = (obj && Array.isArray(obj.tips)) ? obj.tips : [];
+    arr = (obj && Array.isArray(obj.experiences)) ? obj.experiences : [];
   } catch (e) {
-    addLog(t.sid, '复盘技巧生成失败：' + e.message, true);
+    // 失败原因不再闷在 SW console：面板可见 + 进导出日志⑤；解析失败时带原文片段，一眼看出是调用错还是返回格式错
+    console.error('[PageAgent] 复盘经验生成失败：', e);
+    addLog(t.sid, '复盘经验生成失败：' + e.message + (raw ? ' 原文=' + midTruncate(raw, 200) : ''));
     return;
   }
   if (!stillCurrent(t, myTurn, force)) return;
-  // 按域名分组：只写报告里的域名，防 LLM 乱加别的站点
+  // 按域名分组：只写报告里的域名，防 LLM 乱加别的站点；归一化成 {scene, params, code} 对象
   const byHost = new Map();
   for (const item of arr) {
     if (!item || typeof item !== 'object') continue;
     const h = hostOf(item.domain);
     if (!h || !report.domains.includes(h)) continue;
-    const tip = String(item.tip || '').replace(/\s+/g, ' ').trim();
-    if (tip) { if (!byHost.has(h)) byHost.set(h, []); byHost.get(h).push(tip); }
+    const exp = normExp(item); // scene 空 / 归一化失败 → null 丢弃
+    if (exp) { if (!byHost.has(h)) byHost.set(h, []); byHost.get(h).push(exp); }
   }
-  if (!byHost.size) return;
-  let savedTips = 0; // 本轮实际沉淀的新技巧条数（按各域名的 newTips 计）
-  for (const [h, newTips] of byHost) {
+  if (!byHost.size) {
+    // 有候选站点但 LLM 判定无复用价值：不沉淀任何经验（宁缺毋滥）——结论要可见，别让"为什么没沉淀"靠猜
+    addLog(t.sid, '复盘经验：本轮候选站点未发现可复用的经验');
+    return;
+  }
+  for (const [h, newExp] of byHost) {
     if (!stillCurrent(t, myTurn, force)) break;
     try {
-      const merged = await mergeSiteTips(h, newTips, oldByHost[h], t.sid);
+      const merged = await mergeSiteExperiences(h, newExp, oldByHost[h], t.sid);
       if (!merged || !merged.length) continue;
-      await saveSiteTips(h, merged, t.sid);
-      savedTips += newTips.length;
-      addLog(t.sid, '复盘：沉淀 ' + h + ' 的操作技巧（共 ' + merged.length + ' 条）', true); // 明细留 console，活动日志只报总数
+      await saveSiteExperiences(h, merged, t.sid);
+      // 每个站一行即最终沉淀结果，不再另报"总结了 N 个"总数（用户反馈"沉淀写了两行"太啰嗦；各站新增条数已够）
+      addLog(t.sid, '复盘：沉淀 ' + h + ' 的操作经验（新增 ' + newExp.length + ' 条）'); // 面板可见 + 进导出日志⑤
     } catch (e) {
-      addLog(t.sid, '复盘技巧保存失败：' + h + ' → ' + e.message, true);
+      console.error('[PageAgent] 复盘经验保存失败：' + h, e);
+      addLog(t.sid, '复盘经验保存失败：' + h + ' → ' + e.message);
     }
   }
-  if (savedTips > 0) addLog(t.sid, '复盘：总结了 ' + savedTips + ' 个操作技巧'); // 成果：本轮沉淀的新技巧总数
 }
 
-// 合并某域名的既有技巧与新技巧：同站同操作的冲突技巧合并处理、有价值的旧技巧保留、限制条数。返回最终列表。
-async function mergeSiteTips(host, newTips, oldTipsText, sid) {
+// 合并某域名的既有经验与新经验：同站同操作的冲突经验合并处理、有价值的旧经验保留。返回最终对象列表。
+// newExp / oldExp 都是 {scene, params, code} 对象数组（旧数据在 getExpStore 已归一化）。
+async function mergeSiteExperiences(host, newExp, oldExp, sid) {
   const cfg = await getConfig();
-  if (oldTipsText && cfg.apiKey) {
+  if (Array.isArray(oldExp) && oldExp.length && cfg.apiKey) {
     const msgs = [
       {
         role: 'system',
-        content: '你是 PageAgent 的"网站操作技巧合并"助手。给定一个网站的【旧技巧】和【新技巧】，合并成一份最终技巧列表。规则：① 同一操作的不同/冲突技巧要合并处理，新技巧能覆盖旧技巧的以新为准（新技巧说明旧做法是错的时，删除旧做法）；② 仍有用的旧技巧保留，不要丢失；③ 每条一句话、具体可执行；④ 重复或相近的技巧必须合并成一条，宁精勿滥，不要让同一条经验以不同措辞堆叠多条；⑤ 只输出 JSON 数组，如 ["技巧一","技巧二"]。'
+        content: '你是 PageAgent 的"网站操作经验合并"助手。给定一个网站的【旧经验】和【新经验】，合并成一份最终经验列表。每条经验是 {scene, params, code} 对象：scene 是"该怎么做"的一句话、params 是参数声明（name+desc，无则空数组）、code 是可执行 JS（自包含、用 args.<参数名> 取参数、无代码则 code 为空字符串）。规则：① 同一操作的不同/冲突经验要合并，新经验能覆盖旧经验的以新为准（新 code 比旧 code 正确时用新的）；② 仍有用的旧经验保留，不要丢失；③ scene 一句话、具体可执行；④ 重复或相近的经验必须合并成一条，宁精勿滥，不要让同一条经验以不同措辞堆叠多条；⑤ 只输出 JSON 数组，如 [{"scene":"经验一","params":[],"code":""},{"scene":"经验二","params":[{"name":"keyword","desc":"要搜索的关键词"}],"code":"..."}]。'
       },
-      { role: 'user', content: '网站：' + host + '\n旧技巧：\n' + (oldTipsText || '（无）') + '\n新技巧：\n' + newTips.join('\n') }
+      { role: 'user', content: '网站：' + host + '\n旧经验：\n' + (oldExp.map(expFullText).join('\n\n') || '（无）') + '\n\n新经验：\n' + newExp.map(expFullText).join('\n\n') }
     ];
+    let raw = ''; // 合并返回原文：解析失败时保留原文供诊断
     try {
       const tsk = getTask(sid) || undefined;
-      const raw = await callLLM(msgs, { json: false }, tsk);
-      await logLLMExchange(tsk, msgs, raw, '复盘·技巧合并'); // 复盘的过程也要进导出日志（② 大模型返回节）：合并后最终留下哪些技巧
+      raw = await callLLM(msgs, { json: false }, tsk);
+      await logLLMExchange(tsk, msgs, raw, '复盘·经验合并'); // 复盘的过程也要进导出日志（② 大模型返回节）：合并后最终留下哪些经验
       const arr = JSON.parse(raw.replace(/^```(?:json)?/i, '').replace(/```$/i, '').trim());
       if (Array.isArray(arr) && arr.length) {
-        const clean = arr.map((s) => String(s || '').replace(/\s+/g, ' ').trim()).filter(Boolean);
+        const clean = arr.map((x) => normExp(x)).filter(Boolean);
         if (clean.length) return clean;
       }
     } catch (e) {
-      addLog(sid, '复盘技巧合并失败：' + e.message, true);
+      console.error('[PageAgent] 复盘经验合并失败：', e);
+      addLog(sid, '复盘经验合并失败：' + e.message + (raw ? ' 原文=' + midTruncate(raw, 200) : '')); // 面板可见 + 进导出日志⑤
     }
   }
-  // 兜底：旧 + 新 简单去重（LLM 合并失败时不让旧技巧丢失）
-  const merged = [...newTips];
-  const seen = new Set(merged);
-  for (const o of String(oldTipsText || '').split('\n')) {
-    const s = o.replace(/\s+/g, ' ').trim();
-    if (s && !seen.has(s)) { merged.push(s); seen.add(s); }
+  // 兜底：旧 + 新 按 scene 去重（LLM 合并失败时不让旧经验丢失）
+  const merged = [];
+  const seen = new Set();
+  for (const x of [...newExp, ...(Array.isArray(oldExp) ? oldExp : [])]) {
+    const e = normExp(x);
+    if (!e) continue;
+    const key = String(e.scene).toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    merged.push(e);
   }
   return merged;
 }
 
-// 统计本轮各站点的动作数/失败数，返回有"困难信号"站点的报告（供 LLM 沉淀技巧）。
+// 统计本轮各站点的动作数/失败数/可交互操作数，返回"候选站点"的报告（供 LLM 判断哪些操作值得沉淀成经验）。
 // 只统计实际操作过的站点：快照【当前页面】URL 之后、到下一个快照之前的动作归属该站点。
-// 困难信号：失败 ≥ TIPS_FAIL_THRESHOLD，或动作 ≥ TIPS_ACTION_THRESHOLD（绕弯路/多点了很多次）。
+// 候选信号：失败 ≥ EXP_FAIL_THRESHOLD，或动作 ≥ EXP_ACTION_THRESHOLD，或做过可交互操作（clicks ≥ 1）——
+// 不要求"绕了弯路"：只要做过点击/输入/选择这类可复用操作，就算一路顺利也列为候选，交 LLM 判断有无复用价值。
+// 报告带实际操作轨迹（成功结果补元素 label，如 click(邮箱)→click(全选)），LLM 据此识别可沉淀的操作与绕弯。
 function collectDifficultyReport(t) {
   const slice = (t.history || []).slice(t.turnHistoryStart || 0);
-  const sites = new Map(); // host -> { actions, fails, actLines: Map<actionType,count>, actSeq: [], failMsgs: [], okSeq: [] }
+  const sites = new Map(); // host -> { actions, fails, clicks, actLines: Map<actionType,count>, actSeq: [], failMsgs: [], okSeq: [] }
   const ensure = (h) => {
     if (!h) return null;
-    if (!sites.has(h)) sites.set(h, { actions: 0, fails: 0, actLines: new Map(), actSeq: [], failMsgs: [], okSeq: [] });
+    if (!sites.has(h)) sites.set(h, { actions: 0, fails: 0, clicks: 0, actLines: new Map(), actSeq: [], failMsgs: [], okSeq: [] });
     return sites.get(h);
   };
   let cur = null; // 当前操作站点
   let lastActType = null; // 最近一个"可点类"动作类型，供配对成功的"动作结果"label（尽力配对，label 本身才是关键）
+  let lastActIdx = -1;   // 最近一个"可点类"动作在轨迹里的位置，成功结果返回时给轨迹补 label
   const CLICKLIKE = new Set(['click', 'clickAt', 'dblclickAt', 'gotoCell', 'clickText', 'hover', 'show', 'type', 'select', 'keypress']);
   for (const m of slice) {
     if (m.role === 'assistant' && typeof m.content === 'string') {
@@ -3769,7 +4021,11 @@ function collectDifficultyReport(t) {
           cur = ensure(hostOf(a.url));
           if (cur) { cur.actions++; bumpAct(cur, a.action); }
         } else if (CLICKLIKE.has(a.action) || a.action === 'scroll') {
-          if (cur) { cur.actions++; bumpAct(cur, a.action); }
+          if (cur) {
+            cur.actions++;
+            bumpAct(cur, a.action);
+            if (CLICKLIKE.has(a.action)) { cur.clicks++; lastActIdx = cur.actSeq.length - 1; } // 记住该动作在轨迹里的位置，供结果 label 回填
+          }
         }
       }
     } else if (m.role === 'user' && typeof m.content === 'string') {
@@ -3780,7 +4036,8 @@ function collectDifficultyReport(t) {
         cur.failMsgs.push(m.content.replace(/^动作执行失败：/, '').slice(0, 500));
       }
       // 成功的动作结果带元素 label（"动作结果：{"ok":true,"label":"发布",...}"）：把"最终走通的操作"记进报告，
-      // 复盘沉淀技巧时 LLM 能据此提炼"该怎么操作才顺"，而不是只看到失败。
+      // 复盘沉淀经验时 LLM 能据此提炼"该怎么操作才顺"；同时给轨迹补上 label（click → click(邮箱)），
+      // 让 LLM 看到真实点击轨迹、判断"点错再点对"这类绕弯，而不是只看到失败。
       const rm = m.content.match(/^动作结果：(.*)/);
       if (rm && cur && lastActType) {
         try {
@@ -3789,13 +4046,20 @@ function collectDifficultyReport(t) {
             const lbl = String(r.label).replace(/\s+/g, ' ').trim().slice(0, 16);
             if (lbl) {
               cur.okSeq.push(lastActType + '(' + lbl + ')');
+              if (lastActIdx >= 0 && cur.actSeq[lastActIdx] === lastActType) cur.actSeq[lastActIdx] = lastActType + '(' + lbl + ')';
             }
           }
         } catch (e) { /* 结果非 JSON（如链接后台打开的消息），跳过 */ }
       }
     }
   }
-  const bad = [...sites.values()].filter((s) => s.fails >= TIPS_FAIL_THRESHOLD || s.actions >= TIPS_ACTION_THRESHOLD);
+  const bad = [...sites.values()].filter((s) => s.fails >= EXP_FAIL_THRESHOLD || s.actions >= EXP_ACTION_THRESHOLD || s.clicks > 0);
+  // exec_code 失败并删除了经验：该站即使动作/失败数不够候选门槛也强制进候选，让本次复盘读到失败原因、避免再生成同类代码
+  for (const f of (t._expFailures || [])) {
+    if (!f || !f.host) continue;
+    const s = ensure(f.host);
+    if (s && !bad.includes(s)) bad.push(s);
+  }
   if (!bad.length) return null;
   const hostOfSite = (s) => { for (const [h, v] of sites) if (v === s) return h; return ''; };
   const lines = [];
@@ -4145,7 +4409,7 @@ async function processUserMessage(sid, text, tabId) {
   t._lastRoundMutated = false; // 新回合重置"上一轮是否试过改页面"（轮级无进展判定用）
   t.readList = [];     // 新回合重置"已读清单"：上一轮读过的条目不再拦截，新任务从零记录
   t.lastActiveAt = Date.now();
-  t.lastTipsHost = ''; // 新回合重置"技巧加载提示"去重
+  t.lastExpHost = ''; // 新回合重置"经验加载提示"去重
 
   t.conversation.push({ role: 'user', text: content, t: Date.now() });
   if (t.conversation.length > MAX_CONVERSATION) t.conversation = t.conversation.slice(-MAX_CONVERSATION);
@@ -4200,7 +4464,7 @@ async function stopCurrent(sid) {
     await saveTasks();
     addLog(t.sid, '已停止当前操作，可继续对话');
     broadcast({ type: 'AGENT_STATUS', status: 'idle' }, t.sid);
-    // 停止后仍做复盘：本轮实际访问过的网站 / 走过的弯路，照常沉淀成书签与操作技巧。
+    // 停止后仍做复盘：本轮实际访问过的网站 / 走过的弯路，照常沉淀成书签与操作经验。
     // 后台执行不阻塞停止按钮的响应；期间若来了新指令（turnId 变化）复盘自动退出。
     reviewAfterTurnEnd(t, myTurn, reviewSteps);
   }
@@ -4208,9 +4472,33 @@ async function stopCurrent(sid) {
 
 // 回合收尾后的复盘（停止 / finish 完成都走这里）：任务已回 idle，用 force 让复盘在后台照常执行
 // （LLM 判断本轮访问的网站是否有用、操作是否有困难）。钉住回合号：新指令（turnId 变化）自动退出。
+// 复盘是 fire-and-forget 且 complete()/停止路径都清了心跳 alarm：MV3 worker 随时可能被回收，一回收
+// 复盘链就断了且毫无痕迹（会话1 实测：书签筛选 #7 跑完、经验沉淀 #8 还没发请求 worker 就被回收，
+// 导出日志⑤停在 complete() 存档时刻、② 缺经验沉淀那轮）。因此：起跑前把"复盘未完成"标记落盘并重挂
+// alarm —— 落盘保证 worker 重启后能按标记补跑；alarm 保证有唤醒源触发补跑（心跳期间 anyBusy 不会清）。
 async function reviewAfterTurnEnd(t, myTurn, reviewSteps) {
-  try { await reviewAndBookmark(t, true, myTurn, reviewSteps); } catch (e) { /* 复盘失败不影响收尾 */ }
-  try { await reviewAndLearnTips(t, true, myTurn); } catch (e) { /* 技巧沉淀失败不影响收尾 */ }
+  if (!t) return;
+  if (reviewRunning[t.sid]) {
+    // 上回合复盘还没跑完就来了新指令（本回合复盘想起跑被挡）：不并发起跑，
+    // 把待办标记更新为当前回合——正在跑的旧复盘会在仍 current 检查时退出，其收尾不清新标记，
+    // 之后由 alarm 心跳路径按新标记补跑本回合复盘。
+    t._reviewPending = { turnId: myTurn, reviewSteps: reviewSteps || 0 };
+    return;
+  }
+  reviewRunning[t.sid] = true;
+  t._reviewPending = { turnId: myTurn, reviewSteps: reviewSteps || 0 };
+  try {
+    await saveTasks(); // 先把"复盘未完成"标记落盘
+    setupAlarm(); // 复盘窗口保持心跳（complete()/停止已把 alarm 清了），worker 不被空闲回收
+    try { await reviewAndBookmark(t, true, myTurn, reviewSteps); } catch (e) { /* 复盘失败不影响收尾 */ }
+    try { await reviewAndLearnExperiences(t, true, myTurn); } catch (e) { /* 经验沉淀失败不影响收尾 */ }
+  } finally {
+    reviewRunning[t.sid] = false;
+    // 本次复盘完成：清掉自己的标记。期间来了新回合的（_reviewPending 已被新回合更新）不在此清，
+    // 留给 alarm 心跳路径补跑新回合复盘。alarm 不在此清，交给 alarm 处理器"无任务忙 + 无复盘待办"时统一收。
+    if (t._reviewPending && t._reviewPending.turnId === myTurn) t._reviewPending = null;
+    await saveTasks(); // 清标记（或保留新回合标记）都落盘：worker 随时可能回收
+  }
 }
 
 // 事件是否录自 iframe 子窗口（frameId 非 0 或缺失时视为主窗口）
@@ -4234,25 +4522,6 @@ function formatTeachSteps(events) {
   return lines.join('\n');
 }
 
-// 脱敏配方：教学步骤去掉输入的具体值（不把密码/账号存进技巧库），只保留动作+控件名，供同站未来复用
-function buildTeachRecipe(events) {
-  if (!events || !events.length) return '';
-  const nums = '①②③④⑤⑥⑦⑧⑨⑩';
-  const lines = events.map((e, i) => {
-    const no = nums.charAt(i) || (i + 1);
-    const frameNote = inIframe(e) ? '（子窗口内）' : '';
-    switch (e.t) {
-      case 'click': return no + '点击『' + (e.label || '按钮/链接') + '』' + frameNote;
-      case 'hover': return no + '悬浮『' + (e.label || '元素') + '』' + frameNote;
-      case 'type': return no + '在『' + (e.label || '输入框') + '』输入' + frameNote;
-      case 'select': return no + '在『' + (e.label || '下拉框') + '』选择' + frameNote;
-      case 'submit': return no + '按回车提交' + frameNote;
-      default: return no + '执行' + (e.label || '');
-    }
-  });
-  return '该站操作流程：' + lines.join('；');
-}
-
 // 使用者手动操作完成，继续当前回合（page / teach 两种模式）。
 // confirmedText：confirm 模式下使用者在对话里输入确认的话（有则带进上下文，避免与按钮占位重复）
 async function resumeAfterUser(sid, confirmedText) {
@@ -4260,7 +4529,7 @@ async function resumeAfterUser(sid, confirmedText) {
   if (!t || t.state !== 'waiting_user') return;
   if (t.waitingReply) return; // 对话回复模式没有"继续"按钮，回复直接走 processUserMessage
 
-  // ---- 教我模式：使用者演示完成 → 停止录制、沉淀技巧、把步骤注入上下文让 Agent 学习 ----
+  // ---- 教我模式：使用者演示完成 → 停止录制、沉淀经验、把步骤注入上下文让 Agent 学习 ----
   if (t.askMode === 'teach') {
     const teachTabId = t.teachTabId;
     const teachTabIds = (t.teachTabIds || []).slice(); // 快照，下面会清
@@ -4276,7 +4545,7 @@ async function resumeAfterUser(sid, confirmedText) {
           const extra = resp && Array.isArray(resp.events) ? resp.events : [];
           console.log('[Teach] TEACH_STOP tab=' + id + ' frame=' + f.frameId + ' 响应带回 extra=' + extra.length + ' 条 [' + extra.map((e) => e.t).join(',') + ']');
           if (extra.length) {
-            // 尾部缓冲事件没走 TEACH_EVENT 上报，补来源 host（收尾按网站分组沉淀技巧）
+            // 尾部缓冲事件没走 TEACH_EVENT 上报，补来源 host（收尾按网站分组沉淀经验）
             const tb = await getTab(id);
             const h = hostOf((tb && tb.url) || '');
             for (const e of extra) { e.tab = id; e.host = e.host || h; e.frameId = e.frameId || f.frameId; }
@@ -4288,8 +4557,8 @@ async function resumeAfterUser(sid, confirmedText) {
     console.log('[Teach] 合并后本轮教学步骤共 ' + events.length + ' 条：' + events.map((e) => e.t + (e.label ? '(' + e.label + ')' : '')).join(' → '));
     t.teachTabId = null;
     t.teachTabIds = [];
-    // 步骤先留在 teachEvents 上，等使用者确认 Agent 的复述后再沉淀成技巧（见 resumeAfterUser 的 confirm 分支）；
-    // 确认循环中途若被打断/放弃，会在对应分支清掉，避免存了未经确认、可能理解错误的流程。
+    // 步骤留在 teachEvents 上只供 Agent 复述学习（不再落库：经验统一由 finish 复盘沉淀，
+    // 教过的正确做法会以动作形式出现在本轮轨迹里，复盘自然看得到）；确认循环结束会清掉。
     t.teachEvents = events;
     t.askMode = null;
     t.askText = null;
@@ -4323,29 +4592,9 @@ async function resumeAfterUser(sid, confirmedText) {
   // ---- 普通页面操作模式 / 复述确认（confirm） ----
   const isConfirm = t.askMode === 'confirm';
 
-  // 复述确认通过后才沉淀技巧：教的动作流程经使用者确认无误，才写入该站操作技巧库。
-  // （不再"录完就存"——未确认/可能理解错误的流程不该落库）
-  if (isConfirm && t.teachEvents && t.teachEvents.length) {
-    try {
-      const byHost = {};
-      for (const e of t.teachEvents) {
-        const h = e.host || '';
-        if (h) (byHost[h] = byHost[h] || []).push(e);
-      }
-      for (const host of Object.keys(byHost)) {
-        const recipe = buildTeachRecipe(byHost[host]);
-        if (!recipe) continue;
-        const store = await getTipStore();
-        const old = (store[host] || []).join('\n');
-        const merged = await mergeSiteTips(host, [recipe], old, t.sid);
-        if (merged && merged.length) {
-          await saveSiteTips(host, merged, t.sid);
-          addLog(t.sid, '教我模式：使用者确认后，已把该站操作流程沉淀为技巧（' + host + '）');
-        }
-      }
-    } catch (e) { addLog(t.sid, '教我模式：技巧沉淀失败 → ' + e.message, true); }
-    t.teachEvents = [];
-  }
+  // 教我模式确认后不再沉淀经验：统一由 finish 复盘综合审查任务执行来沉淀（教过的正确做法会以动作形式出现在本轮轨迹里）。
+  // 这里只清掉教学步骤，避免残留占用内存、也不误复用上一轮的演示。
+  if (isConfirm) t.teachEvents = [];
 
   t.askMode = null;
   timerResume(t); // 你操作完/确认完，Agent 继续：计时恢复
@@ -4519,6 +4768,26 @@ async function handleMessage(msg, sender) {
   switch (msg.type) {
     case 'PING':
       return { pong: true };
+    case 'RUN_EXP_USERSCRIPT': { // 经验代码改走 userScripts 主世界注入（MV3 内容脚本 CSP 禁 unsafe-eval，无法 new AsyncFunction/eval）
+      const tabId = sender && sender.tab && sender.tab.id;
+      if (tabId == null) return { ok: false, infra: true, message: '缺少标签页上下文，无法注入经验脚本' };
+      if (!chrome.userScripts || typeof chrome.userScripts.execute !== 'function') {
+        return { ok: false, infra: true, message: '经验脚本执行需要「允许用户脚本」开关：请到 chrome://extensions 的 PageAgent 详情页，打开「开发者模式」下的「允许用户脚本」（Chrome 138+；更早版本需全局开启开发者模式）后重试。' };
+      }
+      const frameId = (sender && sender.frameId != null) ? sender.frameId : 0;
+      try {
+        await chrome.userScripts.execute({
+          target: { tabId, frameIds: [frameId] },
+          world: 'MAIN',
+          js: [{ code: msg.script }],
+          injectImmediately: true
+        });
+        return { ok: true };
+      } catch (e) {
+        console.warn('[PageAgent] userScripts 注入失败 tab=' + tabId + ' frame=' + frameId + ' → ' + e.message);
+        return { ok: false, infra: true, message: '经验脚本注入失败：' + e.message };
+      }
+    }
     case 'PICK_FILE_RESULT': { // 本地文件弹窗回传：选中文件 base64 与元信息（uploadFile pick:true 编排用）
       const w = pickWaiters.get(msg.pickId);
       if (w) {
@@ -4599,18 +4868,18 @@ async function handleMessage(msg, sender) {
     case 'CLEAR':
       await clearConversation(msg.sid);
       return { ok: true };
-    case 'GET_TIPS': // 面板技巧管理：读取全部站点操作技巧 { [host]: string[] }
-      return { tips: await getTipStore() };
-    case 'SAVE_TIPS': { // 面板技巧管理：保存某站点整份技巧（空数组=删除该站点）
+    case 'GET_EXP': // 面板经验管理：读取全部站点操作经验 { [host]: Item[] }（Item = {scene, params, code}）
+      return { exps: await getExpStore() };
+    case 'SAVE_EXP': { // 面板经验管理：保存某站点整份经验（空数组=删除该站点）
       const h = hostOf(msg.domain);
       if (!h) throw new Error('无效域名');
-      const store = await getTipStore();
-      if (Array.isArray(msg.tips) && msg.tips.length) {
-        store[h] = msg.tips.map((s) => String(s).replace(/\s+/g, ' ').trim().slice(0, 120)).filter(Boolean);
+      const store = await getExpStore();
+      if (Array.isArray(msg.exps) && msg.exps.length) {
+        store[h] = msg.exps.map((x) => normExp(x)).filter(Boolean); // normExp 兼容旧 string 与新对象，去重按 scene 兜底在面板删除/编辑路径不适用（面板按 index 操作，无需去重）
       } else {
         delete store[h];
       }
-      await chrome.storage.local.set({ [TIPS_KEY]: store });
+      await chrome.storage.local.set({ [EXP_KEY]: store });
       return { ok: true };
     }
     case 'DIAG_SNAPSHOT': { // 面板诊断：提取当前标签页合并快照（agent 同款 readSnapshotWithFrames 管线），面板复制到剪贴板
@@ -4639,7 +4908,7 @@ async function handleMessage(msg, sender) {
       console.log('[Teach] 收到 TEACH_EVENT tab=' + src + ' 条数=' + evts.length + ' 匹配教学会话=' + matched + ' 类型=[' + evts.map((e) => e.t).join(',') + ']');
       if (matched && evts.length) {
         tt.teachEvents = tt.teachEvents || [];
-        // 给每条事件补上来源 tab / host / frame（收尾按网站分组沉淀技巧用；frameId 标记 iframe 内步骤，复现时按窗口定位）
+        // 给每条事件补上来源 tab / host / frame（收尾按网站分组沉淀经验用；frameId 标记 iframe 内步骤，复现时按窗口定位）
         const srcHost = hostOf(sender && sender.tab ? (sender.tab.url || '') : '');
         const srcFrame = (sender && sender.frameId) || 0;
         for (const e of evts) { e.tab = src; e.host = srcHost || e.host || ''; e.frameId = e.frameId || srcFrame; }
@@ -4722,14 +4991,14 @@ chrome.runtime.onInstalled.addListener(async () => {
 // 浏览器启动清理：把上次浏览器会话残留的一次性状态全部清掉。
 // ① storage.session 本就随 Chrome 退出自动清空，这里再显式清一次 tasks/llmLogs 双保险；
 // ② 关键是清掉崩溃/异常退出后残留的孤儿 PageAgent N 标签分组（会话状态已空，无法走正常删除路径）。
-// 持久层（config、TIPS_KEY）跨重启保留，不动。
+// 持久层（config、EXP_KEY）跨重启保留，不动。
 chrome.runtime.onStartup.addListener(() => {
   cleanupStartup().catch(() => {});
 });
 
 async function cleanupStartup() {
   push('启动清理：清空会话存储（tasks/llmLogs）并清理孤儿 PageAgent 分组');
-  // 1) 会话级存储显式清空（tasks / llmLogs；config、TIPS_KEY 等持久层保留）
+  // 1) 会话级存储显式清空（tasks / llmLogs；config、EXP_KEY 等持久层保留）
   try {
     await chrome.storage.session.remove(['tasks', LLM_LOGS_KEY]);
   } catch (e) {}

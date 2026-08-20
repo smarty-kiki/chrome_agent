@@ -200,8 +200,8 @@ label.check input[type="checkbox"] {
 }
 .chip-add:hover:not(:disabled) { color: var(--accent); border-color: var(--accent); }
 .chip-add:disabled { opacity: .4; cursor: default; }
-/* ---------------- 网站操作技巧面板 ---------------- */
-#tipsPanel {
+/* ---------------- 网站操作经验面板 ---------------- */
+#expPanel {
   border-bottom: 1px solid var(--border);
   background: var(--bg-2);
   padding: 10px 14px;
@@ -212,20 +212,20 @@ label.check input[type="checkbox"] {
   max-height: 45%;
   overflow-y: auto;
 }
-#tipsPanel[hidden] { display: none; }
+#expPanel[hidden] { display: none; }
 
-.tips-head {
+.exp-head {
   display: flex;
   align-items: center;
   justify-content: space-between;
   font-weight: 600;
   gap: 8px;
 }
-#tipsCount { font-weight: 400; }
+#expCount { font-weight: 400; }
 
-#tipsList { display: flex; flex-direction: column; gap: 10px; }
+#expList { display: flex; flex-direction: column; gap: 10px; }
 
-.tip-domain {
+.exp-domain {
   border: 1px solid var(--border);
   border-radius: 8px;
   background: var(--bg-3);
@@ -234,17 +234,17 @@ label.check input[type="checkbox"] {
   flex-direction: column;
   gap: 6px;
 }
-.tip-domain-head {
+.exp-domain-head {
   display: flex;
   align-items: center;
   justify-content: space-between;
   gap: 8px;
 }
-.tip-domain-name { font-weight: 600; color: var(--accent); word-break: break-all; }
-.tip-del-domain { padding: 2px 8px; font-size: 11px; }
+.exp-domain-name { font-weight: 600; color: var(--accent); word-break: break-all; }
+.exp-del-domain { padding: 2px 8px; font-size: 11px; }
 
-.tip-items { display: flex; flex-direction: column; gap: 4px; }
-.tip-item {
+.exp-items { display: flex; flex-direction: column; gap: 4px; }
+.exp-item {
   display: flex;
   flex-direction: column;
   gap: 4px;
@@ -252,18 +252,18 @@ label.check input[type="checkbox"] {
   border-radius: 6px;
   padding: 3px 6px;
 }
-/* 单条技巧默认一行紧凑展示：文本 + 编辑/删除按钮，编辑时才展开 textarea */
-.tip-row {
+/* 单条经验默认一行紧凑展示：文本 + 编辑/删除按钮，编辑时才展开 textarea */
+.exp-row {
   display: flex;
   align-items: flex-start;
   justify-content: space-between;
   gap: 8px;
   font-size: 12px;
 }
-.tip-row-text { flex: 1; word-break: break-word; line-height: 1.5; }
-.tip-editor { display: flex; flex-direction: column; gap: 4px; }
-.tip-editor[hidden] { display: none; }
-.tip-text {
+.exp-row-text { flex: 1; word-break: break-word; line-height: 1.5; }
+.exp-editor { display: flex; flex-direction: column; gap: 4px; }
+.exp-editor[hidden] { display: none; }
+.exp-text {
   width: 100%;
   background: var(--bg);
   border: 1px solid var(--border);
@@ -274,10 +274,29 @@ label.check input[type="checkbox"] {
   font-size: 12px;
   resize: vertical;
 }
-.tip-text:focus { outline: none; border-color: var(--accent); }
-.tip-item-actions { display: flex; gap: 4px; flex-shrink: 0; }
-.tip-item-actions button { padding: 0 8px; font-size: 11px; }
-.tip-save { color: var(--ok); border-color: var(--ok); background: transparent; }
+.exp-text:focus { outline: none; border-color: var(--accent); }
+.exp-item-actions { display: flex; gap: 4px; flex-shrink: 0; }
+.exp-item-actions button { padding: 0 8px; font-size: 11px; }
+.exp-save { color: var(--ok); border-color: var(--ok); background: transparent; }
+
+/* 经验参数说明：每参数一行，次要色小字 */
+.exp-params { margin-top: 2px; display: flex; flex-direction: column; gap: 1px; }
+.exp-param { color: var(--muted); font-size: 11px; word-break: break-word; }
+/* 可执行经验：代码展开按钮 + 代码块 */
+.exp-code-toggle { margin-top: 2px; padding: 0 8px; font-size: 11px; }
+.exp-code {
+  margin: 4px 0 0;
+  background: #f6f8fa;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 6px 8px;
+  overflow-x: auto;
+  white-space: pre;
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  font-size: 11px;
+  color: var(--text);
+}
+.exp-code[hidden] { display: none; }
 
 #statusBar.running { color: var(--accent); }
 #statusBar.fail { color: var(--danger); }

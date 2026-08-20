@@ -1167,7 +1167,7 @@
   // 先 settlePage 一次（等渲染静）再读——替代原动作内部的固定 sleep（hover 600ms / show 200ms / type 350ms 等）。
   // 纯读动作（read）不进 MUTATING_ACTIONS；openTab 拦截未真动页面也不标记。
   let lastMutatingAt = 0; // 最近一次可变动作成功的时间戳（0=未标记）；读动作 settle 后清 0，避免每张快照重复等
-  const MUTATING_ACTIONS = new Set(['click', 'clickAt', 'dblclickAt', 'clickText', 'clickSelector', 'uploadFile', 'pasteRich', 'gotoCell', 'hover', 'show', 'hide', 'type', 'select', 'scroll', 'keypress']);
+  const MUTATING_ACTIONS = new Set(['click', 'clickAt', 'dblclickAt', 'clickText', 'clickSelector', 'uploadFile', 'pasteRich', 'gotoCell', 'hover', 'show', 'hide', 'type', 'select', 'scroll', 'keypress', 'exec_code']);
   // 读动作读前等 DOM 静：上一步动过则 settle 一次并清标记（读到动作后的稳定状态）
   async function settleIfJustMutated() {
     if (!lastMutatingAt) return;
@@ -1220,6 +1220,111 @@
       timer = setTimeout(check, SETTLE_QUIET_MS);
       maxTimer = setTimeout(finish, SETTLE_MAX_MS);
     });
+  }
+
+  // ---- 经验代码执行（exec_code 用）：MV3 下内容脚本不能 eval，改走 userScripts 主世界注入 ----
+  // 复盘沉淀的经验代码在页面上下文运行、只许操作当前页 DOM。MV3 对扩展页/内容脚本的 CSP 永久禁止
+  // unsafe-eval，new AsyncFunction / eval / new Function 全被拦（症状：经验代码语法错误：Evaluating a
+  // string as JavaScript violates ... CSP directive）。改法：把"沙箱包装 + 经验代码 + postMessage 上报结果"
+  // 拼成一段脚本字符串，请 background 用 chrome.userScripts.execute 注入到 MAIN 世界执行（页面 CSP 管不到
+  // userScripts），结果经 window.postMessage 桥回本脚本、按 reqId 对账 + 超时兜底。
+  // 沙箱仍是"参数遮蔽 + Proxy 拦截危险全局"：禁网络（fetch/XHR/WebSocket/sendBeacon）、禁本地存储
+  // （localStorage/sessionStorage/indexedDB/caches）、禁开新窗口/弹窗（open/alert/confirm/prompt）、
+  // 禁页面跳转（location 赋值/跳转类方法）。Promise.race 超时强停；返回值 JSON 序列化截断。
+  // 经验代码自己返回 {ok:false,message} 时原样透传，background 会把它当失败喂回模型补/改参数重试。
+  // 已知边界：同步死循环（while(true){} 这类不 await 的循环）会卡死当前页面线程，Promise.race 无法强制
+  // 中断——该场景由使用者刷新/关闭标签、background 侧的心跳/超时恢复兜底；经验代码是复盘时 LLM 生成的，几乎不会出现。
+  const EXP_RUN_TIMEOUT_MS = 10000; // 经验代码执行超时强停（毫秒）
+  const EXP_RESULT_MAX = 10000;     // 执行结果序列化截断字符数
+  const EXP_SCRIPT_MAX = 30000;     // 注入脚本字符串长度上限（沙箱包装 + 经验代码），超长拒绝执行防爆
+  const EXP_RESULT_TYPE = '__PAGEAGENT_EXP_RESULT__'; // 主世界 → 本脚本的结果桥消息类型（配 reqId 对账）
+
+  // 拼注入脚本：沙箱包装 + 经验代码 + 结果上报。用内层函数参数遮蔽危险全局（等价旧版 AsyncFunction 的
+  // 参数遮蔽，但不需要 eval）：经验代码里出现的 window/location/fetch 等自由变量绑定到这些参数上，绕不开。
+  // 内部字符串一律双引号（外层是单引号字面量，避免引号转义）；code 以原样文本嵌入，含反引号/换行都安全。
+  function buildExperienceInjection(code, args, reqId) {
+    const wrap = [
+      '(async function(){',
+      '  var __R=' + JSON.stringify(reqId) + ';',
+      '  var __A=' + safeArgsJson(args) + ';',
+      '  var __win=window;',
+      '  var __deny=function(n){ return function(){ throw new Error("沙箱禁止调用："+n); }; };',
+      '  var __noObj=function(n){ return new Proxy({}, { get:function(){ throw new Error("沙箱禁止访问："+n); }, set:function(){ throw new Error("沙箱禁止访问："+n); } }); };',
+      '  var __bindFn=function(fn,t){ if(typeof fn!=="function") return fn; var b=fn.bind(t); if(fn.prototype) b.prototype=fn.prototype; return b; };',
+      // 绑定保留 this 但会吃掉构造函数的 .prototype（HTMLInputElement 等被 bind 后 .prototype 变 undefined，
+      // 经验代码 Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype,'value') 就会报 reading 'set'）；
+      // __bindFn 绑定后把原函数的 prototype 装回去：方法 this 保留、构造函数照常可用。
+      '  var __loc=new Proxy(window.location,{',
+      '    get:function(t,p){ if(p==="assign"||p==="replace"||p==="reload") return __deny("location."+p+"()"); return __bindFn(Reflect.get(t,p),t); },',
+      '    set:function(){ throw new Error("沙箱禁止修改 location（页面跳转）"); }',
+      '  });',
+      '  var __nav=new Proxy(window.navigator,{',
+      '    get:function(t,p){ if(p==="sendBeacon") return __deny("navigator.sendBeacon"); return __bindFn(Reflect.get(t,p),t); },',
+      '    set:function(){ return true; }',
+      '  });',
+      '  var __noKeys=["fetch","XMLHttpRequest","WebSocket","EventSource","sendBeacon","open","alert","confirm","prompt","localStorage","sessionStorage","indexedDB","caches","chrome","webRequest"];',
+      '  var __sw=new Proxy(window,{',
+      '    get:function(t,p){ if(p==="location") return __loc; if(p==="navigator") return __nav; if(typeof p==="string"&&__noKeys.indexOf(p)>=0) return __deny(p); return __bindFn(Reflect.get(t,p),t); },',
+      '    set:function(){ throw new Error("沙箱禁止给 window 赋值"); }',
+      '  });',
+      '  var __run=function(window,globalThis,self,location,navigator,document,fetch,XMLHttpRequest,WebSocket,EventSource,sendBeacon,localStorage,sessionStorage,indexedDB,caches,open,alert,confirm,prompt){',
+      '    return async function(args){ "use strict";',
+      code,
+      '    };',
+      '  };',
+      '  var __fn=__run(__sw,__sw,__sw,__loc,__nav,document,__deny("fetch"),__deny("XMLHttpRequest"),__deny("WebSocket"),__deny("EventSource"),__deny("sendBeacon"),__noObj("localStorage"),__noObj("sessionStorage"),__noObj("indexedDB"),__noObj("caches"),__deny("open"),__deny("alert"),__deny("confirm"),__deny("prompt"));',
+      '  var __t=new Promise(function(_,r){ setTimeout(function(){ r(new Error("经验代码执行超时（' + (EXP_RUN_TIMEOUT_MS / 1000) + ' 秒）")); }, ' + EXP_RUN_TIMEOUT_MS + '); });',
+      '  function __post(ok,v){',
+      '    if(ok && v && typeof v==="object" && !Array.isArray(v) && v.ok===false){ ok=false; v=(v&&v.message)||"经验代码返回失败（未说明原因）"; }',
+      '    var payload;',
+      '    try{ payload=JSON.stringify(v===undefined?null:v); }catch(e){ try{ payload=JSON.stringify(String(v)); }catch(e2){ payload="（结果无法序列化）"; } }',
+      '    if(payload.length>' + EXP_RESULT_MAX + ') payload=payload.slice(0,' + EXP_RESULT_MAX + ')+"…(截断)";',
+      '    __win.postMessage({type:"__PAGEAGENT_EXP_RESULT__",reqId:__R,ok:ok,result:ok?payload:undefined,message:ok?undefined:payload},"*");',
+      '  }',
+      '  try{ __post(true, await Promise.race([__fn(__A),__t])); }',
+      '  catch(e){ __post(false,(e&&e.message)||String(e)); }',
+      '})();'
+    ].join('\n');
+    return wrap.length > EXP_SCRIPT_MAX ? null : wrap;
+  }
+
+  // args 是 background 按参数白名单透传的 JSON 安全值；万一有不可序列化的，退回空对象（防御）
+  function safeArgsJson(args) {
+    try {
+      const s = JSON.stringify(args);
+      return (typeof s === 'string') ? s : '{}';
+    } catch (e) { return '{}'; }
+  }
+
+  // 执行一条经验代码：构造注入脚本 → 请后台注入主世界 → 等 postMessage 结果（reqId 对账）→ 超时兜底。
+  // 返回 {ok:true,result}（result 为 JSON 字符串）或 {ok:false,message}；基础设施失败（开关/API 不可用）
+  // 带 infra 标记，background 据此不压成"经验不可用"。
+  async function runExperienceCode(code, args) {
+    const reqId = 'exp' + Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+    const script = buildExperienceInjection(code, args, reqId);
+    if (script == null) return { ok: false, message: '经验代码过长（超过 ' + EXP_SCRIPT_MAX + ' 字符上限），无法注入执行' };
+    // 先挂结果监听再发注入请求：注入脚本可能秒回，后挂监听会漏掉 postMessage 结果
+    const resultPromise = new Promise((resolve) => {
+      const onMsg = (ev) => {
+        if (!ev.data || ev.data.type !== EXP_RESULT_TYPE || ev.data.reqId !== reqId) return;
+        finish(ev.data.ok
+          ? { ok: true, result: ev.data.result } // result 已是注入脚本序列化截断后的 JSON 字符串
+          : { ok: false, message: ev.data.message || '经验代码执行失败' });
+      };
+      const finish = (r) => { clearTimeout(timer); window.removeEventListener('message', onMsg); resolve(r); };
+      const timer = setTimeout(() => finish({ ok: false, message: '经验代码执行超时（' + (EXP_RUN_TIMEOUT_MS / 1000) + ' 秒）' }), EXP_RUN_TIMEOUT_MS);
+      window.addEventListener('message', onMsg);
+    });
+    let inj = null;
+    try {
+      inj = await chrome.runtime.sendMessage({ type: 'RUN_EXP_USERSCRIPT', script });
+    } catch (e) {
+      return { ok: false, infra: true, message: '经验脚本注入失败（后台连接失败）：' + e.message };
+    }
+    if (!inj || inj.ok !== true) {
+      return { ok: false, infra: true, message: (inj && inj.message) || '经验脚本注入失败' };
+    }
+    return await resultPromise;
   }
 
   async function executeActionInner(a) {
@@ -1775,6 +1880,11 @@
         return { ok: true, cleared };
       }
 
+      case 'exec_code': { // 执行经验库沉淀好的 JS（background 已校验 idx/新鲜度/参数白名单；这里拼注入脚本请后台注入主世界跑）
+        const r = await runExperienceCode(a.code, a.args);
+        return r; // {ok:true,result} 或 {ok:false,message} / {ok:false,infra:true,message}
+      }
+
       default:
         return { ok: false, message: '内容脚本不支持的动作：' + a.action };
     }
@@ -1782,7 +1892,7 @@
 
   // ---------------- 教我模式：页面事件录制 ----------------
   // 使用者在页面上手把手演示时，录制可信用户事件（点击/输入/下拉/回车提交），
-  // 供 Agent 学习并沉淀成该站操作技巧。仅录 e.isTrusted（真实用户操作，滤掉脚本/扩展派发的事件）。
+  // 供 Agent 学习并沉淀成该站操作经验。仅录 e.isTrusted（真实用户操作，滤掉脚本/扩展派发的事件）。
   let teachOn = false;
   let teachBuf = [];         // 待上报事件缓冲
   let teachTimer = null;     // 批量上报定时器
